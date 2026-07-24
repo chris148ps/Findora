@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Die interne Homebrew-OCR-Version läuft absichtlich ohne App Sandbox,
+      da macOS sandboxed Apps das Starten externer Homebrew-Programme verbietet.
+      Für eine sandboxed Distribution müssen OCRmyPDF und alle Hilfsprogramme
+      zuerst kontrolliert ins App-Bundle integriert werden.
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>
+

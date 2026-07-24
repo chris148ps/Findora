@@ -1,0 +1,180 @@
+import Foundation
+
+public actor DocumentProcessor {
+    public struct Progress: Sendable {
+        public let currentFile: String?
+        public let completed: Int
+        public let total: Int
+
+        public init(currentFile: String?, completed: Int, total: Int) {
+            self.currentFile = currentFile
+            self.completed = completed
+            self.total = total
+        }
+    }
+
+    private nonisolated let database: SQLiteDatabase
+    private nonisolated let stabilityChecker: any FileStabilityChecking
+    private nonisolated let extractor: PDFKitTextExtractor
+    private nonisolated let chunker: any Chunking
+    private nonisolated let embedder: any EmbeddingProviding
+    private nonisolated let hasher: SHA256Hasher
+    private nonisolated let ocrProcessor: (any OCRProcessing)?
+    private nonisolated let ocrProcessorFactory: (@Sendable () -> any OCRProcessing)?
+    private var isPaused = false
+
+    public init(
+        database: SQLiteDatabase,
+        stabilityChecker: any FileStabilityChecking = FileStabilityChecker(),
+        extractor: PDFKitTextExtractor = PDFKitTextExtractor(),
+        chunker: any Chunking = PageChunker(),
+        embedder: any EmbeddingProviding,
+        hasher: SHA256Hasher = SHA256Hasher(),
+        ocrProcessor: (any OCRProcessing)? = nil,
+        ocrProcessorFactory: (@Sendable () -> any OCRProcessing)? = nil
+    ) {
+        self.database = database
+        self.stabilityChecker = stabilityChecker
+        self.extractor = extractor
+        self.chunker = chunker
+        self.embedder = embedder
+        self.hasher = hasher
+        self.ocrProcessor = ocrProcessor
+        self.ocrProcessorFactory = ocrProcessorFactory
+    }
+
+    public func setPaused(_ paused: Bool) {
+        isPaused = paused
+    }
+
+    public func processPending(
+        ocrConfiguration: OCRConfiguration,
+        onProgress: @Sendable (Progress) async -> Void
+    ) async {
+        do {
+            let files = try await database.pendingFiles(limit: 10_000)
+            var completed = 0
+            var nextIndex = 0
+            let limit = Self.parallelism(for: ocrConfiguration)
+
+            await withTaskGroup(of: String.self) { group in
+                func enqueueNext() {
+                    guard nextIndex < files.count else { return }
+                    let file = files[nextIndex]
+                    nextIndex += 1
+                    group.addTask { [self] in
+                        await processAndRecord(file, ocrConfiguration: ocrConfiguration)
+                        return file.fileName
+                    }
+                }
+
+                for _ in 0..<min(limit, files.count) {
+                    enqueueNext()
+                }
+
+                while let fileName = await group.next() {
+                    completed += 1
+                    await onProgress(
+                        Progress(currentFile: fileName, completed: completed, total: files.count)
+                    )
+                    if isPaused || Task.isCancelled {
+                        group.cancelAll()
+                    } else {
+                        enqueueNext()
+                    }
+                }
+            }
+            await onProgress(Progress(currentFile: nil, completed: completed, total: files.count))
+        } catch {
+            try? await database.recordError(category: "Indexierung", message: error.localizedDescription)
+        }
+    }
+
+    private nonisolated func processAndRecord(
+        _ file: DiscoveredPDF,
+        ocrConfiguration: OCRConfiguration
+    ) async {
+        do {
+            try await process(file, ocrConfiguration: ocrConfiguration)
+        } catch is CancellationError {
+            try? await database.updateJob(path: file.id, state: .discovered)
+        } catch {
+            try? await database.updateJob(path: file.id, state: .failed, error: error.localizedDescription)
+            try? await database.recordError(
+                category: "Indexierung",
+                message: error.localizedDescription,
+                path: file.url.path
+            )
+        }
+    }
+
+    private nonisolated func process(
+        _ file: DiscoveredPDF,
+        ocrConfiguration: OCRConfiguration
+    ) async throws {
+        try await database.updateJob(path: file.id, state: .waitingForStability)
+        var stable = try await stabilityChecker.waitUntilStable(file)
+        let inputHash = try hasher.hash(fileAt: stable.url)
+
+        try await database.updateJob(path: file.id, state: .extracting)
+        var pages = try extractor.extractPages(from: stable.url)
+        var ocrPerformed = false
+
+        let needsOCR = !extractor.hasUsableTextLayer(pages)
+            || extractor.needsMixedDocumentOCR(pages)
+        if needsOCR, ocrConfiguration.isEnabled {
+            guard let selectedOCRProcessor = ocrProcessorFactory?() ?? ocrProcessor else {
+                throw PrivateDocSearchError.dependencyMissing("OCR-Verarbeitung ist nicht verfügbar.")
+            }
+            try await database.updateJob(path: file.id, state: .ocrRunning)
+            let result = try await selectedOCRProcessor.process(stable, configuration: ocrConfiguration)
+            ocrPerformed = true
+            let attributes = try FileManager.default.attributesOfItem(atPath: stable.url.path)
+            stable = DiscoveredPDF(
+                url: stable.url,
+                relativePath: stable.relativePath,
+                fileName: stable.fileName,
+                size: (attributes[.size] as? NSNumber)?.int64Value ?? stable.size,
+                modifiedAt: attributes[.modificationDate] as? Date ?? stable.modifiedAt,
+                resourceIdentifier: stable.resourceIdentifier,
+                volumeIdentifier: stable.volumeIdentifier,
+                isLocallyAvailable: true
+            )
+            pages = try extractor.extractPages(from: stable.url)
+            guard extractor.hasUsableTextLayer(pages), result.outputHash != inputHash else {
+                throw PrivateDocSearchError.invalidPDF("OCR-Ausgabe enthält keine brauchbare Textschicht.")
+            }
+        }
+
+        guard extractor.hasUsableTextLayer(pages) else {
+            throw PrivateDocSearchError.invalidPDF("Keine brauchbare Textschicht vorhanden.")
+        }
+
+        try await database.updateJob(path: file.id, state: .indexing)
+        let finalHash = try hasher.hash(fileAt: stable.url)
+        let chunks = chunker.chunks(for: pages, documentHash: finalHash)
+        let embeddings = try await embedder.embed(documents: chunks.map(\.text))
+        _ = try await database.indexDocument(
+            file: stable,
+            hash: finalHash,
+            pages: pages,
+            chunks: chunks,
+            embeddings: embeddings,
+            embeddingModelID: embedder.modelID,
+            embeddingModelVersion: embedder.modelVersion,
+            ocrPerformed: ocrPerformed
+        )
+    }
+
+    private static func parallelism(for configuration: OCRConfiguration) -> Int {
+        let configured = max(1, configuration.maximumParallelFiles)
+        switch configuration.cpuMode {
+        case .economical:
+            return 1
+        case .normal:
+            return configured
+        case .fast:
+            return min(configured, max(1, ProcessInfo.processInfo.activeProcessorCount / 2))
+        }
+    }
+}

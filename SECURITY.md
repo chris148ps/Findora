@@ -1,0 +1,69 @@
+# Sicherheit
+
+## Schutzgrenzen
+
+PrivateDocSearch schützt private Dokumente vor unbeabsichtigter externer
+Übertragung und vor unsicheren OCR-Ersetzungen. Die App ist kein
+Mehrbenutzersystem und verschlüsselt den lokalen Index in Version 1 nicht.
+macOS-Dateirechte und FileVault bleiben die maßgeblichen Schutzmechanismen für
+Daten im Benutzerkonto.
+
+## Dateizugriff
+
+Der Nutzer wählt den Stammordner über `NSOpenPanel`. Ein Security-Scoped
+Bookmark persistiert die Freigabe. Die App folgt keinen Symlinks und schließt
+eigene Arbeits-, Modell- und temporäre Dateien vom Scan aus. Ein nicht
+erreichbarer Stammordner wird nicht als Löschung aller Dokumente gewertet.
+
+Die interne Homebrew-OCR-Version wird ohne App Sandbox signiert, weil eine
+sandboxed App externe Homebrew-Programme nicht zuverlässig ausführen kann.
+Die kleinsten vorgesehenen Sandbox-Entitlements liegen separat in
+`Config/PrivateDocSearch-Sandbox.entitlements`; sie sind für eine spätere
+Version mit gebündeltem OCR-Helfer bestimmt.
+
+## Sichere OCR-Ersetzung
+
+OCR arbeitet auf einer eindeutig benannten temporären Datei im selben Ordner.
+Vor dem atomaren Austausch werden PDF-Signatur, Lesbarkeit, Seitenzahl,
+Textschicht und unveränderter Eingangshash geprüft. Die App löscht das
+Original nicht vorab. Fehler vor dem Austausch lassen das Original
+unverändert.
+
+## Modelle und Lieferkette
+
+- Katalogeinträge pinnen Anbieter, Revision, Dateiliste, Größe und SHA-256.
+- Downloads verwenden HTTPS und eine Host-Allowlist.
+- Alle Modelldateien werden vor der Installation validiert.
+- Neue Versionen ersetzen eine funktionierende alte Version erst nach Prüfung.
+- Beliebige Modell-URLs aus Nutzereingaben werden nicht unterstützt.
+- Modelllizenzen werden in der UI angezeigt.
+
+Swift-Paketversionen sind in `Package.resolved` festgehalten. Vor einer
+externen Distribution sind zusätzlich SBOM, Signierung, Notarisierung und
+Abhängigkeitsaudit erforderlich.
+
+## Prompt Injection und Quellen
+
+PDF-Text ist nicht vertrauenswürdige Eingabe. Das Systemprompt weist das lokale
+Sprachmodell an, Anweisungen in Dokumenten nicht auszuführen. Die App vergibt
+opaque Quellen-IDs und löst Dateiname sowie Seitenzahl erst nach der
+Generierung aus der Datenbank auf. Vom Modell erfundene IDs werden verworfen.
+
+## Logs
+
+Dokumenttext, Embeddings, Suchauszüge, vollständige Prompts und Antworten
+gehören nicht in Logs. Zulässig sind Dateiname, Pfad, Status, Dauer und
+technische Fehler. Für weitergegebene Logs sollten sensible Pfadteile
+geschwärzt werden.
+
+## Bekannte Grenzen
+
+- Der SQLite-Index ist nicht anwendungsseitig verschlüsselt.
+- Die interne App ist ad-hoc signiert und nicht notarisiert.
+- Homebrew-OCR vergrößert die lokale Lieferkette.
+- Ein Benutzerprozess mit denselben macOS-Rechten kann auf Index und Modelle
+  zugreifen.
+
+Sicherheitsprobleme sollten mit reproduzierbaren Schritten gemeldet werden,
+jedoch ohne private PDF-Inhalte oder ungeschwärzte Pfade anzuhängen.
+
