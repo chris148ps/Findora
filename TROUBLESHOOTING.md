@@ -93,3 +93,13 @@ entfernen:
 Die ausgewählten Original-PDFs liegen nicht dort und dürfen nicht gelöscht
 werden.
 
+## Technisches Protokoll
+
+Memory-Pressure-Ereignisse, Pausierung/Fortsetzung, Modell-Entladung und
+technische Fehler stehen zeilenweise unter:
+
+```text
+~/Library/Logs/PrivateDocSearch/PrivateDocSearch.log
+```
+
+Dokumentinhalte werden dort nicht protokolliert.

@@ -25,6 +25,15 @@ oder Tags.
 - automatisierte Core-, OCR-, Index- und Opt-in-MLX-Tests;
 - Architektur-, Datenschutz-, Sicherheits-, Test- und Betriebsdokumentation.
 
+### Behoben
+
+- MainActor-Isolationsfehler im Memory-Pressure-Callback behoben; der
+  Dispatch-Handler ist nichtisoliert und leitet Zustandsänderungen ausdrücklich
+  auf den MainActor weiter.
+- Robuster Start-/Stop-Lebenszyklus für die Memory-Pressure-Quelle ergänzt.
+- Lesbares lokales Dateiprotokoll für Speicherdruck, Pausierung,
+  Modell-Entladung und Fehler ergänzt.
+
 ### Bekannte Punkte vor externer Freigabe
 
 - Developer-ID-Signierung und Notarisierung stehen aus.
@@ -33,4 +42,3 @@ oder Tags.
 - Physische Langzeitabnahme mit großem synthetischem Bestand auf einem
   8-GB-Zielgerät steht aus.
 - Version 1 enthält keinen automatischen App-Updater.
-

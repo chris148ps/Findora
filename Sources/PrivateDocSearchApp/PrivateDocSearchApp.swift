@@ -90,6 +90,7 @@ final class AppState {
 
     private let paths: AppPaths
     private let database: SQLiteDatabase
+    private let fileLogger: AppFileLogger
     private let bookmarkStore = FolderBookmarkStore()
     private let scanner: RecursivePDFScanner
     private var processor: DocumentProcessor
@@ -102,13 +103,14 @@ final class AppState {
     private var folderWatcher: FolderChangeWatcher?
     private var modelDownloadTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
-    private var memoryPressureSource: DispatchSourceMemoryPressure?
+    private var memoryPressureMonitor: MemoryPressureMonitor?
 
     init() {
         do {
             let paths = try AppPaths()
             self.paths = paths
             self.database = SQLiteDatabase(url: paths.database)
+            self.fileLogger = try AppFileLogger(logDirectory: paths.logs)
             self.scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
             let catalog = try ModelCatalog.bundled()
             self.modelManager = LocalModelManager(catalog: catalog, paths: paths)
@@ -125,7 +127,8 @@ final class AppState {
             self.processor = DocumentProcessor(
                 database: database,
                 embedder: embedder,
-                ocrProcessorFactory: ocrFactory
+                ocrProcessorFactory: ocrFactory,
+                fileLogger: fileLogger
             )
             self.searchService = HybridSearchService(database: database, embedder: embedder)
         } catch {
@@ -138,7 +141,13 @@ final class AppState {
 
     func start() async {
         do {
+            try await fileLogger.log(
+                .info,
+                category: "App",
+                message: "PrivateDocSearch wird gestartet."
+            )
             try await database.initialize()
+            await runMemoryPressureDiagnosticIfRequested()
             await loadSettings()
             launchAtLogin = SMAppService.mainApp.status == .enabled
             documentFolderPath = await bookmarkStore.displayPath()
@@ -216,7 +225,18 @@ final class AppState {
 
     func setPaused(_ paused: Bool) {
         isPaused = paused
-        Task { await processor.setPaused(paused) }
+        let processor = processor
+        let fileLogger = fileLogger
+        Task {
+            await processor.setPaused(paused)
+            try? await fileLogger.log(
+                .info,
+                category: "Verarbeitung",
+                message: paused
+                    ? "OCR und Indexierung wurden pausiert."
+                    : "OCR und Indexierung wurden fortgesetzt."
+            )
+        }
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -448,7 +468,7 @@ final class AppState {
                     )
                     try await generator.test()
                     try await modelManager.activate(modelID: model.id)
-                    await answerGenerator?.unload()
+                    await unloadAnswerModel(reason: "Modellwechsel")
                     answerGenerator = generator
                     activeAnswerModelID = model.id
                     try await database.setSetting(key: "activeAnswerModelID", value: model.id)
@@ -493,7 +513,7 @@ final class AppState {
         Task {
             do {
                 if model.descriptor.kind == .answer, activeAnswerModelID == model.id {
-                    await answerGenerator?.unload()
+                    await unloadAnswerModel(reason: "Modellentfernung")
                     answerGenerator = nil
                     activeAnswerModelID = nil
                 }
@@ -626,37 +646,95 @@ final class AppState {
         return DocumentProcessor(
             database: database,
             embedder: embedder,
-            ocrProcessorFactory: ocrFactory
+            ocrProcessorFactory: ocrFactory,
+            fileLogger: fileLogger
         )
     }
 
     private func startMemoryPressureMonitoring() {
-        let source = DispatchSource.makeMemoryPressureSource(
-            eventMask: [.normal, .warning, .critical],
-            queue: .global(qos: .utility)
-        )
-        source.setEventHandler { [weak self, weak source] in
-            guard let event = source?.data else { return }
-            Task { @MainActor in
-                guard let self else { return }
-                if event.contains(.critical) {
-                    self.memoryPressure = "Kritisch"
-                    await self.answerGenerator?.unload()
-                } else if event.contains(.warning) {
-                    self.memoryPressure = "Erhöht"
-                } else {
-                    self.memoryPressure = "Normal"
-                }
-            }
+        guard memoryPressureMonitor == nil else { return }
+
+        let monitor = MemoryPressureMonitor { [weak self] level in
+            guard let self else { return }
+            await self.handleMemoryPressure(level)
         }
-        source.resume()
-        memoryPressureSource = source
+        guard monitor.start() else { return }
+        memoryPressureMonitor = monitor
+
+        Task {
+            try? await fileLogger.log(
+                .info,
+                category: "Speicherdruck",
+                message: "Memory-Pressure-Monitor wurde gestartet."
+            )
+        }
+    }
+
+    private func handleMemoryPressure(_ level: MemoryPressureLevel) async {
+        let displayValue: String
+        switch level {
+        case .critical:
+            displayValue = "Kritisch"
+        case .warning:
+            displayValue = "Erhöht"
+        case .normal:
+            displayValue = "Normal"
+        }
+        memoryPressure = displayValue
+
+        try? await fileLogger.log(
+            level == .critical ? .warning : .info,
+            category: "Speicherdruck",
+            message: "Memory-Pressure-Ereignis: \(displayValue)."
+        )
+
+        if level == .critical {
+            await unloadAnswerModel(reason: "kritischer Speicherdruck")
+        }
+    }
+
+    private func runMemoryPressureDiagnosticIfRequested() async {
+        guard let value = ProcessInfo.processInfo.environment[
+            "PRIVATEDOCSEARCH_SIMULATE_MEMORY_PRESSURE"
+        ]?.lowercased(),
+        let level = MemoryPressureLevel(rawValue: value),
+        let memoryPressureMonitor else {
+            return
+        }
+
+        let ranAwayFromMainThread = await memoryPressureMonitor.simulateForDiagnostics(level)
+        try? await fileLogger.log(
+            .info,
+            category: "Speicherdruck",
+            message: "Diagnoseereignis \(level.rawValue) wurde von einer Hintergrund-Queue weitergeleitet: \(ranAwayFromMainThread)."
+        )
+    }
+
+    private func unloadAnswerModel(reason: String) async {
+        guard let answerGenerator else { return }
+        try? await fileLogger.log(
+            .warning,
+            category: "Modelle",
+            message: "Antwortmodell wird entladen. Grund: \(reason)."
+        )
+        await answerGenerator.unload()
+        try? await fileLogger.log(
+            .info,
+            category: "Modelle",
+            message: "Antwortmodell wurde entladen. Grund: \(reason)."
+        )
     }
 
     private func report(_ error: Error) {
-        lastError = error.localizedDescription
+        let message = error.localizedDescription
+        lastError = message
         Task {
-            try? await database.recordError(category: "Allgemein", message: error.localizedDescription)
+            try? await fileLogger.log(
+                .error,
+                category: "Fehler",
+                message: message
+            )
+            try? await database.recordError(category: "Allgemein", message: message)
             await refreshDatabaseState()
         }
     }

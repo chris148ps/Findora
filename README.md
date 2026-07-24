@@ -79,6 +79,8 @@ Jobstatus erlaubt die Fortsetzung nach einem Neustart.
 
 Status, Warteschlange und technische Fehler erscheinen unter **Status** und
 **Logs**. Inhalte von Dokumenten werden nicht protokolliert.
+Das dauerhaft lesbare technische Protokoll liegt unter
+`~/Library/Logs/PrivateDocSearch/PrivateDocSearch.log`.
 
 ## Modellauswahl
 
@@ -157,4 +159,3 @@ nicht gelöscht.
 - [`PRIVACY.md`](PRIVACY.md)
 - [`SECURITY.md`](SECURITY.md)
 - [`TESTING.md`](TESTING.md)
-

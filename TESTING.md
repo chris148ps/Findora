@@ -65,6 +65,19 @@ Danach manuell:
 11. Antwort abbrechen und Entladen bei Speicherdruck/Inaktivität prüfen.
 12. Volume aushängen; der Index darf nicht als leer behandelt werden.
 
+Der Memory-Pressure-Pfad lässt sich ohne echten Speichermangel kontrolliert
+beim App-Start auslösen:
+
+```bash
+PRIVATEDOCSEARCH_SIMULATE_MEMORY_PRESSURE=critical \
+  build/PrivateDocSearch.app/Contents/MacOS/PrivateDocSearch
+```
+
+Der Regressionstest leitet dasselbe Ereignis von einer Utility-Queue auf den
+MainActor weiter. Im Log müssen das kritische Ereignis und die erfolgreiche
+Hintergrund-Weiterleitung erscheinen; `_dispatch_assert_queue_fail` oder
+`SIGTRAP` dürfen nicht auftreten.
+
 ## Abnahme auf 8 GB
 
 Vor einer externen Version sind Langzeittests mit einem großen synthetischen

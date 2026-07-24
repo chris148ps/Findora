@@ -43,6 +43,78 @@ func abandonedOCRTemporaryFilesAreRemovedConservatively() throws {
     #expect(FileManager.default.fileExists(atPath: unrelated.path))
 }
 
+@Test(.timeLimit(.minutes(1)))
+func memoryPressureHandlerHopsFromBackgroundQueueToMainActor() async throws {
+    let state = await MainActor.run { MemoryPressureTestState() }
+    let (events, continuation) = AsyncStream<MemoryPressureLevel>.makeStream()
+    let sourceQueue = DispatchQueue(
+        label: "de.privatedocsearch.tests.memory-pressure-source",
+        qos: .utility
+    )
+    let callbackQueue = DispatchQueue(
+        label: "de.privatedocsearch.tests.memory-pressure-callback",
+        qos: .utility
+    )
+    let monitor = MemoryPressureMonitor(queue: sourceQueue) { level in
+        state.level = level
+        state.wasUpdatedOnMainActor = true
+        continuation.yield(level)
+    }
+
+    #expect(monitor.start())
+    #expect(!monitor.start())
+    let ranAwayFromMainThread = await monitor.simulateForDiagnostics(
+        .critical,
+        from: callbackQueue
+    )
+    #expect(ranAwayFromMainThread)
+
+    var iterator = events.makeAsyncIterator()
+    let received = await iterator.next()
+    #expect(received == .critical)
+    let result = await MainActor.run {
+        (state.level, state.wasUpdatedOnMainActor)
+    }
+    #expect(result.0 == .critical)
+    #expect(result.1)
+
+    monitor.stop()
+    #expect(!monitor.isRunning)
+    monitor.stop()
+    #expect(monitor.start())
+    monitor.stop()
+
+    weak var releasedMonitor: MemoryPressureMonitor?
+    do {
+        let disposableMonitor = MemoryPressureMonitor { _ in }
+        #expect(disposableMonitor.start())
+        releasedMonitor = disposableMonitor
+    }
+    #expect(releasedMonitor == nil)
+}
+
+@Test
+func appFileLoggerCreatesReadablePrivateLog() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let logger = try AppFileLogger(logDirectory: root)
+
+    try await logger.log(
+        .warning,
+        category: "Speicherdruck",
+        message: "Kritisch\nAntwortmodell entladen."
+    )
+    let contents = try await logger.contents()
+    let fileURL = await logger.fileURL
+    let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+    let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+
+    #expect(fileURL.lastPathComponent == "PrivateDocSearch.log")
+    #expect(contents.contains("[WARN] [Speicherdruck]"))
+    #expect(contents.contains("Kritisch Antwortmodell entladen."))
+    #expect(permissions == 0o600)
+}
+
 @Test
 func scannerFindsNestedPDFsAndSkipsSymlinks() async throws {
     let root = FileManager.default.temporaryDirectory
@@ -426,6 +498,12 @@ private actor OCRConcurrencyProbe {
     func end() {
         active -= 1
     }
+}
+
+@MainActor
+private final class MemoryPressureTestState {
+    var level: MemoryPressureLevel = .normal
+    var wasUpdatedOnMainActor = false
 }
 
 private struct SyntheticOCRProcessor: OCRProcessing {

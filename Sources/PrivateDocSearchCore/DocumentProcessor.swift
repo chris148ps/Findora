@@ -21,6 +21,7 @@ public actor DocumentProcessor {
     private nonisolated let hasher: SHA256Hasher
     private nonisolated let ocrProcessor: (any OCRProcessing)?
     private nonisolated let ocrProcessorFactory: (@Sendable () -> any OCRProcessing)?
+    private nonisolated let fileLogger: AppFileLogger?
     private var isPaused = false
 
     public init(
@@ -31,7 +32,8 @@ public actor DocumentProcessor {
         embedder: any EmbeddingProviding,
         hasher: SHA256Hasher = SHA256Hasher(),
         ocrProcessor: (any OCRProcessing)? = nil,
-        ocrProcessorFactory: (@Sendable () -> any OCRProcessing)? = nil
+        ocrProcessorFactory: (@Sendable () -> any OCRProcessing)? = nil,
+        fileLogger: AppFileLogger? = nil
     ) {
         self.database = database
         self.stabilityChecker = stabilityChecker
@@ -41,6 +43,7 @@ public actor DocumentProcessor {
         self.hasher = hasher
         self.ocrProcessor = ocrProcessor
         self.ocrProcessorFactory = ocrProcessorFactory
+        self.fileLogger = fileLogger
     }
 
     public func setPaused(_ paused: Bool) {
@@ -87,6 +90,11 @@ public actor DocumentProcessor {
             await onProgress(Progress(currentFile: nil, completed: completed, total: files.count))
         } catch {
             try? await database.recordError(category: "Indexierung", message: error.localizedDescription)
+            try? await fileLogger?.log(
+                .error,
+                category: "Indexierung",
+                message: error.localizedDescription
+            )
         }
     }
 
@@ -101,6 +109,12 @@ public actor DocumentProcessor {
         } catch {
             try? await database.updateJob(path: file.id, state: .failed, error: error.localizedDescription)
             try? await database.recordError(
+                category: "Indexierung",
+                message: error.localizedDescription,
+                path: file.url.path
+            )
+            try? await fileLogger?.log(
+                .error,
                 category: "Indexierung",
                 message: error.localizedDescription,
                 path: file.url.path
