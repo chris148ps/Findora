@@ -5,10 +5,23 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 
 public actor SQLiteDatabase {
     private var connection: OpaquePointer?
+    private var statusContinuation: AsyncStream<DocumentStatusChange>.Continuation?
     public let url: URL
 
     public init(url: URL) {
         self.url = url
+    }
+
+    public func statusChanges() -> AsyncStream<DocumentStatusChange> {
+        let (stream, continuation) = AsyncStream<DocumentStatusChange>.makeStream(
+            bufferingPolicy: .bufferingNewest(32)
+        )
+        statusContinuation = continuation
+        return stream
+    }
+
+    private func publishStatusChange(_ change: DocumentStatusChange) {
+        statusContinuation?.yield(change)
     }
 
     public func initialize() throws {
@@ -67,7 +80,7 @@ public actor SQLiteDatabase {
                         state = CASE
                             WHEN excluded.state = 'unavailable'
                             THEN 'unavailable'
-                            WHEN processing_jobs.state = 'indexed'
+                            WHEN processing_jobs.state IN ('indexed', 'failed')
                                  AND processing_jobs.discovered_size = excluded.discovered_size
                                  AND processing_jobs.discovered_modified_at = excluded.discovered_modified_at
                             THEN processing_jobs.state
@@ -88,6 +101,14 @@ public actor SQLiteDatabase {
                         .real(completedAt.timeIntervalSince1970),
                         .real(completedAt.timeIntervalSince1970)
                     ]
+                )
+                try execute(
+                    """
+                    UPDATE processing_jobs
+                    SET last_stage = state
+                    WHERE job_key = ? AND state NOT IN ('indexed', 'failed')
+                    """,
+                    bindings: [.text(file.id)]
                 )
                 if let availabilityError = file.availabilityError {
                     try execute(
@@ -130,7 +151,8 @@ public actor SQLiteDatabase {
             try execute(
                 """
                 UPDATE processing_jobs
-                SET state = 'retired', last_error = NULL, updated_at = ?
+                SET state = 'retired', last_stage = 'retired',
+                    last_error = NULL, updated_at = ?
                 WHERE substr(absolute_path, 1, length(?)) = ?
                   AND absolute_path NOT IN (SELECT absolute_path FROM current_scan_paths)
                 """,
@@ -145,6 +167,7 @@ public actor SQLiteDatabase {
             try setSetting(key: "lastFullScan", value: String(completedAt.timeIntervalSince1970))
             try setSetting(key: "lastScanGeneration", value: String(generation))
         }
+        publishStatusChange(.scanCompleted)
     }
 
     public func pendingFiles(limit: Int = 100) throws -> [DiscoveredPDF] {
@@ -184,6 +207,7 @@ public actor SQLiteDatabase {
             """
             UPDATE processing_jobs
             SET state = ?, last_error = ?, attempt_count = attempt_count + ?,
+                last_stage = CASE WHEN ? = 'failed' THEN last_stage ELSE ? END,
                 updated_at = ?
             WHERE job_key = ?
             """,
@@ -191,10 +215,13 @@ public actor SQLiteDatabase {
                 .text(state.rawValue),
                 error.map(SQLiteValue.text) ?? .null,
                 .integer(state == .failed ? 1 : 0),
+                .text(state.rawValue),
+                .text(state.rawValue),
                 .real(Date().timeIntervalSince1970),
                 .text(path)
             ]
         )
+        publishStatusChange(.jobChanged)
     }
 
     public func indexDocument(
@@ -213,7 +240,7 @@ public actor SQLiteDatabase {
             throw PrivateDocSearchError.database("Chunk- und Embedding-Anzahl stimmen nicht überein.")
         }
 
-        return try transaction {
+        let indexedDocumentID = try transaction {
             let now = Date().timeIntervalSince1970
             try execute(
                 """
@@ -385,7 +412,7 @@ public actor SQLiteDatabase {
                 UPDATE processing_jobs
                 SET state = 'indexed', content_hash = ?,
                     discovered_size = ?, discovered_modified_at = ?,
-                    last_error = NULL, updated_at = ?
+                    last_stage = 'indexed', last_error = NULL, updated_at = ?
                 WHERE job_key = ?
                 """,
                 bindings: [
@@ -398,6 +425,8 @@ public actor SQLiteDatabase {
             )
             return documentID
         }
+        publishStatusChange(.documentIndexed)
+        return indexedDocumentID
     }
 
     /// Reuses a fully indexed document by immutable source hash or by the hash of
@@ -457,7 +486,8 @@ public actor SQLiteDatabase {
                 """
                 UPDATE processing_jobs
                 SET state = 'indexed', content_hash = ?, discovered_size = ?,
-                    discovered_modified_at = ?, last_error = NULL, updated_at = ?
+                    discovered_modified_at = ?, last_stage = 'indexed',
+                    last_error = NULL, updated_at = ?
                 WHERE job_key = ?
                 """,
                 bindings: [
@@ -469,6 +499,7 @@ public actor SQLiteDatabase {
                 ]
             )
         }
+        publishStatusChange(.locationsChanged)
         return true
     }
 
@@ -497,6 +528,7 @@ public actor SQLiteDatabase {
                 """
             )
         }
+        publishStatusChange(.locationsChanged)
     }
 
     public func lexicalSearch(query searchText: String, limit: Int = 40) throws -> [SearchSource] {
@@ -561,39 +593,168 @@ public actor SQLiteDatabase {
     }
 
     public func statistics() throws -> DocumentStatistics {
+        let row = try query(
+            """
+            WITH active_locations AS (
+                SELECT * FROM document_locations WHERE deleted_at IS NULL
+            ),
+            active_documents AS (
+                SELECT DISTINCT document_id FROM active_locations
+            ),
+            active_chunks AS (
+                SELECT c.*
+                FROM chunks c
+                JOIN active_documents d ON d.document_id = c.document_id
+            )
+            SELECT
+                MAX(
+                    (SELECT COUNT(*) FROM active_locations),
+                    (SELECT COUNT(*) FROM processing_jobs WHERE state != 'retired')
+                ) AS total_pdfs,
+                (SELECT COUNT(*) FROM processing_jobs WHERE state = 'indexed')
+                    AS indexed_pdfs,
+                (SELECT COUNT(*) FROM active_locations l
+                 JOIN documents d ON d.id = l.document_id
+                 WHERE d.text_layer_present = 1) AS searchable_pdfs,
+                (SELECT COUNT(*) FROM active_locations l
+                 JOIN documents d ON d.id = l.document_id
+                 WHERE d.text_layer_present = 0 OR d.ocr_status = 'pending')
+                    + (SELECT COUNT(*) FROM processing_jobs
+                       WHERE last_stage IN ('ocrQueued', 'ocrRunning')
+                         AND content_hash IS NULL)
+                    AS ocr_required_pdfs,
+                (SELECT COUNT(*) FROM active_locations l
+                 JOIN documents d ON d.id = l.document_id
+                 WHERE d.ocr_status = 'completed') AS ocr_processed_pdfs,
+                (SELECT COUNT(*) FROM processing_jobs
+                 WHERE state = 'failed' AND last_stage = 'ocrRunning')
+                    AS ocr_failed_pdfs,
+                (SELECT COUNT(*) FROM processing_jobs
+                 WHERE state IN ('discovered', 'waitingForStability', 'ocrQueued'))
+                    AS pending_jobs,
+                (SELECT COUNT(*) FROM processing_jobs
+                 WHERE state IN ('extracting', 'ocrRunning', 'indexing'))
+                    AS processing_jobs,
+                (SELECT COUNT(*) FROM processing_jobs WHERE state = 'retired')
+                    AS skipped_jobs,
+                (SELECT COUNT(*) FROM processing_jobs WHERE state = 'failed')
+                    AS failed_jobs,
+                (SELECT COUNT(*) FROM active_chunks) AS total_chunks,
+                (SELECT COUNT(*) FROM active_chunks c
+                 WHERE EXISTS (SELECT 1 FROM chunk_embeddings e WHERE e.chunk_id = c.id))
+                    AS embedded_chunks,
+                (SELECT COUNT(*) FROM active_chunks c
+                 WHERE EXISTS (
+                     SELECT 1 FROM chunk_embeddings e
+                     WHERE e.chunk_id = c.id AND e.model_id = 'builtin-token-hash'
+                 )) AS fallback_embedded_chunks,
+                (SELECT COUNT(*) FROM active_chunks c
+                 WHERE EXISTS (
+                     SELECT 1 FROM chunk_embeddings e
+                     WHERE e.chunk_id = c.id AND lower(e.model_id) LIKE '%e5%'
+                 )) AS e5_embedded_chunks,
+                MAX(
+                    0,
+                    (SELECT COUNT(*) FROM active_locations)
+                    - (SELECT COUNT(*) FROM active_documents)
+                ) AS duplicate_locations,
+                (SELECT COUNT(*) FROM document_locations WHERE deleted_at IS NOT NULL)
+                    + (SELECT COUNT(*) FROM processing_jobs WHERE state = 'unavailable')
+                    AS missing_or_moved_files,
+                (SELECT COUNT(*) FROM ocr_page_quality q
+                 JOIN active_documents d ON d.document_id = q.document_id
+                 WHERE q.status = 'good') AS ocr_quality_good,
+                (SELECT COUNT(*) FROM ocr_page_quality q
+                 JOIN active_documents d ON d.document_id = q.document_id
+                 WHERE q.status = 'review') AS ocr_quality_review,
+                (SELECT COUNT(*) FROM ocr_page_quality q
+                 JOIN active_documents d ON d.document_id = q.document_id
+                 WHERE q.status = 'likelyFailed') AS ocr_quality_failed,
+                (SELECT COUNT(*) FROM processing_jobs
+                 WHERE state IN ('indexed', 'failed')) AS processed_jobs,
+                (SELECT COUNT(*) FROM processing_jobs
+                 WHERE state NOT IN ('retired', 'unavailable')) AS total_jobs
+            """
+        ).first
         var result = DocumentStatistics()
-        result.totalPDFs = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM document_locations WHERE deleted_at IS NULL"
-        ))
-        result.indexedPDFs = Int(try scalarInt64(
+        result.totalPDFs = Int(row?.int64("total_pdfs") ?? 0)
+        result.indexedPDFs = Int(row?.int64("indexed_pdfs") ?? 0)
+        result.searchablePDFs = Int(row?.int64("searchable_pdfs") ?? 0)
+        result.withoutTextLayerPDFs = max(0, result.totalPDFs - result.searchablePDFs)
+        result.ocrRequiredPDFs = Int(row?.int64("ocr_required_pdfs") ?? 0)
+        result.ocrProcessedPDFs = Int(row?.int64("ocr_processed_pdfs") ?? 0)
+        result.ocrFailedPDFs = Int(row?.int64("ocr_failed_pdfs") ?? 0)
+        result.pendingJobs = Int(row?.int64("pending_jobs") ?? 0)
+        result.processingJobs = Int(row?.int64("processing_jobs") ?? 0)
+        result.skippedJobs = Int(row?.int64("skipped_jobs") ?? 0)
+        result.failedJobs = Int(row?.int64("failed_jobs") ?? 0)
+        result.totalChunks = Int(row?.int64("total_chunks") ?? 0)
+        result.embeddedChunks = Int(row?.int64("embedded_chunks") ?? 0)
+        result.fallbackEmbeddedChunks = Int(row?.int64("fallback_embedded_chunks") ?? 0)
+        result.e5EmbeddedChunks = Int(row?.int64("e5_embedded_chunks") ?? 0)
+        result.duplicateLocations = Int(row?.int64("duplicate_locations") ?? 0)
+        result.missingOrMovedFiles = Int(row?.int64("missing_or_moved_files") ?? 0)
+        result.ocrQualityGoodPages = Int(row?.int64("ocr_quality_good") ?? 0)
+        result.ocrQualityReviewPages = Int(row?.int64("ocr_quality_review") ?? 0)
+        result.ocrQualityFailedPages = Int(row?.int64("ocr_quality_failed") ?? 0)
+        result.processedJobs = Int(row?.int64("processed_jobs") ?? 0)
+        result.totalJobs = Int(row?.int64("total_jobs") ?? 0)
+        result.isPaused = try setting(key: "processingPaused") == "1"
+        result.pausedJobs = result.isPaused
+            ? result.pendingJobs + result.processingJobs
+            : 0
+
+        if let current = try query(
             """
-            SELECT COUNT(DISTINCT c.document_id)
-            FROM chunks c
-            JOIN document_locations l ON l.document_id = c.document_id
-            WHERE l.deleted_at IS NULL
+            SELECT state, file_name
+            FROM processing_jobs
+            WHERE state IN (
+                'discovered', 'waitingForStability', 'extracting',
+                'ocrQueued', 'ocrRunning', 'indexing'
+            )
+            ORDER BY
+                CASE state
+                    WHEN 'indexing' THEN 0
+                    WHEN 'ocrRunning' THEN 1
+                    WHEN 'extracting' THEN 2
+                    ELSE 3
+                END,
+                updated_at DESC
+            LIMIT 1
             """
-        ))
-        result.searchablePDFs = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM documents WHERE text_layer_present = 1 AND active_version = 1"
-        ))
-        result.ocrProcessedPDFs = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM documents WHERE ocr_status = 'completed'"
-        ))
-        result.pendingJobs = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM processing_jobs WHERE state NOT IN ('indexed', 'failed', 'unavailable', 'retired')"
-        ))
-        result.failedJobs = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM processing_jobs WHERE state = 'failed'"
-        ))
-        result.ocrQualityGoodPages = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM ocr_page_quality WHERE status = 'good'"
-        ))
-        result.ocrQualityReviewPages = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM ocr_page_quality WHERE status = 'review'"
-        ))
-        result.ocrQualityFailedPages = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM ocr_page_quality WHERE status = 'likelyFailed'"
-        ))
+        ).first {
+            result.currentFile = current.string("file_name")
+            result.currentStep = result.isPaused
+                ? "Pausiert"
+                : current.string("state")
+                    .flatMap(ProcessingState.init(rawValue:))?
+                    .displayName
+        }
+        if let success = try query(
+            """
+            SELECT file_name FROM processing_jobs
+            WHERE state = 'indexed'
+            ORDER BY updated_at DESC LIMIT 1
+            """
+        ).first?.string("file_name") {
+            result.lastSuccessfulStep = "Indexiert: \(success)"
+        }
+        result.lastProcessingError = try query(
+            """
+            SELECT message AS last_error
+            FROM (
+                SELECT last_error AS message, updated_at AS event_time
+                FROM processing_jobs
+                WHERE state = 'failed' AND last_error IS NOT NULL
+                UNION ALL
+                SELECT message, created_at AS event_time
+                FROM errors
+                WHERE resolved_at IS NULL
+            )
+            ORDER BY event_time DESC
+            LIMIT 1
+            """
+        ).first?.string("last_error")
         if let value = try setting(key: "lastFullScan").flatMap(Double.init) {
             result.lastFullScan = Date(timeIntervalSince1970: value)
         }
@@ -617,19 +778,22 @@ public actor SQLiteDatabase {
                 .real(Date().timeIntervalSince1970)
             ]
         )
+        publishStatusChange(.errorRecorded)
     }
 
     public func queueFullReindex() throws {
         try execute(
             """
             UPDATE processing_jobs
-            SET state = 'discovered', last_error = NULL, updated_at = ?
+            SET state = 'discovered', last_stage = 'discovered',
+                last_error = NULL, updated_at = ?
             WHERE absolute_path IN (
                 SELECT absolute_path FROM document_locations WHERE deleted_at IS NULL
             )
             """,
             bindings: [.real(Date().timeIntervalSince1970)]
         )
+        publishStatusChange(.maintenanceCompleted)
     }
 
     public func storedDocumentTexts() throws -> [StoredDocumentText] {
@@ -729,6 +893,7 @@ public actor SQLiteDatabase {
                 )
             }
         }
+        publishStatusChange(.embeddingsChanged)
     }
 
     public func resetOCRData() throws {
@@ -764,7 +929,8 @@ public actor SQLiteDatabase {
             try execute(
                 """
                 UPDATE processing_jobs
-                SET state = 'discovered', last_error = NULL, updated_at = ?
+                SET state = 'discovered', last_stage = 'discovered',
+                    last_error = NULL, updated_at = ?
                 WHERE absolute_path IN (
                     SELECT absolute_path FROM document_locations WHERE deleted_at IS NULL
                 )
@@ -775,6 +941,7 @@ public actor SQLiteDatabase {
                 bindings: [.real(now)]
             )
         }
+        publishStatusChange(.maintenanceCompleted)
     }
 
     public func deleteDocumentIndex() throws {
@@ -786,6 +953,7 @@ public actor SQLiteDatabase {
             try execute("DELETE FROM errors")
             try execute("DELETE FROM search_history")
         }
+        publishStatusChange(.maintenanceCompleted)
     }
 
     public func repairIndex() throws -> String {
@@ -808,7 +976,8 @@ public actor SQLiteDatabase {
             try execute(
                 """
                 UPDATE processing_jobs
-                SET state = 'retired', last_error = NULL, updated_at = ?
+                SET state = 'retired', last_stage = 'retired',
+                    last_error = NULL, updated_at = ?
                 WHERE NOT EXISTS (
                     SELECT 1 FROM document_locations l
                     WHERE l.absolute_path = processing_jobs.absolute_path
@@ -821,7 +990,8 @@ public actor SQLiteDatabase {
             try execute(
                 """
                 UPDATE processing_jobs
-                SET state = 'discovered', last_error = NULL, updated_at = ?
+                SET state = 'discovered', last_stage = 'discovered',
+                    last_error = NULL, updated_at = ?
                 WHERE absolute_path IN (
                     SELECT l.absolute_path
                     FROM document_locations l
@@ -834,6 +1004,7 @@ public actor SQLiteDatabase {
                 bindings: [.real(now)]
             )
         }
+        publishStatusChange(.maintenanceCompleted)
         return "SQLite-Integrität und Fremdschlüssel sind in Ordnung; FTS und Jobzustände wurden abgeglichen."
     }
 
@@ -841,11 +1012,13 @@ public actor SQLiteDatabase {
         try execute(
             """
             UPDATE processing_jobs
-            SET state = 'discovered', last_error = NULL, updated_at = ?
+            SET state = 'discovered', last_stage = 'discovered',
+                last_error = NULL, updated_at = ?
             WHERE state = 'failed'
             """,
             bindings: [.real(Date().timeIntervalSince1970)]
         )
+        publishStatusChange(.jobChanged)
     }
 
     public func recentErrors(limit: Int = 100) throws -> [(Date, String, String, String?)] {
@@ -891,6 +1064,11 @@ public actor SQLiteDatabase {
             """,
             bindings: [.text(key), .text(value), .real(Date().timeIntervalSince1970)]
         )
+    }
+
+    public func setProcessingPaused(_ paused: Bool) throws {
+        try setSetting(key: "processingPaused", value: paused ? "1" : "0")
+        publishStatusChange(.processingPaused)
     }
 
     private func migrate() throws {
@@ -943,6 +1121,17 @@ public actor SQLiteDatabase {
                 }
                 try execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 5 {
+            try transaction {
+                for statement in Self.migration5 {
+                    try execute(statement)
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
                     bindings: [.real(Date().timeIntervalSince1970)]
                 )
             }
@@ -1324,6 +1513,17 @@ public actor SQLiteDatabase {
         UPDATE pages
         SET text_source = 'ocr'
         WHERE document_id IN (SELECT id FROM documents WHERE ocr_status = 'completed')
+        """
+    ]
+
+    private static let migration5 = [
+        "ALTER TABLE processing_jobs ADD COLUMN last_stage TEXT NOT NULL DEFAULT 'discovered'",
+        """
+        UPDATE processing_jobs
+        SET last_stage = CASE
+            WHEN state = 'failed' THEN 'failed'
+            ELSE state
+        END
         """
     ]
 }

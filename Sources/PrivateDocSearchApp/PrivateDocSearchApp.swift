@@ -62,9 +62,6 @@ final class AppState {
     var statistics = DocumentStatistics()
     var isProcessing = false
     var isPaused = false
-    var currentFile: String?
-    var completedFiles = 0
-    var totalFiles = 0
     var question = ""
     var answer = ""
     var searchResults: [SearchSource] = []
@@ -106,6 +103,10 @@ final class AppState {
     private var modelDownloadTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var memoryPressureMonitor: MemoryPressureMonitor?
+    private var statusEventTask: Task<Void, Never>?
+    private var statusRefreshTask: Task<Void, Never>?
+    private var statusConsistencyTask: Task<Void, Never>?
+    private var statusRefreshPending = false
 
     init() {
         do {
@@ -148,6 +149,7 @@ final class AppState {
                 message: "PrivateDocSearch wird gestartet."
             )
             try await database.initialize()
+            await startDocumentStatusMonitoring()
             await runMemoryPressureDiagnosticIfRequested()
             await loadSettings()
             await refreshOCRComponents()
@@ -224,13 +226,7 @@ final class AppState {
             let files = try await scanner.scan(root: folder.url)
             try await database.saveScan(files: files, root: folder.url)
             folderStatus = "Erreichbar"
-            await processor.processPending(ocrConfiguration: ocrConfiguration) { [weak self] progress in
-                await MainActor.run {
-                    self?.currentFile = progress.currentFile
-                    self?.completedFiles = progress.completed
-                    self?.totalFiles = progress.total
-                }
-            }
+            await processor.processPending(ocrConfiguration: ocrConfiguration) { _ in }
             await refreshDatabaseState()
         } catch {
             folderStatus = "Nicht erreichbar"
@@ -244,6 +240,12 @@ final class AppState {
         let fileLogger = fileLogger
         Task {
             await processor.setPaused(paused)
+            do {
+                try await database.setProcessingPaused(paused)
+                await refreshDocumentStatus()
+            } catch {
+                report(error)
+            }
             try? await fileLogger.log(
                 .info,
                 category: "Verarbeitung",
@@ -251,6 +253,9 @@ final class AppState {
                     ? "OCR und Indexierung wurden pausiert."
                     : "OCR und Indexierung wurden fortgesetzt."
             )
+            if !paused {
+                await scanNow()
+            }
         }
     }
 
@@ -350,12 +355,7 @@ final class AppState {
         Task {
             defer { isProcessing = false }
             do {
-                try await processor.rebuildSearchIndex { [weak self] progress in
-                    await MainActor.run {
-                        self?.completedFiles = progress.completed
-                        self?.totalFiles = progress.total
-                    }
-                }
+                try await processor.rebuildSearchIndex { _ in }
                 modelMessage = "Der Suchindex wurde aus dem gespeicherten Text neu aufgebaut."
                 await refreshDatabaseState()
             } catch {
@@ -476,10 +476,56 @@ final class AppState {
 
     func refreshDatabaseState() async {
         do {
-            statistics = try await database.statistics()
+            await refreshDocumentStatus()
             logEntries = try await database.recentErrors()
         } catch {
             report(error)
+        }
+    }
+
+    private func refreshDocumentStatus() async {
+        do {
+            let snapshot = try await database.statistics()
+            statistics = snapshot
+            isPaused = snapshot.isPaused
+        } catch {
+            report(error)
+        }
+    }
+
+    private func startDocumentStatusMonitoring() async {
+        statusEventTask?.cancel()
+        statusConsistencyTask?.cancel()
+        let changes = await database.statusChanges()
+        statusEventTask = Task { [weak self] in
+            for await _ in changes {
+                guard !Task.isCancelled, let self else { return }
+                self.scheduleDocumentStatusRefresh()
+            }
+        }
+        statusConsistencyTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                guard !Task.isCancelled, let self else { return }
+                await self.refreshDocumentStatus()
+            }
+        }
+    }
+
+    private func scheduleDocumentStatusRefresh() {
+        guard statusRefreshTask == nil else {
+            statusRefreshPending = true
+            return
+        }
+        statusRefreshPending = false
+        statusRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled, let self else { return }
+            await self.refreshDocumentStatus()
+            self.statusRefreshTask = nil
+            if self.statusRefreshPending {
+                self.scheduleDocumentStatusRefresh()
+            }
         }
     }
 
@@ -576,12 +622,7 @@ final class AppState {
                     let previousProcessor = processor
                     do {
                         processor = makeProcessor(embedder: provider)
-                        try await processor.rebuildSearchIndex { [weak self] progress in
-                            await MainActor.run {
-                                self?.completedFiles = progress.completed
-                                self?.totalFiles = progress.total
-                            }
-                        }
+                        try await processor.rebuildSearchIndex { _ in }
                         modelMessage = "Der neue Embedding-Index wird aufgebaut; die bisherige Suche bleibt aktiv."
                         let coverage = try await database.embeddingCoverage(
                             modelID: model.id,
@@ -772,6 +813,8 @@ final class AppState {
                 llmIdleMinutes = min(max(decoded, 1), 120)
             }
             showExperimentalModels = try await database.setting(key: "showExperimentalModels") == "1"
+            isPaused = try await database.setting(key: "processingPaused") == "1"
+            await processor.setPaused(isPaused)
         } catch {
             report(error)
         }
@@ -1119,9 +1162,21 @@ struct StatusView: View {
                     MetricCard(title: "PDFs insgesamt", value: state.statistics.totalPDFs)
                     MetricCard(title: "Indexiert", value: state.statistics.indexedPDFs)
                     MetricCard(title: "Mit Textschicht", value: state.statistics.searchablePDFs)
-                    MetricCard(title: "Durch OCR", value: state.statistics.ocrProcessedPDFs)
-                    MetricCard(title: "Wartend", value: state.statistics.pendingJobs)
+                    MetricCard(title: "Ohne Textschicht", value: state.statistics.withoutTextLayerPDFs)
+                    MetricCard(title: "OCR erforderlich", value: state.statistics.ocrRequiredPDFs)
+                    MetricCard(title: "OCR erfolgreich", value: state.statistics.ocrProcessedPDFs)
+                    MetricCard(title: "OCR fehlgeschlagen", value: state.statistics.ocrFailedPDFs)
+                    MetricCard(title: "In Warteschlange", value: state.statistics.pendingJobs)
+                    MetricCard(title: "In Bearbeitung", value: state.statistics.processingJobs)
+                    MetricCard(title: "Pausiert", value: state.statistics.pausedJobs)
+                    MetricCard(title: "Übersprungen", value: state.statistics.skippedJobs)
                     MetricCard(title: "Fehler", value: state.statistics.failedJobs)
+                    MetricCard(title: "Chunks insgesamt", value: state.statistics.totalChunks)
+                    MetricCard(title: "Embeddings vorhanden", value: state.statistics.embeddedChunks)
+                    MetricCard(title: "Fallback-Embeddings", value: state.statistics.fallbackEmbeddedChunks)
+                    MetricCard(title: "E5-Embeddings", value: state.statistics.e5EmbeddedChunks)
+                    MetricCard(title: "Duplikate", value: state.statistics.duplicateLocations)
+                    MetricCard(title: "Fehlend oder verschoben", value: state.statistics.missingOrMovedFiles)
                     MetricCard(title: "OCR-Seiten gut", value: state.statistics.ocrQualityGoodPages)
                     MetricCard(title: "OCR-Seiten prüfen", value: state.statistics.ocrQualityReviewPages)
                     MetricCard(title: "OCR vermutlich fehlgeschlagen", value: state.statistics.ocrQualityFailedPages)
@@ -1145,17 +1200,72 @@ struct StatusView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                if state.isProcessing {
-                    GroupBox("Verarbeitung") {
+                if state.isProcessing
+                    || state.statistics.totalJobs > 0
+                    || state.statistics.pendingJobs > 0
+                    || state.statistics.isPaused {
+                    GroupBox(
+                        state.statistics.isPaused
+                            ? "Verarbeitung pausiert"
+                            : state.statistics.processingJobs > 0
+                                ? "Verarbeitung läuft"
+                                : "Dokumentenverarbeitung"
+                    ) {
                         VStack(alignment: .leading, spacing: 8) {
-                            ProgressView(
-                                value: Double(state.completedFiles),
-                                total: Double(max(1, state.totalFiles))
-                            )
-                            Text(state.currentFile ?? "Scan läuft …")
-                            Text("\(state.completedFiles) von \(state.totalFiles)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            ProgressView(value: state.statistics.progressFraction)
+                            HStack {
+                                Text(
+                                    "\(state.statistics.processedJobs) von \(state.statistics.totalJobs) PDFs verarbeitet"
+                                )
+                                Spacer()
+                                Text(
+                                    state.statistics.progressFraction,
+                                    format: .percent.precision(.fractionLength(0))
+                                )
+                                .monospacedDigit()
+                            }
+                            Text("\(state.statistics.failedJobs) fehlgeschlagen")
+                                .foregroundStyle(
+                                    state.statistics.failedJobs > 0 ? .red : .secondary
+                                )
+                            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 6) {
+                                GridRow {
+                                    Text("Aktueller Schritt").foregroundStyle(.secondary)
+                                    Text(
+                                        state.statistics.currentStep
+                                            ?? (state.statistics.isPaused
+                                                ? "Pausiert"
+                                                : state.isProcessing
+                                                    ? "Ordner wird gescannt"
+                                                    : "Bereit")
+                                    )
+                                }
+                                GridRow {
+                                    Text("Aktuelle Datei").foregroundStyle(.secondary)
+                                    Text(state.statistics.currentFile ?? "—")
+                                }
+                                GridRow {
+                                    Text("Zustand").foregroundStyle(.secondary)
+                                    Text(
+                                        state.statistics.isPaused
+                                            ? "Pausiert"
+                                            : state.statistics.processingJobs > 0 || state.isProcessing
+                                                ? "Aktiv"
+                                                : state.statistics.pendingJobs > 0
+                                                    ? "Wartend"
+                                                    : "Bereit"
+                                    )
+                                }
+                                GridRow {
+                                    Text("Letzter Erfolg").foregroundStyle(.secondary)
+                                    Text(state.statistics.lastSuccessfulStep ?? "—")
+                                }
+                                GridRow {
+                                    Text("Letzter Fehler").foregroundStyle(.secondary)
+                                    Text(state.statistics.lastProcessingError ?? "—")
+                                        .lineLimit(3)
+                                }
+                            }
                         }
                     }
                 }
@@ -1691,7 +1801,7 @@ struct MenuBarContent: View {
 
     var body: some View {
         Text(state.isProcessing ? "Verarbeitung läuft" : state.isPaused ? "Verarbeitung pausiert" : "Dienst aktiv")
-        if let file = state.currentFile { Text(file).font(.caption) }
+        if let file = state.statistics.currentFile { Text(file).font(.caption) }
         Divider()
         Button("Hauptfenster öffnen") {
             NSApplication.shared.activate(ignoringOtherApps: true)

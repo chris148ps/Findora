@@ -11,6 +11,32 @@ public enum ProcessingState: String, Codable, Sendable {
     case failed
     case unavailable
     case retired
+
+    public var displayName: String {
+        switch self {
+        case .discovered: "Erkannt"
+        case .waitingForStability: "Dateistabilität wird geprüft"
+        case .extracting: "Textschicht wird analysiert"
+        case .ocrQueued: "OCR wartet"
+        case .ocrRunning: "OCR läuft"
+        case .indexing: "Index und Embeddings werden erstellt"
+        case .indexed: "Indexiert"
+        case .failed: "Fehlgeschlagen"
+        case .unavailable: "Datei nicht verfügbar"
+        case .retired: "Übersprungen"
+        }
+    }
+}
+
+public enum DocumentStatusChange: String, Sendable {
+    case scanCompleted
+    case jobChanged
+    case documentIndexed
+    case embeddingsChanged
+    case locationsChanged
+    case processingPaused
+    case maintenanceCompleted
+    case errorRecorded
 }
 
 public struct DiscoveredPDF: Identifiable, Hashable, Sendable {
@@ -111,13 +137,37 @@ public struct DocumentStatistics: Equatable, Sendable {
     public var totalPDFs = 0
     public var indexedPDFs = 0
     public var searchablePDFs = 0
+    public var withoutTextLayerPDFs = 0
+    public var ocrRequiredPDFs = 0
     public var ocrProcessedPDFs = 0
+    public var ocrFailedPDFs = 0
     public var pendingJobs = 0
+    public var processingJobs = 0
+    public var pausedJobs = 0
+    public var skippedJobs = 0
     public var failedJobs = 0
+    public var totalChunks = 0
+    public var embeddedChunks = 0
+    public var fallbackEmbeddedChunks = 0
+    public var e5EmbeddedChunks = 0
+    public var duplicateLocations = 0
+    public var missingOrMovedFiles = 0
     public var ocrQualityGoodPages = 0
     public var ocrQualityReviewPages = 0
     public var ocrQualityFailedPages = 0
+    public var processedJobs = 0
+    public var totalJobs = 0
+    public var currentStep: String?
+    public var currentFile: String?
+    public var isPaused = false
+    public var lastSuccessfulStep: String?
+    public var lastProcessingError: String?
     public var lastFullScan: Date?
+
+    public var progressFraction: Double {
+        guard totalJobs > 0 else { return indexedPDFs > 0 ? 1 : 0 }
+        return min(1, max(0, Double(processedJobs) / Double(totalJobs)))
+    }
 
     public init() {}
 }

@@ -24,6 +24,9 @@ Abgedeckt sind:
 - Finder-sichere Toolauflösung und sicherer Abbruch ohne Homebrew;
 - seitenweise OCR-Qualität einschließlich Tesseract-Konfidenz;
 - Erkennung einer älteren installierten Modellversion;
+- ereignisgetriebener Dokumentenstatus unter 500 ms;
+- konsistente OCR-/Job-/Chunk-/Embedding-/Duplikatzähler;
+- persistierte Pause und identische Statusrekonstruktion nach Datenbank-Neustart;
 - Vollständigkeit, Revisionen und Hashes des Modellkatalogs;
 - Hardware-Einstufung des Katalogs.
 

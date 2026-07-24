@@ -586,6 +586,109 @@ func indexMaintenanceRebuildsFromStoredTextAndPreservesSettings() async throws {
 }
 
 @Test
+func persistentStatusEventsAndSnapshotsTrackLiveProcessing() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let changes = await database.statusChanges()
+    let firstEvent = Task {
+        var iterator = changes.makeAsyncIterator()
+        return await iterator.next()
+    }
+    let pdf = root.appending(path: "Live.pdf")
+    try createTextPDF(
+        at: pdf,
+        pages: ["LIVE STATUS " + String(repeating: "Persistenter Text. ", count: 30)]
+    )
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    var files = try await scanner.scan(root: root)
+    let eventStart = ContinuousClock.now
+    try await database.saveScan(files: files, root: root)
+    #expect(await firstEvent.value == .scanCompleted)
+    #expect(eventStart.duration(to: .now) < .milliseconds(500))
+
+    var status = try await database.statistics()
+    #expect(status.totalPDFs == 1)
+    #expect(status.pendingJobs == 1)
+    #expect(status.processingJobs == 0)
+    #expect(status.currentStep == ProcessingState.discovered.displayName)
+    #expect(status.currentFile == "Live.pdf")
+
+    let embedder = TokenHashEmbedding(dimensions: 64)
+    let processor = DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: embedder
+    )
+    await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+    status = try await database.statistics()
+    #expect(status.indexedPDFs == 1)
+    #expect(status.searchablePDFs == 1)
+    #expect(status.withoutTextLayerPDFs == 0)
+    #expect(status.totalChunks > 0)
+    #expect(status.embeddedChunks == status.totalChunks)
+    #expect(status.fallbackEmbeddedChunks == status.totalChunks)
+    #expect(status.e5EmbeddedChunks == 0)
+    #expect(status.processedJobs == status.totalJobs)
+    #expect(status.progressFraction == 1)
+    #expect(status.lastSuccessfulStep?.contains("Live.pdf") == true)
+
+    let copy = root.appending(path: "Live-Kopie.pdf")
+    try FileManager.default.copyItem(at: pdf, to: copy)
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+    status = try await database.statistics()
+    #expect(status.totalPDFs == 2)
+    #expect(status.indexedPDFs == 2)
+    #expect(status.duplicateLocations == 1)
+
+    let failing = root.appending(path: "OCR-Fehler.pdf")
+    try createImagePDF(at: failing, text: "SYNTHETIC FAILURE")
+    let waiting = root.appending(path: "Wartend.pdf")
+    try createTextPDF(at: waiting, pages: ["Noch nicht verarbeitet"])
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    try await database.updateJob(path: failing.path, state: .ocrRunning)
+    try await database.updateJob(
+        path: failing.path,
+        state: .failed,
+        error: "Synthetischer OCR-Fehler ohne Dokumentinhalt"
+    )
+    status = try await database.statistics()
+    #expect(status.ocrFailedPDFs == 1)
+    #expect(status.failedJobs == 1)
+    #expect(status.lastProcessingError?.contains("Synthetischer OCR-Fehler") == true)
+    try await database.saveScan(files: files, root: root)
+    status = try await database.statistics()
+    #expect(status.ocrFailedPDFs == 1)
+    #expect(status.failedJobs == 1)
+
+    let pauseChanges = await database.statusChanges()
+    let pauseEvent = Task {
+        var iterator = pauseChanges.makeAsyncIterator()
+        return await iterator.next()
+    }
+    try await database.setProcessingPaused(true)
+    #expect(await pauseEvent.value == .processingPaused)
+    status = try await database.statistics()
+    #expect(status.isPaused)
+    #expect(status.pausedJobs >= 1)
+
+    let reopened = SQLiteDatabase(url: paths.database)
+    try await reopened.initialize()
+    let reconstructed = try await reopened.statistics()
+    #expect(reconstructed == status)
+    #expect(reconstructed.isPaused)
+    #expect(reconstructed.ocrFailedPDFs == 1)
+}
+
+@Test
 func finderSafeToolResolutionAndMissingInstallerAreDeterministic() async throws {
     let dependencies = OCRDependencyChecker().check()
     #expect(dependencies.environmentPATH.hasPrefix("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"))

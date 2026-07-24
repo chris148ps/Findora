@@ -86,6 +86,11 @@ Status, Warteschlange und technische Fehler erscheinen unter **Status** und
 Das dauerhaft lesbare technische Protokoll liegt unter
 `~/Library/Logs/PrivateDocSearch/PrivateDocSearch.log`.
 
+Der Dokumentenstatus aktualisiert sich während Scan, OCR, Indexierung,
+Embedding-Erstellung und Wartung automatisch. Datenbankereignisse werden
+gebündelt innerhalb von etwa 300 ms dargestellt; ein manueller Ansichtswechsel
+oder Neuladen ist nicht erforderlich.
+
 ## Modellauswahl
 
 Unter **Modelle** stehen nur fest versionierte, lizenzierte MLX-Modelle aus dem

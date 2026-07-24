@@ -67,3 +67,22 @@ Jeder Vektor trägt Modell-ID, Modellversion, Dimension und Normalisierung.
 Bei einem Modellwechsel wird ein paralleler Indexstand aufgebaut. Die UI zeigt
 Dokument-/Chunk-Fortschritt. Abbruch oder Fehler lassen den vorherigen
 Indexstand unverändert.
+
+## Live-Dokumentenstatus
+
+SQLite bleibt die einzige fachliche Statusquelle. Erfolgreiche Scan-, Job-,
+Index-, Embedding-, Standort-, Pausen-, Fehler- und Wartungstransaktionen
+veröffentlichen ein typisiertes Statusereignis. `AppState` bündelt eintreffende
+Ereignisse für 300 ms und lädt danach einen konsistenten aggregierten Snapshot.
+Bei kontinuierlicher Verarbeitung entsteht damit etwa alle 300 ms ein Update,
+nicht für jeden Chunk oder jedes Zeichen.
+
+Der Snapshot enthält Dokument-, Textschicht-, OCR-, Job-, Chunk-, Embedding-,
+Duplikat- und Verfügbarkeitszähler sowie aktuelle Phase/Datei,
+erledigt/gesamt, Fehler, Pause und letzten Erfolg. Die SwiftUI-Ansicht
+beobachtet ausschließlich den `@MainActor`-isolierten `AppState`.
+
+Ein 30-Sekunden-Abgleich dient nur als Sicherheitsnetz. Nach einem Neustart
+werden alle Werte erneut aus `processing_jobs`, Dokumenten, Standorten,
+Chunks, Embeddings und Einstellungen rekonstruiert; es existieren keine
+separaten dauerhaft relevanten In-Memory-Zähler.
