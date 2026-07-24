@@ -56,12 +56,18 @@ public actor LocalModelManager {
     public func models(profile: HardwareProfile) -> [InstalledModel] {
         catalog.models.map { descriptor in
             let directory = installedDirectory(for: descriptor)
+            let currentInstalled = validateInstalledFiles(descriptor, directory: directory)
+            let installedVersion = currentInstalled
+                ? descriptor.modelVersion
+                : olderInstalledVersion(for: descriptor)
             return InstalledModel(
                 descriptor: descriptor,
                 directory: directory,
-                isInstalled: validateInstalledFiles(descriptor, directory: directory),
+                isInstalled: currentInstalled,
                 isActive: activeModelIDs[descriptor.kind] == descriptor.id,
-                compatibility: profile.compatibility(for: descriptor)
+                compatibility: profile.compatibility(for: descriptor),
+                installedVersion: installedVersion,
+                updateAvailable: installedVersion != nil && !currentInstalled
             )
         }
     }
@@ -286,6 +292,26 @@ public actor LocalModelManager {
         modelsDirectory
             .appending(path: descriptor.id.replacingOccurrences(of: "/", with: "_"))
             .appending(path: descriptor.modelVersion)
+    }
+
+    private func olderInstalledVersion(for descriptor: LocalModelDescriptor) -> String? {
+        let root = modelsDirectory.appending(
+            path: descriptor.id.replacingOccurrences(of: "/", with: "_"),
+            directoryHint: .isDirectory
+        )
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        return children
+            .filter {
+                $0.lastPathComponent != descriptor.modelVersion
+                    && ((try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true)
+            }
+            .map(\.lastPathComponent)
+            .sorted()
+            .last
     }
 
     private func validateInstalledFiles(

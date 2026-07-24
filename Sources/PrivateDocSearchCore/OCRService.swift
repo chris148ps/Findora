@@ -1,4 +1,18 @@
 import Foundation
+import CoreGraphics
+import CoreText
+
+public enum OCRPersistenceMode: String, Codable, CaseIterable, Sendable {
+    case nonDestructive
+    case persistent
+
+    public var displayName: String {
+        switch self {
+        case .nonDestructive: "Nicht-destruktiv (empfohlen)"
+        case .persistent: "PDF dauerhaft mit OCR versehen"
+        }
+    }
+}
 
 public enum OCRCPUMode: String, Codable, CaseIterable, Sendable {
     case economical
@@ -24,6 +38,7 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
     public var createPDFA: Bool
     public var maximumParallelFiles: Int
     public var cpuMode: OCRCPUMode
+    public var persistenceMode: OCRPersistenceMode
 
     public init(
         isEnabled: Bool = true,
@@ -34,7 +49,8 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
         optimizeLevel: Int = 0,
         createPDFA: Bool = false,
         maximumParallelFiles: Int = 1,
-        cpuMode: OCRCPUMode = .normal
+        cpuMode: OCRCPUMode = .normal,
+        persistenceMode: OCRPersistenceMode = .nonDestructive
     ) {
         self.isEnabled = isEnabled
         self.languages = languages
@@ -45,20 +61,73 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
         self.createPDFA = createPDFA
         self.maximumParallelFiles = max(1, maximumParallelFiles)
         self.cpuMode = cpuMode
+        self.persistenceMode = persistenceMode
     }
 
     public static let `default` = OCRConfiguration()
+
+    private enum CodingKeys: String, CodingKey {
+        case isEnabled, languages, rotatePages, deskew, clean, optimizeLevel
+        case createPDFA, maximumParallelFiles, cpuMode, persistenceMode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            isEnabled: try values.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true,
+            languages: try values.decodeIfPresent([String].self, forKey: .languages) ?? ["deu", "eng"],
+            rotatePages: try values.decodeIfPresent(Bool.self, forKey: .rotatePages) ?? true,
+            deskew: try values.decodeIfPresent(Bool.self, forKey: .deskew) ?? true,
+            clean: try values.decodeIfPresent(Bool.self, forKey: .clean) ?? false,
+            optimizeLevel: try values.decodeIfPresent(Int.self, forKey: .optimizeLevel) ?? 0,
+            createPDFA: try values.decodeIfPresent(Bool.self, forKey: .createPDFA) ?? false,
+            maximumParallelFiles: try values.decodeIfPresent(Int.self, forKey: .maximumParallelFiles) ?? 1,
+            cpuMode: try values.decodeIfPresent(OCRCPUMode.self, forKey: .cpuMode) ?? .normal,
+            persistenceMode: try values.decodeIfPresent(OCRPersistenceMode.self, forKey: .persistenceMode) ?? .nonDestructive
+        )
+    }
 }
 
 public struct OCRDependencies: Equatable, Sendable {
+    public let homebrew: URL?
     public let ocrMyPDF: URL?
     public let tesseract: URL?
     public let pdfText: URL?
     public let pdfInfo: URL?
+    public let pdfToPPM: URL?
+    public let environmentPATH: String
     public let installedLanguages: [String]
+    public let versions: [String: String]
+    public let selfTestPassed: Bool
     public let messages: [String]
 
-    public var isReady: Bool {
+    public init(
+        homebrew: URL?,
+        ocrMyPDF: URL?,
+        tesseract: URL?,
+        pdfText: URL?,
+        pdfInfo: URL?,
+        pdfToPPM: URL?,
+        environmentPATH: String,
+        installedLanguages: [String],
+        versions: [String: String],
+        selfTestPassed: Bool,
+        messages: [String]
+    ) {
+        self.homebrew = homebrew
+        self.ocrMyPDF = ocrMyPDF
+        self.tesseract = tesseract
+        self.pdfText = pdfText
+        self.pdfInfo = pdfInfo
+        self.pdfToPPM = pdfToPPM
+        self.environmentPATH = environmentPATH
+        self.installedLanguages = installedLanguages
+        self.versions = versions
+        self.selfTestPassed = selfTestPassed
+        self.messages = messages
+    }
+
+    public var componentsInstalled: Bool {
         ocrMyPDF != nil
             && tesseract != nil
             && pdfText != nil
@@ -66,6 +135,8 @@ public struct OCRDependencies: Equatable, Sendable {
             && installedLanguages.contains("deu")
             && installedLanguages.contains("eng")
     }
+
+    public var isReady: Bool { componentsInstalled && selfTestPassed }
 }
 
 public struct OCRDependencyChecker: Sendable {
@@ -73,61 +144,216 @@ public struct OCRDependencyChecker: Sendable {
 
     public init(approvedDirectories: [URL] = [
             URL(filePath: "/opt/homebrew/bin", directoryHint: .isDirectory),
-            URL(filePath: "/usr/local/bin", directoryHint: .isDirectory)
+            URL(filePath: "/usr/local/bin", directoryHint: .isDirectory),
+            URL(filePath: "/usr/bin", directoryHint: .isDirectory),
+            URL(filePath: "/bin", directoryHint: .isDirectory)
         ]) {
         self.approvedDirectories = approvedDirectories
     }
 
-    public func check(customOCRMyPDF: URL? = nil) -> OCRDependencies {
+    public func check(
+        customOCRMyPDF: URL? = nil,
+        runFunctionalSelfTest: Bool = true
+    ) -> OCRDependencies {
+        let searchDirectories = resolvedSearchDirectories()
+        let homebrew = executable(named: "brew", directories: searchDirectories)
         let ocr = executable(named: "ocrmypdf", custom: customOCRMyPDF)
         let tesseract = executable(named: "tesseract")
         let pdfText = executable(named: "pdftotext")
         let pdfInfo = executable(named: "pdfinfo")
-        let languages = tesseract.map(installedLanguages) ?? []
+        let pdfToPPM = executable(named: "pdftoppm")
+        let environmentPATH = searchDirectories.map(\.path).joined(separator: ":")
+        let languages = tesseract.map {
+            installedLanguages(tesseract: $0, environmentPATH: environmentPATH)
+        } ?? []
+        var versions: [String: String] = [:]
+        for (name, executable, arguments) in [
+            ("OCRmyPDF", ocr, ["--version"]),
+            ("Tesseract", tesseract, ["--version"]),
+            ("pdftotext", pdfText, ["-v"]),
+            ("pdfinfo", pdfInfo, ["-v"])
+        ] {
+            if let executable,
+               let version = commandOutput(
+                   executable: executable,
+                   arguments: arguments,
+                   environmentPATH: environmentPATH
+               ) {
+                versions[name] = version
+            }
+        }
         var messages: [String] = []
 
+        if homebrew == nil { messages.append("Homebrew fehlt.") }
         if ocr == nil { messages.append("OCRmyPDF fehlt. Installation: brew install ocrmypdf") }
         if tesseract == nil { messages.append("Tesseract fehlt. Installation: brew install tesseract tesseract-lang") }
         if pdfText == nil || pdfInfo == nil { messages.append("Poppler fehlt. Installation: brew install poppler") }
         if !languages.contains("deu") { messages.append("Tesseract-Sprachdaten Deutsch (deu) fehlen.") }
         if !languages.contains("eng") { messages.append("Tesseract-Sprachdaten Englisch (eng) fehlen.") }
+        let commandsPassed = ocr != nil
+            && tesseract != nil
+            && pdfText != nil
+            && pdfInfo != nil
+            && versions.count == 4
+            && languages.contains("deu")
+            && languages.contains("eng")
+        let selfTestPassed = commandsPassed
+            && runFunctionalSelfTest
+            && functionalSelfTest(
+                ocrMyPDF: ocr!,
+                pdfText: pdfText!,
+                environmentPATH: environmentPATH
+            )
+        if runFunctionalSelfTest, !selfTestPassed, messages.isEmpty {
+            messages.append("Der OCR-Werkzeug-Selbsttest ist fehlgeschlagen.")
+        } else if !runFunctionalSelfTest, commandsPassed, messages.isEmpty {
+            messages.append("Der OCR-Werkzeug-Selbsttest wird ausgeführt.")
+        }
 
         return OCRDependencies(
+            homebrew: homebrew,
             ocrMyPDF: ocr,
             tesseract: tesseract,
             pdfText: pdfText,
             pdfInfo: pdfInfo,
+            pdfToPPM: pdfToPPM,
+            environmentPATH: environmentPATH,
             installedLanguages: languages,
+            versions: versions,
+            selfTestPassed: selfTestPassed,
             messages: messages
         )
     }
 
-    private func executable(named name: String, custom: URL? = nil) -> URL? {
+    private func resolvedSearchDirectories() -> [URL] {
+        let inherited = ProcessInfo.processInfo.environment["PATH", default: ""]
+            .split(separator: ":")
+            .map { URL(filePath: String($0), directoryHint: .isDirectory) }
+        var seen: Set<String> = []
+        return (approvedDirectories + inherited).filter {
+            seen.insert($0.standardizedFileURL.path).inserted
+        }
+    }
+
+    private func executable(
+        named name: String,
+        custom: URL? = nil,
+        directories: [URL]? = nil
+    ) -> URL? {
         let candidates = [custom].compactMap { $0 }
-            + approvedDirectories.map { $0.appending(path: name) }
+            + (directories ?? resolvedSearchDirectories()).map { $0.appending(path: name) }
         return candidates.first {
             FileManager.default.isExecutableFile(atPath: $0.path)
         }
     }
 
-    private func installedLanguages(tesseract: URL) -> [String] {
+    private func installedLanguages(tesseract: URL, environmentPATH: String) -> [String] {
+        guard let text = commandOutput(
+            executable: tesseract,
+            arguments: ["--list-langs"],
+            environmentPATH: environmentPATH
+        ) else { return [] }
+        return text
+            .components(separatedBy: .newlines)
+            .dropFirst()
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func commandOutput(
+        executable: URL,
+        arguments: [String],
+        environmentPATH: String
+    ) -> String? {
         let process = Process()
         let output = Pipe()
-        process.executableURL = tesseract
-        process.arguments = ["--list-langs"]
+        process.executableURL = executable
+        process.arguments = arguments
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = environmentPATH
+        process.environment = environment
         process.standardOutput = output
         process.standardError = output
         do {
             try process.run()
             process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
             let data = output.fileHandleForReading.readDataToEndOfFile()
             return String(decoding: data, as: UTF8.self)
-                .components(separatedBy: .newlines)
-                .dropFirst()
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
-            return []
+            return nil
+        }
+    }
+
+    private func functionalSelfTest(
+        ocrMyPDF: URL,
+        pdfText: URL,
+        environmentPATH: String
+    ) -> Bool {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "PrivateDocSearch-selftest-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        let input = directory.appending(path: "input.pdf")
+        let output = directory.appending(path: "output.pdf")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            guard let bitmap = CGContext(
+                data: nil,
+                width: 1_200,
+                height: 300,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            bitmap.setFillColor(CGColor(gray: 1, alpha: 1))
+            bitmap.fill(CGRect(x: 0, y: 0, width: 1_200, height: 300))
+            let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 64, nil)
+            let attributes = [
+                kCTFontAttributeName: font,
+                kCTForegroundColorAttributeName: CGColor(gray: 0, alpha: 1)
+            ] as CFDictionary
+            guard let attributed = CFAttributedStringCreate(
+                nil,
+                "PRIVATE DOC SEARCH OCR TEST 12345" as CFString,
+                attributes
+            ) else { return false }
+            let line = CTLineCreateWithAttributedString(attributed)
+            bitmap.textPosition = CGPoint(x: 35, y: 115)
+            CTLineDraw(line, bitmap)
+            guard let image = bitmap.makeImage() else { return false }
+
+            var mediaBox = CGRect(x: 0, y: 0, width: 1_200, height: 300)
+            guard let pdf = CGContext(input as CFURL, mediaBox: &mediaBox, nil) else {
+                return false
+            }
+            pdf.beginPDFPage(nil)
+            pdf.draw(image, in: mediaBox)
+            pdf.endPDFPage()
+            pdf.closePDF()
+
+            guard commandOutput(
+                executable: ocrMyPDF,
+                arguments: [
+                    "--force-ocr", "--output-type", "pdf", "--optimize", "0",
+                    "--jobs", "1", "-l", "eng", input.path, output.path
+                ],
+                environmentPATH: environmentPATH
+            ) != nil,
+            let text = commandOutput(
+                executable: pdfText,
+                arguments: [output.path, "-"],
+                environmentPATH: environmentPATH
+            ) else {
+                return false
+            }
+            return text.uppercased().contains("PRIVATE")
+                && text.uppercased().contains("OCR")
+        } catch {
+            return false
         }
     }
 }
@@ -136,13 +362,78 @@ public struct OCRResult: Equatable, Sendable {
     public let inputHash: String
     public let outputHash: String
     public let pageCount: Int
+    public let pages: [ExtractedPage]
+    public let persistedToOriginal: Bool
+    public let pageQualities: [OCRPageQuality]
     public let completedAt: Date
 
-    public init(inputHash: String, outputHash: String, pageCount: Int, completedAt: Date) {
+    public init(
+        inputHash: String,
+        outputHash: String,
+        pageCount: Int,
+        pages: [ExtractedPage] = [],
+        persistedToOriginal: Bool = true,
+        pageQualities: [OCRPageQuality] = [],
+        completedAt: Date
+    ) {
         self.inputHash = inputHash
         self.outputHash = outputHash
         self.pageCount = pageCount
+        self.pages = pages
+        self.persistedToOriginal = persistedToOriginal
+        self.pageQualities = pageQualities
         self.completedAt = completedAt
+    }
+}
+
+public enum OCRQualityStatus: String, Codable, CaseIterable, Sendable {
+    case good
+    case review
+    case likelyFailed
+
+    public var displayName: String {
+        switch self {
+        case .good: "Gut"
+        case .review: "Prüfen"
+        case .likelyFailed: "Wahrscheinlich fehlgeschlagen"
+        }
+    }
+}
+
+public struct OCRPageQuality: Codable, Equatable, Sendable {
+    public let pageNumber: Int
+    public let meanConfidence: Double?
+    public let characterCount: Int
+    public let wordCount: Int
+    public let unusualCharacterCount: Int
+    public let suspectedBrokenWordCount: Int
+    public let recognizedLanguage: String
+    public let isEmpty: Bool
+    public let imageToTextRatio: Double
+    public let status: OCRQualityStatus
+
+    public init(
+        pageNumber: Int,
+        meanConfidence: Double?,
+        characterCount: Int,
+        wordCount: Int,
+        unusualCharacterCount: Int,
+        suspectedBrokenWordCount: Int,
+        recognizedLanguage: String,
+        isEmpty: Bool,
+        imageToTextRatio: Double,
+        status: OCRQualityStatus
+    ) {
+        self.pageNumber = pageNumber
+        self.meanConfidence = meanConfidence
+        self.characterCount = characterCount
+        self.wordCount = wordCount
+        self.unusualCharacterCount = unusualCharacterCount
+        self.suspectedBrokenWordCount = suspectedBrokenWordCount
+        self.recognizedLanguage = recognizedLanguage
+        self.isEmpty = isEmpty
+        self.imageToTextRatio = imageToTextRatio
+        self.status = status
     }
 }
 
@@ -215,7 +506,7 @@ public actor OCRmyPDFProcessor: OCRProcessing {
     ) async throws -> OCRResult {
         try Task.checkCancellation()
         guard configuration.isEnabled else { throw PrivateDocSearchError.cancelled }
-        guard dependencies.isReady, let executable = dependencies.ocrMyPDF else {
+        guard dependencies.componentsInstalled, let executable = dependencies.ocrMyPDF else {
             throw PrivateDocSearchError.dependencyMissing(
                 dependencies.messages.joined(separator: " ")
             )
@@ -234,51 +525,76 @@ public actor OCRmyPDFProcessor: OCRProcessing {
         let temporary = file.url.deletingLastPathComponent().appending(
             path: ".privatedocsearch-ocr-\(UUID().uuidString).pdf"
         )
-        defer { try? fileManager.removeItem(at: temporary) }
-
-        let process = Process()
-        let output = Pipe()
-        process.executableURL = executable
-        process.arguments = arguments(
-            configuration: configuration,
-            input: file.url,
-            output: temporary
-        )
-        process.standardOutput = output
-        process.standardError = output
-        process.qualityOfService = configuration.cpuMode == .economical ? .utility : .userInitiated
-        currentProcess = process
-        defer { currentProcess = nil }
-
-        try process.run()
-        let diagnosticData = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let diagnostics = String(decoding: diagnosticData, as: UTF8.self)
-
-        try Task.checkCancellation()
-        guard process.terminationStatus == 0 else {
-            throw PrivateDocSearchError.processFailed(
-                Self.sanitizedDiagnostics(diagnostics, replacing: file.url.path)
-            )
+        var temporaryFiles = [temporary]
+        defer {
+            for url in temporaryFiles {
+                try? fileManager.removeItem(at: url)
+            }
         }
 
-        try validateOutput(temporary, expectedPages: originalPageCount)
+        try runOCR(
+            executable: executable,
+            configuration: configuration,
+            input: file.url,
+            output: temporary,
+            recoveryAttempt: false
+        )
+        var bestURL = temporary
+        var bestPages = try validateOutput(temporary, expectedPages: originalPageCount)
+        var bestQualities = qualityResults(
+            pdf: temporary,
+            pages: bestPages,
+            languages: configuration.languages
+        )
+        if bestQualities.contains(where: { $0.status == .likelyFailed }) {
+            let retry = file.url.deletingLastPathComponent().appending(
+                path: ".privatedocsearch-ocr-\(UUID().uuidString).pdf"
+            )
+            temporaryFiles.append(retry)
+            do {
+                try runOCR(
+                    executable: executable,
+                    configuration: configuration,
+                    input: file.url,
+                    output: retry,
+                    recoveryAttempt: true
+                )
+                let retryPages = try validateOutput(retry, expectedPages: originalPageCount)
+                let retryQualities = qualityResults(
+                    pdf: retry,
+                    pages: retryPages,
+                    languages: configuration.languages
+                )
+                if qualityScore(retryQualities) > qualityScore(bestQualities) {
+                    bestURL = retry
+                    bestPages = retryPages
+                    bestQualities = retryQualities
+                }
+            } catch {
+                // The validated first attempt remains usable.
+            }
+        }
         guard try hasher.hash(fileAt: file.url) == inputHash else {
             throw PrivateDocSearchError.unstableFile(file.url.path)
         }
 
-        _ = try fileManager.replaceItemAt(
-            file.url,
-            withItemAt: temporary,
-            backupItemName: nil,
-            options: []
-        )
-
-        try validateOutput(file.url, expectedPages: originalPageCount)
+        let outputHash = try hasher.hash(fileAt: bestURL)
+        if configuration.persistenceMode == .persistent {
+            _ = try fileManager.replaceItemAt(
+                file.url,
+                withItemAt: bestURL,
+                backupItemName: nil,
+                options: []
+            )
+            _ = try validateOutput(file.url, expectedPages: originalPageCount)
+        }
         return OCRResult(
             inputHash: inputHash,
-            outputHash: try hasher.hash(fileAt: file.url),
+            outputHash: outputHash,
             pageCount: originalPageCount,
+            pages: bestPages,
+            persistedToOriginal: configuration.persistenceMode == .persistent,
+            pageQualities: bestQualities,
             completedAt: Date()
         )
     }
@@ -290,7 +606,8 @@ public actor OCRmyPDFProcessor: OCRProcessing {
     private func arguments(
         configuration: OCRConfiguration,
         input: URL,
-        output: URL
+        output: URL,
+        recoveryAttempt: Bool = false
     ) -> [String] {
         var arguments = [
             "--skip-text",
@@ -302,11 +619,67 @@ public actor OCRmyPDFProcessor: OCRProcessing {
         if configuration.rotatePages { arguments.append("--rotate-pages") }
         if configuration.deskew { arguments.append("--deskew") }
         if configuration.clean { arguments.append("--clean") }
+        if recoveryAttempt {
+            if !configuration.rotatePages { arguments.append("--rotate-pages") }
+            if !configuration.deskew { arguments.append("--deskew") }
+            arguments.append(contentsOf: ["--oversample", "300"])
+        }
         arguments.append(contentsOf: [input.path, output.path])
         return arguments
     }
 
-    private func validateOutput(_ url: URL, expectedPages: Int) throws {
+    private func runOCR(
+        executable: URL,
+        configuration: OCRConfiguration,
+        input: URL,
+        output: URL,
+        recoveryAttempt: Bool
+    ) throws {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = executable
+        process.arguments = arguments(
+            configuration: configuration,
+            input: input,
+            output: output,
+            recoveryAttempt: recoveryAttempt
+        )
+        process.standardOutput = pipe
+        process.standardError = pipe
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = dependencies.environmentPATH
+        process.environment = environment
+        process.qualityOfService = configuration.cpuMode == .economical ? .utility : .userInitiated
+        currentProcess = process
+        defer { currentProcess = nil }
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        try Task.checkCancellation()
+        guard process.terminationStatus == 0 else {
+            throw PrivateDocSearchError.processFailed(
+                Self.sanitizedDiagnostics(
+                    String(decoding: data, as: UTF8.self),
+                    replacing: input.path
+                )
+            )
+        }
+    }
+
+    private func qualityScore(_ qualities: [OCRPageQuality]) -> Double {
+        guard !qualities.isEmpty else { return -.infinity }
+        return qualities.reduce(0) { result, quality in
+            let statusBonus: Double = switch quality.status {
+            case .good: 100
+            case .review: 40
+            case .likelyFailed: 0
+            }
+            return result + statusBonus + (quality.meanConfidence ?? 0)
+                + min(Double(quality.characterCount), 2_000) / 100
+        } / Double(qualities.count)
+    }
+
+    private func validateOutput(_ url: URL, expectedPages: Int) throws -> [ExtractedPage] {
         guard fileManager.fileExists(atPath: url.path),
               let handle = try? FileHandle(forReadingFrom: url) else {
             throw PrivateDocSearchError.invalidPDF("OCR-Ausgabedatei fehlt.")
@@ -326,6 +699,143 @@ public actor OCRmyPDFProcessor: OCRProcessing {
         guard extractor.hasUsableTextLayer(pages) else {
             throw PrivateDocSearchError.invalidPDF("Keine brauchbare Textschicht nach OCR.")
         }
+        if let pdfInfo = dependencies.pdfInfo {
+            let integrity = try run(executable: pdfInfo, arguments: [url.path])
+            guard integrity.status == 0 else {
+                throw PrivateDocSearchError.invalidPDF("pdfinfo meldet einen Strukturfehler.")
+            }
+        }
+        return pages
+    }
+
+    private func qualityResults(
+        pdf: URL,
+        pages: [ExtractedPage],
+        languages: [String]
+    ) -> [OCRPageQuality] {
+        pages.map { page in
+            let words = page.text.split(whereSeparator: \.isWhitespace).map(String.init)
+            let unusual = page.text.unicodeScalars.filter {
+                !$0.properties.isAlphabetic
+                    && $0.properties.numericType == nil
+                    && !CharacterSet.whitespacesAndNewlines.contains($0)
+                    && !CharacterSet.punctuationCharacters.contains($0)
+            }.count
+            let broken = words.filter {
+                $0.count >= 4 && $0.unicodeScalars.filter(\.properties.isAlphabetic).count * 2 < $0.count
+            }.count
+            let confidence = tesseractConfidence(
+                pdf: pdf,
+                pageNumber: page.pageNumber,
+                languages: languages
+            )
+            let characters = page.text.trimmingCharacters(in: .whitespacesAndNewlines).count
+            let density = min(1, Double(characters) / 1_500)
+            let status: OCRQualityStatus
+            if characters < 8 || (confidence ?? 100) < 40 {
+                status = .likelyFailed
+            } else if (confidence ?? 100) < 70
+                        || unusual > max(3, characters / 20)
+                        || broken > max(2, words.count / 10) {
+                status = .review
+            } else {
+                status = .good
+            }
+            return OCRPageQuality(
+                pageNumber: page.pageNumber,
+                meanConfidence: confidence,
+                characterCount: characters,
+                wordCount: words.count,
+                unusualCharacterCount: unusual,
+                suspectedBrokenWordCount: broken,
+                recognizedLanguage: detectedLanguage(
+                    in: page.text,
+                    configuredLanguages: languages
+                ),
+                isEmpty: characters == 0,
+                imageToTextRatio: 1 - density,
+                status: status
+            )
+        }
+    }
+
+    private func detectedLanguage(
+        in text: String,
+        configuredLanguages: [String]
+    ) -> String {
+        let normalized = text.lowercased()
+        let germanMarkers = [" der ", " die ", " und ", " ist ", " nicht ", " ein ", " eine "]
+        let englishMarkers = [" the ", " and ", " is ", " not ", " a ", " of ", " to "]
+        let germanScore = germanMarkers.filter(normalized.contains).count
+        let englishScore = englishMarkers.filter(normalized.contains).count
+        if germanScore > englishScore, configuredLanguages.contains("deu") { return "deu" }
+        if englishScore > germanScore, configuredLanguages.contains("eng") { return "eng" }
+        return configuredLanguages.count == 1
+            ? configuredLanguages[0]
+            : "unbestimmt"
+    }
+
+    private func tesseractConfidence(
+        pdf: URL,
+        pageNumber: Int,
+        languages: [String]
+    ) -> Double? {
+        guard let renderer = dependencies.pdfToPPM,
+              let tesseract = dependencies.tesseract else { return nil }
+        let directory = fileManager.temporaryDirectory.appending(
+            path: "PrivateDocSearch-quality-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? fileManager.removeItem(at: directory) }
+            let prefix = directory.appending(path: "page")
+            let render = try run(
+                executable: renderer,
+                arguments: [
+                    "-f", String(pageNumber), "-l", String(pageNumber),
+                    "-singlefile", "-r", "150", "-png", pdf.path, prefix.path
+                ]
+            )
+            guard render.status == 0 else { return nil }
+            let image = prefix.appendingPathExtension("png")
+            let result = try run(
+                executable: tesseract,
+                arguments: [
+                    image.path, "stdout", "-l", languages.joined(separator: "+"), "tsv"
+                ]
+            )
+            guard result.status == 0 else { return nil }
+            let confidences = result.output.components(separatedBy: .newlines).compactMap { line -> Double? in
+                let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+                guard fields.count >= 12,
+                      fields[0] == "5",
+                      !fields[11].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let value = Double(fields[10]),
+                      value >= 0 else { return nil }
+                return value
+            }
+            guard !confidences.isEmpty else { return nil }
+            return confidences.reduce(0, +) / Double(confidences.count)
+        } catch {
+            return nil
+        }
+    }
+
+    private func run(executable: URL, arguments: [String]) throws -> (status: Int32, output: String) {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = executable
+        process.arguments = arguments
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = dependencies.environmentPATH
+        process.environment = environment
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
     private static func sanitizedDiagnostics(_ diagnostics: String, replacing path: String) -> String {

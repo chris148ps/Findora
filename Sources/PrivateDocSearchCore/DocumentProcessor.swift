@@ -50,6 +50,46 @@ public actor DocumentProcessor {
         isPaused = paused
     }
 
+    public func rebuildSearchIndex(
+        onProgress: @Sendable (Progress) async -> Void
+    ) async throws {
+        let documents = try await database.storedDocumentTexts()
+        var rebuilt: [RebuiltDocumentIndex] = []
+        rebuilt.reserveCapacity(documents.count)
+        for (offset, document) in documents.enumerated() {
+            try Task.checkCancellation()
+            let chunks = chunker.chunks(
+                for: document.pages,
+                documentHash: document.contentHash
+            )
+            let embeddings = try await embedder.embed(documents: chunks.map(\.text))
+            rebuilt.append(
+                RebuiltDocumentIndex(
+                    document: document,
+                    chunks: chunks,
+                    embeddings: embeddings
+                )
+            )
+            await onProgress(
+                Progress(
+                    currentFile: nil,
+                    completed: offset + 1,
+                    total: documents.count
+                )
+            )
+        }
+        try await database.replaceEntireSearchIndex(
+            with: rebuilt,
+            embeddingModelID: embedder.modelID,
+            embeddingModelVersion: embedder.modelVersion
+        )
+        try? await fileLogger?.log(
+            .info,
+            category: "Indexwartung",
+            message: "Suchindex wurde vollständig aus dem gespeicherten Datenbanktext neu aufgebaut."
+        )
+    }
+
     public func processPending(
         ocrConfiguration: OCRConfiguration,
         onProgress: @Sendable (Progress) async -> Void
@@ -87,6 +127,7 @@ public actor DocumentProcessor {
                     }
                 }
             }
+            try await database.removeDocumentsWithoutActiveLocations()
             await onProgress(Progress(currentFile: nil, completed: completed, total: files.count))
         } catch {
             try? await database.recordError(category: "Indexierung", message: error.localizedDescription)
@@ -129,10 +170,21 @@ public actor DocumentProcessor {
         try await database.updateJob(path: file.id, state: .waitingForStability)
         var stable = try await stabilityChecker.waitUntilStable(file)
         let inputHash = try hasher.hash(fileAt: stable.url)
+        if try await database.reuseIndexedDocument(file: stable, observedHash: inputHash) {
+            try? await fileLogger?.log(
+                .info,
+                category: "Indexierung",
+                message: "Bekanntes Dokument anhand des Inhalts wiederverwendet.",
+                path: stable.url.path
+            )
+            return
+        }
 
         try await database.updateJob(path: file.id, state: .extracting)
         var pages = try extractor.extractPages(from: stable.url)
         var ocrPerformed = false
+        var currentFileHash = inputHash
+        var pageQualities: [OCRPageQuality] = []
 
         let needsOCR = !extractor.hasUsableTextLayer(pages)
             || extractor.needsMixedDocumentOCR(pages)
@@ -141,23 +193,52 @@ public actor DocumentProcessor {
                 throw PrivateDocSearchError.dependencyMissing("OCR-Verarbeitung ist nicht verfügbar.")
             }
             try await database.updateJob(path: file.id, state: .ocrRunning)
+            try? await fileLogger?.log(
+                .info,
+                category: "OCR",
+                message: ocrConfiguration.persistenceMode == .nonDestructive
+                    ? "Nicht-destruktive OCR wurde gestartet."
+                    : "Persistente OCR wurde gestartet.",
+                path: stable.url.path
+            )
             let result = try await selectedOCRProcessor.process(stable, configuration: ocrConfiguration)
             ocrPerformed = true
-            let attributes = try FileManager.default.attributesOfItem(atPath: stable.url.path)
-            stable = DiscoveredPDF(
-                url: stable.url,
-                relativePath: stable.relativePath,
-                fileName: stable.fileName,
-                size: (attributes[.size] as? NSNumber)?.int64Value ?? stable.size,
-                modifiedAt: attributes[.modificationDate] as? Date ?? stable.modifiedAt,
-                resourceIdentifier: stable.resourceIdentifier,
-                volumeIdentifier: stable.volumeIdentifier,
-                isLocallyAvailable: true
-            )
-            pages = try extractor.extractPages(from: stable.url)
-            guard extractor.hasUsableTextLayer(pages), result.outputHash != inputHash else {
+            pages = result.pages
+            pageQualities = result.pageQualities
+            if result.persistedToOriginal {
+                let attributes = try FileManager.default.attributesOfItem(atPath: stable.url.path)
+                stable = DiscoveredPDF(
+                    url: stable.url,
+                    relativePath: stable.relativePath,
+                    fileName: stable.fileName,
+                    size: (attributes[.size] as? NSNumber)?.int64Value ?? stable.size,
+                    modifiedAt: attributes[.modificationDate] as? Date ?? stable.modifiedAt,
+                    resourceIdentifier: stable.resourceIdentifier,
+                    volumeIdentifier: stable.volumeIdentifier,
+                    isLocallyAvailable: true
+                )
+                currentFileHash = result.outputHash
+            }
+            guard extractor.hasUsableTextLayer(pages) else {
                 throw PrivateDocSearchError.invalidPDF("OCR-Ausgabe enthält keine brauchbare Textschicht.")
             }
+            try? await fileLogger?.log(
+                .info,
+                category: "OCR",
+                message: result.persistedToOriginal
+                    ? "OCR wurde validiert und atomar in die PDF übernommen."
+                    : "OCR wurde validiert; Text wird nur in der Datenbank gespeichert.",
+                path: stable.url.path
+            )
+            let good = result.pageQualities.filter { $0.status == .good }.count
+            let review = result.pageQualities.filter { $0.status == .review }.count
+            let failed = result.pageQualities.filter { $0.status == .likelyFailed }.count
+            try? await fileLogger?.log(
+                failed > 0 ? .warning : .info,
+                category: "OCR-Qualität",
+                message: "Seiten: gut=\(good), prüfen=\(review), wahrscheinlich fehlgeschlagen=\(failed).",
+                path: stable.url.path
+            )
         }
 
         guard extractor.hasUsableTextLayer(pages) else {
@@ -165,18 +246,20 @@ public actor DocumentProcessor {
         }
 
         try await database.updateJob(path: file.id, state: .indexing)
-        let finalHash = try hasher.hash(fileAt: stable.url)
-        let chunks = chunker.chunks(for: pages, documentHash: finalHash)
+        let unchangedIdentityHash = inputHash
+        let chunks = chunker.chunks(for: pages, documentHash: unchangedIdentityHash)
         let embeddings = try await embedder.embed(documents: chunks.map(\.text))
         _ = try await database.indexDocument(
             file: stable,
-            hash: finalHash,
+            hash: unchangedIdentityHash,
+            currentFileHash: currentFileHash,
             pages: pages,
             chunks: chunks,
             embeddings: embeddings,
             embeddingModelID: embedder.modelID,
             embeddingModelVersion: embedder.modelVersion,
-            ocrPerformed: ocrPerformed
+            ocrPerformed: ocrPerformed,
+            pageQualities: pageQualities
         )
     }
 

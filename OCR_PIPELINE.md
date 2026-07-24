@@ -25,14 +25,15 @@ PDF/A ist eine ausdrückliche Nutzeroption. Optimierung 1 ist nur nach
 Nutzerwahl aktiv; Optimierung 2/3 wird als potenziell verlustbehaftet
 gekennzeichnet.
 
-## Abhängigkeitsprüfung
+## Abhängigkeitsprüfung und Installation
 
-Beim Start werden ausführbare Dateien nur an freigegebenen Orten gesucht:
+Beim Start werden ausführbare Dateien in dieser Reihenfolge gesucht:
 
-1. gespeicherter, vom Nutzer bestätigter Pfad;
-2. `/opt/homebrew/bin`;
-3. `/usr/local/bin`;
-4. definierter App-Bundle-Hilfsordner.
+1. `/opt/homebrew/bin`;
+2. `/usr/local/bin`;
+3. `/usr/bin`;
+4. `/bin`;
+5. Verzeichnisse aus dem geerbten `PATH`.
 
 Geprüft werden Version und Funktionsfähigkeit von:
 
@@ -40,10 +41,18 @@ Geprüft werden Version und Funktionsfähigkeit von:
 - `tesseract`
 - `pdftotext`
 - `pdfinfo`
+- `pdftoppm` für die seitenweise Qualitätsmessung
 - Tesseract-Sprachen aus `--list-langs`
 
-Fehlende Komponenten erzeugen einen sichtbaren Fehler mit Installationshinweis.
-Die App führt selbst kein `brew install` aus.
+Für jeden Unterprozess setzt die App denselben expliziten, protokollierten
+`PATH`. Deshalb funktioniert die Toolchain auch beim Finder-Start. Erst nach
+erfolgreichen Versions- und Sprachtests wird „Bereit“ angezeigt.
+
+Nach Nutzerbestätigung darf die App das gefundene Homebrew-Executable direkt
+mit den festen Argumenten `install ocrmypdf tesseract-lang poppler` starten.
+Benutzereingaben gelangen nicht in Argumente; eine Shell und `sudo` werden
+nicht verwendet. Fehlt Homebrew, wird nur die offizielle Installationsanleitung
+angeboten.
 
 ## Zulässige Eingaben
 
@@ -74,7 +83,18 @@ Gemischte PDFs werden mit `--skip-text` verarbeitet, wenn mindestens eine
 Seite die Schwelle klar unterschreitet. Vollständig brauchbare PDFs werden
 nicht an OCRmyPDF übergeben.
 
-## Sicherer Ersetzungsablauf
+## Dokumentidentität und OCR-Modi
+
+Der SHA-256 des unveränderten Originals ist die Dokumentidentität. Pfad,
+Dateiname und Zeitstempel sind nur Speicherortdaten. Umbenennen, Verschieben,
+identische Kopien und reine Metadatenänderungen verwenden vorhandene Seiten,
+Chunks und Embeddings wieder. Ändert sich der Inhalt, wird der neue Hash
+verarbeitet und verwaiste alte Indexdaten werden kontrolliert entfernt.
+
+Im Standardmodus wird die validierte OCR-Ausgabe nur gelesen und anschließend
+gelöscht. Seiten und Index entstehen aus dem in SQLite gespeicherten OCR-Text.
+Im optionalen persistenten Modus gilt zusätzlich der folgende
+Ersetzungsablauf:
 
 1. Eingabe-Metadaten, SHA-256 und Seitenzahl erfassen.
 2. Temporäre Ausgabe im selben Ordner erzeugen, damit der spätere Austausch
@@ -98,14 +118,23 @@ Wenn der atomare Austausch fehlschlägt, bleibt das Original erhalten.
 Temporäre Dateien tragen ein eindeutiges App-Präfix und werden nur innerhalb
 des gewählten Ordners und nur nach Alters-/Jobabgleich entfernt.
 
+## Qualitätsprüfung
+
+Für jede Seite werden Tesseract-TSV-Konfidenz, Zeichen- und Wortzahl,
+ungewöhnliche Zeichen, verdächtig beschädigte Wörter, erkannte Sprache,
+Leerseitenindikator und Bild-/Text-Verhältnis gespeichert. Daraus entsteht „Gut“,
+„Prüfen“ oder „Wahrscheinlich fehlgeschlagen“. Bei wahrscheinlich
+fehlgeschlagenen Seiten ist genau ein zweiter Versuch mit Rotation,
+Begradigung und 300-dpi-Übersampling zulässig; nur die besser bewertete,
+vollständig validierte Variante wird verwendet.
+
 ## Parallelität
 
 Auf 8 GB ist die Standardeinstellung ein OCR-Prozess. CPU-Modi:
 
 - sparsam: ein Prozess, niedrige QoS;
-- normal: ein Prozess, Utility-QoS;
+- normal: gewählte Parallelität, User-Initiated-QoS;
 - schnell: bis zur konfigurierten Obergrenze, höchstens halbe Performance-Cores.
 
 Der Nutzer kann Verarbeitung pausieren. Jobs verbleiben persistent in
 `processing_jobs`.
-

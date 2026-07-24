@@ -127,6 +127,19 @@ public actor SQLiteDatabase {
                     .text(rootPrefix)
                 ]
             )
+            try execute(
+                """
+                UPDATE processing_jobs
+                SET state = 'retired', last_error = NULL, updated_at = ?
+                WHERE substr(absolute_path, 1, length(?)) = ?
+                  AND absolute_path NOT IN (SELECT absolute_path FROM current_scan_paths)
+                """,
+                bindings: [
+                    .real(completedAt.timeIntervalSince1970),
+                    .text(rootPrefix),
+                    .text(rootPrefix)
+                ]
+            )
 
             try setSetting(key: "documentRootPath", value: root.path)
             try setSetting(key: "lastFullScan", value: String(completedAt.timeIntervalSince1970))
@@ -187,12 +200,14 @@ public actor SQLiteDatabase {
     public func indexDocument(
         file: DiscoveredPDF,
         hash: String,
+        currentFileHash: String? = nil,
         pages: [ExtractedPage],
         chunks: [TextChunk],
         embeddings: [[Float]],
         embeddingModelID: String,
         embeddingModelVersion: String,
-        ocrPerformed: Bool
+        ocrPerformed: Bool,
+        pageQualities: [OCRPageQuality] = []
     ) throws -> Int64 {
         guard chunks.count == embeddings.count else {
             throw PrivateDocSearchError.database("Chunk- und Embedding-Anzahl stimmen nicht überein.")
@@ -231,8 +246,8 @@ public actor SQLiteDatabase {
                 """
                 INSERT INTO document_locations
                     (document_id, absolute_path, relative_path, file_name, file_size,
-                     modified_at, deleted_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                     modified_at, deleted_at, last_seen_at, current_file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 ON CONFLICT(absolute_path) DO UPDATE SET
                     document_id = excluded.document_id,
                     relative_path = excluded.relative_path,
@@ -240,7 +255,8 @@ public actor SQLiteDatabase {
                     file_size = excluded.file_size,
                     modified_at = excluded.modified_at,
                     deleted_at = NULL,
-                    last_seen_at = excluded.last_seen_at
+                    last_seen_at = excluded.last_seen_at,
+                    current_file_hash = excluded.current_file_hash
                 """,
                 bindings: [
                     .integer(documentID),
@@ -249,7 +265,8 @@ public actor SQLiteDatabase {
                     .text(file.fileName),
                     .integer(file.size),
                     .real(file.modifiedAt.timeIntervalSince1970),
-                    .real(now)
+                    .real(now),
+                    .text(currentFileHash ?? hash)
                 ]
             )
 
@@ -262,8 +279,42 @@ public actor SQLiteDatabase {
                 try execute("DELETE FROM pages WHERE document_id = ?", bindings: [.integer(documentID)])
                 for page in pages {
                     try execute(
-                        "INSERT INTO pages (document_id, page_number, text) VALUES (?, ?, ?)",
-                        bindings: [.integer(documentID), .integer(Int64(page.pageNumber)), .text(page.text)]
+                        "INSERT INTO pages (document_id, page_number, text, text_source) VALUES (?, ?, ?, ?)",
+                        bindings: [
+                            .integer(documentID),
+                            .integer(Int64(page.pageNumber)),
+                            .text(page.text),
+                            .text(ocrPerformed ? "ocr" : "extracted")
+                        ]
+                    )
+                }
+
+                try execute(
+                    "DELETE FROM ocr_page_quality WHERE document_id = ?",
+                    bindings: [.integer(documentID)]
+                )
+                for quality in pageQualities {
+                    try execute(
+                        """
+                        INSERT INTO ocr_page_quality
+                            (document_id, page_number, mean_confidence, character_count,
+                             word_count, unusual_character_count, broken_word_count,
+                             recognized_language, is_empty, image_text_ratio, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        bindings: [
+                            .integer(documentID),
+                            .integer(Int64(quality.pageNumber)),
+                            quality.meanConfidence.map(SQLiteValue.real) ?? .null,
+                            .integer(Int64(quality.characterCount)),
+                            .integer(Int64(quality.wordCount)),
+                            .integer(Int64(quality.unusualCharacterCount)),
+                            .integer(Int64(quality.suspectedBrokenWordCount)),
+                            .text(quality.recognizedLanguage),
+                            .integer(quality.isEmpty ? 1 : 0),
+                            .real(quality.imageToTextRatio),
+                            .text(quality.status.rawValue)
+                        ]
                     )
                 }
 
@@ -349,6 +400,105 @@ public actor SQLiteDatabase {
         }
     }
 
+    /// Reuses a fully indexed document by immutable source hash or by the hash of
+    /// a safely materialized OCR PDF. Paths and timestamps remain location data.
+    public func reuseIndexedDocument(file: DiscoveredPDF, observedHash: String) throws -> Bool {
+        let rows = try query(
+            """
+            SELECT d.id, d.content_hash
+            FROM documents d
+            WHERE (d.content_hash = ?
+                   OR EXISTS (
+                       SELECT 1 FROM document_locations known
+                       WHERE known.document_id = d.id
+                         AND known.current_file_hash = ?
+                   ))
+              AND EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id)
+            LIMIT 1
+            """,
+            bindings: [.text(observedHash), .text(observedHash)]
+        )
+        guard let row = rows.first,
+              let documentID = row.int64("id"),
+              let identityHash = row.string("content_hash") else {
+            return false
+        }
+
+        try transaction {
+            let now = Date().timeIntervalSince1970
+            try execute(
+                """
+                INSERT INTO document_locations
+                    (document_id, absolute_path, relative_path, file_name, file_size,
+                     modified_at, deleted_at, last_seen_at, current_file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(absolute_path) DO UPDATE SET
+                    document_id = excluded.document_id,
+                    relative_path = excluded.relative_path,
+                    file_name = excluded.file_name,
+                    file_size = excluded.file_size,
+                    modified_at = excluded.modified_at,
+                    deleted_at = NULL,
+                    last_seen_at = excluded.last_seen_at,
+                    current_file_hash = excluded.current_file_hash
+                """,
+                bindings: [
+                    .integer(documentID),
+                    .text(file.url.path),
+                    .text(file.relativePath),
+                    .text(file.fileName),
+                    .integer(file.size),
+                    .real(file.modifiedAt.timeIntervalSince1970),
+                    .real(now),
+                    .text(observedHash)
+                ]
+            )
+            try execute(
+                """
+                UPDATE processing_jobs
+                SET state = 'indexed', content_hash = ?, discovered_size = ?,
+                    discovered_modified_at = ?, last_error = NULL, updated_at = ?
+                WHERE job_key = ?
+                """,
+                bindings: [
+                    .text(identityHash),
+                    .integer(file.size),
+                    .real(file.modifiedAt.timeIntervalSince1970),
+                    .real(now),
+                    .text(file.id)
+                ]
+            )
+        }
+        return true
+    }
+
+    public func removeDocumentsWithoutActiveLocations() throws {
+        try transaction {
+            try execute(
+                """
+                DELETE FROM chunks_fts
+                WHERE chunk_id IN (
+                    SELECT c.id
+                    FROM chunks c
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM document_locations l
+                        WHERE l.document_id = c.document_id AND l.deleted_at IS NULL
+                    )
+                )
+                """
+            )
+            try execute(
+                """
+                DELETE FROM documents
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_locations l
+                    WHERE l.document_id = documents.id AND l.deleted_at IS NULL
+                )
+                """
+            )
+        }
+    }
+
     public func lexicalSearch(query searchText: String, limit: Int = 40) throws -> [SearchSource] {
         let matchQuery = Self.safeFTSQuery(searchText)
         guard !matchQuery.isEmpty else { return [] }
@@ -430,10 +580,19 @@ public actor SQLiteDatabase {
             "SELECT COUNT(*) FROM documents WHERE ocr_status = 'completed'"
         ))
         result.pendingJobs = Int(try scalarInt64(
-            "SELECT COUNT(*) FROM processing_jobs WHERE state NOT IN ('indexed', 'failed')"
+            "SELECT COUNT(*) FROM processing_jobs WHERE state NOT IN ('indexed', 'failed', 'unavailable', 'retired')"
         ))
         result.failedJobs = Int(try scalarInt64(
             "SELECT COUNT(*) FROM processing_jobs WHERE state = 'failed'"
+        ))
+        result.ocrQualityGoodPages = Int(try scalarInt64(
+            "SELECT COUNT(*) FROM ocr_page_quality WHERE status = 'good'"
+        ))
+        result.ocrQualityReviewPages = Int(try scalarInt64(
+            "SELECT COUNT(*) FROM ocr_page_quality WHERE status = 'review'"
+        ))
+        result.ocrQualityFailedPages = Int(try scalarInt64(
+            "SELECT COUNT(*) FROM ocr_page_quality WHERE status = 'likelyFailed'"
         ))
         if let value = try setting(key: "lastFullScan").flatMap(Double.init) {
             result.lastFullScan = Date(timeIntervalSince1970: value)
@@ -471,6 +630,211 @@ public actor SQLiteDatabase {
             """,
             bindings: [.real(Date().timeIntervalSince1970)]
         )
+    }
+
+    public func storedDocumentTexts() throws -> [StoredDocumentText] {
+        let rows = try query(
+            """
+            SELECT d.id AS document_id, d.content_hash, p.page_number, p.text,
+                   COALESCE(MAX(l.modified_at), 0) AS modified_at
+            FROM documents d
+            JOIN pages p ON p.document_id = d.id
+            JOIN document_locations l ON l.document_id = d.id AND l.deleted_at IS NULL
+            GROUP BY d.id, d.content_hash, p.page_number, p.text
+            ORDER BY d.id, p.page_number
+            """
+        )
+        var order: [Int64] = []
+        var values: [Int64: (String, Date, [ExtractedPage])] = [:]
+        for row in rows {
+            guard let id = row.int64("document_id"),
+                  let hash = row.string("content_hash"),
+                  let pageNumber = row.int64("page_number"),
+                  let text = row.string("text"),
+                  let modified = row.double("modified_at") else { continue }
+            if values[id] == nil {
+                order.append(id)
+                values[id] = (hash, Date(timeIntervalSince1970: modified), [])
+            }
+            values[id]?.2.append(ExtractedPage(pageNumber: Int(pageNumber), text: text))
+        }
+        return order.compactMap { id in
+            guard let value = values[id] else { return nil }
+            return StoredDocumentText(
+                documentID: id,
+                contentHash: value.0,
+                modifiedAt: value.1,
+                pages: value.2
+            )
+        }
+    }
+
+    public func replaceEntireSearchIndex(
+        with indexes: [RebuiltDocumentIndex],
+        embeddingModelID: String,
+        embeddingModelVersion: String
+    ) throws {
+        for index in indexes where index.chunks.count != index.embeddings.count {
+            throw PrivateDocSearchError.database("Chunk- und Embedding-Anzahl stimmen nicht überein.")
+        }
+        try transaction {
+            let now = Date().timeIntervalSince1970
+            try execute("DELETE FROM chunks_fts")
+            try execute("DELETE FROM chunk_embeddings")
+            try execute("DELETE FROM chunks")
+            for index in indexes {
+                for (offset, chunk) in index.chunks.enumerated() {
+                    try execute(
+                        """
+                        INSERT INTO chunks
+                            (id, document_id, document_hash, page_number, ordinal, chunk_text,
+                             modified_at, indexed_at, embedding_model_id, embedding_model_version)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        bindings: [
+                            .text(chunk.id),
+                            .integer(index.document.documentID),
+                            .text(index.document.contentHash),
+                            .integer(Int64(chunk.pageNumber)),
+                            .integer(Int64(chunk.ordinal)),
+                            .text(chunk.text),
+                            .real(index.document.modifiedAt.timeIntervalSince1970),
+                            .real(now),
+                            .text(embeddingModelID),
+                            .text(embeddingModelVersion)
+                        ]
+                    )
+                    try execute(
+                        "INSERT INTO chunks_fts (chunk_id, chunk_text) VALUES (?, ?)",
+                        bindings: [.text(chunk.id), .text(chunk.text)]
+                    )
+                    try execute(
+                        """
+                        INSERT INTO chunk_embeddings
+                            (chunk_id, model_id, model_version, dimensions, vector)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        bindings: [
+                            .text(chunk.id),
+                            .text(embeddingModelID),
+                            .text(embeddingModelVersion),
+                            .integer(Int64(index.embeddings[offset].count)),
+                            .blob(Self.encode(vector: index.embeddings[offset]))
+                        ]
+                    )
+                }
+                try execute(
+                    "UPDATE documents SET last_indexed_at = ? WHERE id = ?",
+                    bindings: [.real(now), .integer(index.document.documentID)]
+                )
+            }
+        }
+    }
+
+    public func resetOCRData() throws {
+        try transaction {
+            let now = Date().timeIntervalSince1970
+            try execute(
+                """
+                DELETE FROM chunks_fts
+                WHERE chunk_id IN (
+                    SELECT c.id FROM chunks c
+                    JOIN documents d ON d.id = c.document_id
+                    WHERE d.ocr_status = 'completed'
+                )
+                """
+            )
+            try execute(
+                "DELETE FROM chunks WHERE document_id IN (SELECT id FROM documents WHERE ocr_status = 'completed')"
+            )
+            try execute(
+                "DELETE FROM pages WHERE document_id IN (SELECT id FROM documents WHERE ocr_status = 'completed')"
+            )
+            try execute(
+                "DELETE FROM ocr_page_quality WHERE document_id IN (SELECT id FROM documents WHERE ocr_status = 'completed')"
+            )
+            try execute(
+                """
+                UPDATE documents
+                SET ocr_status = 'pending', text_layer_present = 0,
+                    last_successful_processing = NULL, last_indexed_at = NULL
+                WHERE ocr_status = 'completed'
+                """
+            )
+            try execute(
+                """
+                UPDATE processing_jobs
+                SET state = 'discovered', last_error = NULL, updated_at = ?
+                WHERE absolute_path IN (
+                    SELECT absolute_path FROM document_locations WHERE deleted_at IS NULL
+                )
+                  AND content_hash IN (
+                    SELECT content_hash FROM documents WHERE ocr_status = 'pending'
+                )
+                """,
+                bindings: [.real(now)]
+            )
+        }
+    }
+
+    public func deleteDocumentIndex() throws {
+        try transaction {
+            try execute("DELETE FROM chunks_fts")
+            try execute("DELETE FROM processing_jobs")
+            try execute("DELETE FROM document_locations")
+            try execute("DELETE FROM documents")
+            try execute("DELETE FROM errors")
+            try execute("DELETE FROM search_history")
+        }
+    }
+
+    public func repairIndex() throws -> String {
+        let integrity = try query("PRAGMA integrity_check").first?.string("integrity_check") ?? "unknown"
+        guard integrity == "ok" else {
+            throw PrivateDocSearchError.database("SQLite-Integritätsprüfung: \(integrity)")
+        }
+        let foreignKeys = try query("PRAGMA foreign_key_check")
+        guard foreignKeys.isEmpty else {
+            throw PrivateDocSearchError.database(
+                "SQLite meldet \(foreignKeys.count) Fremdschlüsselverletzungen."
+            )
+        }
+        try transaction {
+            let now = Date().timeIntervalSince1970
+            try execute("DELETE FROM chunks_fts")
+            try execute(
+                "INSERT INTO chunks_fts (chunk_id, chunk_text) SELECT id, chunk_text FROM chunks"
+            )
+            try execute(
+                """
+                UPDATE processing_jobs
+                SET state = 'retired', last_error = NULL, updated_at = ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_locations l
+                    WHERE l.absolute_path = processing_jobs.absolute_path
+                      AND l.deleted_at IS NULL
+                )
+                  AND state != 'unavailable'
+                """,
+                bindings: [.real(now)]
+            )
+            try execute(
+                """
+                UPDATE processing_jobs
+                SET state = 'discovered', last_error = NULL, updated_at = ?
+                WHERE absolute_path IN (
+                    SELECT l.absolute_path
+                    FROM document_locations l
+                    WHERE l.deleted_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM chunks c WHERE c.document_id = l.document_id
+                      )
+                )
+                """,
+                bindings: [.real(now)]
+            )
+        }
+        return "SQLite-Integrität und Fremdschlüssel sind in Ordnung; FTS und Jobzustände wurden abgeglichen."
     }
 
     public func retryFailedJobs() throws {
@@ -546,6 +910,39 @@ public actor SQLiteDatabase {
                 }
                 try execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 2 {
+            try transaction {
+                for statement in Self.migration2 {
+                    try execute(statement)
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 3 {
+            try transaction {
+                for statement in Self.migration3 {
+                    try execute(statement)
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 4 {
+            try transaction {
+                for statement in Self.migration4 {
+                    try execute(statement)
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
                     bindings: [.real(Date().timeIntervalSince1970)]
                 )
             }
@@ -887,6 +1284,47 @@ public actor SQLiteDatabase {
         "CREATE INDEX idx_jobs_state ON processing_jobs(state, updated_at)",
         "CREATE INDEX idx_chunks_document ON chunks(document_id)",
         "CREATE INDEX idx_embeddings_model ON chunk_embeddings(model_id, model_version)"
+    ]
+
+    private static let migration2 = [
+        "ALTER TABLE document_locations ADD COLUMN current_file_hash TEXT",
+        """
+        UPDATE document_locations
+        SET current_file_hash = (
+            SELECT content_hash FROM documents WHERE documents.id = document_locations.document_id
+        )
+        WHERE current_file_hash IS NULL
+        """,
+        "CREATE INDEX idx_locations_current_hash ON document_locations(current_file_hash)"
+    ]
+
+    private static let migration3 = [
+        """
+        CREATE TABLE ocr_page_quality (
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            page_number INTEGER NOT NULL,
+            mean_confidence REAL,
+            character_count INTEGER NOT NULL,
+            word_count INTEGER NOT NULL,
+            unusual_character_count INTEGER NOT NULL,
+            broken_word_count INTEGER NOT NULL,
+            recognized_language TEXT NOT NULL,
+            is_empty INTEGER NOT NULL,
+            image_text_ratio REAL NOT NULL,
+            status TEXT NOT NULL,
+            PRIMARY KEY(document_id, page_number)
+        )
+        """,
+        "CREATE INDEX idx_ocr_quality_status ON ocr_page_quality(status)"
+    ]
+
+    private static let migration4 = [
+        "ALTER TABLE pages ADD COLUMN text_source TEXT NOT NULL DEFAULT 'extracted'",
+        """
+        UPDATE pages
+        SET text_source = 'ocr'
+        WHERE document_id IN (SELECT id FROM documents WHERE ocr_status = 'completed')
+        """
     ]
 }
 

@@ -229,13 +229,17 @@ public struct InstalledModel: Identifiable, Equatable, Sendable {
     public let isInstalled: Bool
     public let isActive: Bool
     public let compatibility: ModelCompatibility
+    public let installedVersion: String?
+    public let updateAvailable: Bool
 
     public init(
         descriptor: LocalModelDescriptor,
         directory: URL,
         isInstalled: Bool,
         isActive: Bool,
-        compatibility: ModelCompatibility
+        compatibility: ModelCompatibility,
+        installedVersion: String? = nil,
+        updateAvailable: Bool = false
     ) {
         self.id = descriptor.id
         self.descriptor = descriptor
@@ -243,5 +247,7 @@ public struct InstalledModel: Identifiable, Equatable, Sendable {
         self.isInstalled = isInstalled
         self.isActive = isActive
         self.compatibility = compatibility
+        self.installedVersion = installedVersion
+        self.updateAvailable = updateAvailable
     }
 }

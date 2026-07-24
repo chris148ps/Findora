@@ -86,6 +86,8 @@ final class AppState {
     var activeEmbeddingModelID: String?
     var activeAnswerModelID: String?
     var modelMessage: String?
+    var isInstallingOCRComponents = false
+    var ocrInstallationMessage: String?
     let hardwareProfile: HardwareProfile
 
     private let paths: AppPaths
@@ -116,13 +118,12 @@ final class AppState {
             self.modelManager = LocalModelManager(catalog: catalog, paths: paths)
             self.hardwareProfile = HardwareProfile.current(storageURL: paths.applicationSupport)
             let embedder = TokenHashEmbedding()
-            let dependencies = OCRDependencyChecker().check()
+            let dependencies = OCRDependencyChecker().check(runFunctionalSelfTest: false)
             self.ocrDependencies = dependencies
-            let ocrFactory: (@Sendable () -> any OCRProcessing)?
-            if dependencies.isReady {
-                ocrFactory = { OCRmyPDFProcessor(dependencies: dependencies) }
-            } else {
-                ocrFactory = nil
+            let ocrFactory: @Sendable () -> any OCRProcessing = {
+                OCRmyPDFProcessor(
+                    dependencies: OCRDependencyChecker().check(runFunctionalSelfTest: false)
+                )
             }
             self.processor = DocumentProcessor(
                 database: database,
@@ -149,20 +150,34 @@ final class AppState {
             try await database.initialize()
             await runMemoryPressureDiagnosticIfRequested()
             await loadSettings()
+            await refreshOCRComponents()
             launchAtLogin = SMAppService.mainApp.status == .enabled
-            documentFolderPath = await bookmarkStore.displayPath()
-            resolvedFolder = try await bookmarkStore.resolve()
-            if let folder = resolvedFolder {
-                documentFolderPath = folder.url.path
-                folderStatus = "Erreichbar"
-                _ = try OCRTemporaryFileCleaner().removeAbandonedFiles(below: folder.url)
-                configureFolderWatcher(for: folder.url)
+            let documentAccessDisabled =
+                ProcessInfo.processInfo.environment["PRIVATEDOCSEARCH_DISABLE_DOCUMENT_ACCESS"] == "1"
+            if documentAccessDisabled {
+                documentFolderPath = nil
+                resolvedFolder = nil
+                folderStatus = "Dokumentzugriff für Diagnose deaktiviert"
+                try? await fileLogger.log(
+                    .info,
+                    category: "Diagnose",
+                    message: "Dokumentzugriff und Scan wurden für diesen Diagnoselauf deaktiviert."
+                )
+            } else {
+                documentFolderPath = await bookmarkStore.displayPath()
+                resolvedFolder = try await bookmarkStore.resolve()
+                if let folder = resolvedFolder {
+                    documentFolderPath = folder.url.path
+                    folderStatus = "Erreichbar"
+                    _ = try OCRTemporaryFileCleaner().removeAbandonedFiles(below: folder.url)
+                    configureFolderWatcher(for: folder.url)
+                }
             }
             await restoreModelSelection()
             await refreshModels()
             await refreshDatabaseState()
             startScanLoop()
-            if resolvedFolder != nil {
+            if resolvedFolder != nil, !documentAccessDisabled {
                 await scanNow()
             }
         } catch {
@@ -283,6 +298,126 @@ final class AppState {
         }
     }
 
+    func refreshOCRComponents() async {
+        let dependencies = await Task.detached {
+            OCRDependencyChecker().check()
+        }.value
+        ocrDependencies = dependencies
+        let paths = [
+            dependencies.ocrMyPDF,
+            dependencies.tesseract,
+            dependencies.pdfText,
+            dependencies.pdfInfo
+        ].compactMap(\.?.path).joined(separator: ", ")
+        let versions = dependencies.versions
+            .sorted(by: { $0.key < $1.key })
+            .map { "\($0.key)=\($0.value.replacingOccurrences(of: "\n", with: " "))" }
+            .joined(separator: "; ")
+        try? await fileLogger.log(
+            dependencies.isReady ? .info : .warning,
+            category: "OCR-Komponenten",
+            message: "PATH=\(dependencies.environmentPATH); Werkzeuge=\(paths); Versionen=\(versions); Selbsttest=\(dependencies.selfTestPassed)"
+        )
+    }
+
+    func installMissingOCRComponents() {
+        guard !isInstallingOCRComponents else { return }
+        isInstallingOCRComponents = true
+        ocrInstallationMessage = "OCR-Komponenten werden installiert …"
+        let dependencies = ocrDependencies
+        Task {
+            defer { isInstallingOCRComponents = false }
+            do {
+                let result = try await OCRComponentInstaller().installMissing(from: dependencies)
+                ocrDependencies = result.dependencies
+                ocrInstallationMessage = "Installation und Werkzeug-Selbsttest erfolgreich."
+                try? await fileLogger.log(
+                    .info,
+                    category: "OCR-Komponenten",
+                    message: "OCR-Komponenten wurden installiert und erneut geprüft."
+                )
+            } catch {
+                ocrInstallationMessage = error.localizedDescription
+                report(error)
+                await refreshOCRComponents()
+            }
+        }
+    }
+
+    func rebuildSearchIndex() {
+        guard !isProcessing else { return }
+        isProcessing = true
+        Task {
+            defer { isProcessing = false }
+            do {
+                try await processor.rebuildSearchIndex { [weak self] progress in
+                    await MainActor.run {
+                        self?.completedFiles = progress.completed
+                        self?.totalFiles = progress.total
+                    }
+                }
+                modelMessage = "Der Suchindex wurde aus dem gespeicherten Text neu aufgebaut."
+                await refreshDatabaseState()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func resetOCRData() {
+        guard !isProcessing else { return }
+        Task {
+            do {
+                try await database.resetOCRData()
+                try? await fileLogger.log(
+                    .warning,
+                    category: "Indexwartung",
+                    message: "OCR-Text, OCR-Qualität und davon abhängige Indexdaten wurden zurückgesetzt."
+                )
+                await scanNow()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func deleteDocumentIndex() {
+        guard !isProcessing else { return }
+        setPaused(true)
+        Task {
+            do {
+                try await database.deleteDocumentIndex()
+                try? await fileLogger.log(
+                    .warning,
+                    category: "Indexwartung",
+                    message: "Der vollständige Dokumentindex wurde gelöscht; PDFs, Modelle und Einstellungen blieben erhalten."
+                )
+                modelMessage = "Dokumentindex gelöscht. Verarbeitung bleibt bis zum manuellen Fortsetzen pausiert."
+                await refreshDatabaseState()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func repairIndex() {
+        guard !isProcessing else { return }
+        Task {
+            do {
+                let result = try await database.repairIndex()
+                modelMessage = result
+                try? await fileLogger.log(
+                    .info,
+                    category: "Indexwartung",
+                    message: result
+                )
+                await refreshDatabaseState()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
     func submitQuestion() {
         let value = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, !isSearching else { return }
@@ -352,7 +487,7 @@ final class AppState {
         availableModels = await modelManager.models(profile: hardwareProfile)
     }
 
-    func installModel(_ model: InstalledModel) {
+    func installModel(_ model: InstalledModel, activateAfterInstall: Bool = false) {
         guard modelDownloadTask == nil else { return }
         downloadingModelID = model.id
         pausedModelID = nil
@@ -393,6 +528,9 @@ final class AppState {
                 }
                 modelMessage = "\(model.descriptor.displayName) wurde sicher installiert."
                 await refreshModels()
+                if activateAfterInstall {
+                    activateModel(model)
+                }
             } catch is ModelDownloadPausedError {
                 pausedModelID = model.id
                 modelMessage = "Modelldownload pausiert. Er kann fortgesetzt oder verworfen werden."
@@ -438,9 +576,13 @@ final class AppState {
                     let previousProcessor = processor
                     do {
                         processor = makeProcessor(embedder: provider)
-                        try await database.queueFullReindex()
+                        try await processor.rebuildSearchIndex { [weak self] progress in
+                            await MainActor.run {
+                                self?.completedFiles = progress.completed
+                                self?.totalFiles = progress.total
+                            }
+                        }
                         modelMessage = "Der neue Embedding-Index wird aufgebaut; die bisherige Suche bleibt aktiv."
-                        await scanNow()
                         let coverage = try await database.embeddingCoverage(
                             modelID: model.id,
                             modelVersion: model.descriptor.modelVersion
@@ -636,17 +778,14 @@ final class AppState {
     }
 
     private func makeProcessor(embedder: any EmbeddingProviding) -> DocumentProcessor {
-        let processorDependencies = OCRDependencyChecker().check()
-        let ocrFactory: (@Sendable () -> any OCRProcessing)?
-        if processorDependencies.isReady {
-            ocrFactory = { OCRmyPDFProcessor(dependencies: processorDependencies) }
-        } else {
-            ocrFactory = nil
-        }
         return DocumentProcessor(
             database: database,
             embedder: embedder,
-            ocrProcessorFactory: ocrFactory,
+            ocrProcessorFactory: {
+                OCRmyPDFProcessor(
+                    dependencies: OCRDependencyChecker().check(runFunctionalSelfTest: false)
+                )
+            },
             fileLogger: fileLogger
         )
     }
@@ -983,6 +1122,9 @@ struct StatusView: View {
                     MetricCard(title: "Durch OCR", value: state.statistics.ocrProcessedPDFs)
                     MetricCard(title: "Wartend", value: state.statistics.pendingJobs)
                     MetricCard(title: "Fehler", value: state.statistics.failedJobs)
+                    MetricCard(title: "OCR-Seiten gut", value: state.statistics.ocrQualityGoodPages)
+                    MetricCard(title: "OCR-Seiten prüfen", value: state.statistics.ocrQualityReviewPages)
+                    MetricCard(title: "OCR vermutlich fehlgeschlagen", value: state.statistics.ocrQualityFailedPages)
                 }
 
                 GroupBox("Lokale KI") {
@@ -1049,18 +1191,65 @@ struct MetricCard: View {
 
 struct OCRView: View {
     @Environment(AppState.self) private var state
+    @State private var confirmsInstallation = false
 
     var body: some View {
         @Bindable var state = state
         Form {
-            Section("Status") {
-                LabeledContent("OCRmyPDF", value: state.ocrDependencies.ocrMyPDF?.path ?? "Nicht gefunden")
-                LabeledContent("Tesseract", value: state.ocrDependencies.tesseract?.path ?? "Nicht gefunden")
-                LabeledContent("Verfügbarkeit", value: state.ocrDependencies.isReady ? "Bereit" : "Unvollständig")
+            Section("OCR-Komponenten") {
+                componentRow("OCRmyPDF", available: state.ocrDependencies.ocrMyPDF != nil)
+                componentRow("Tesseract", available: state.ocrDependencies.tesseract != nil)
+                componentRow(
+                    "Deutsche Sprachdaten",
+                    available: state.ocrDependencies.installedLanguages.contains("deu")
+                )
+                componentRow(
+                    "Poppler",
+                    available: state.ocrDependencies.pdfInfo != nil
+                        && state.ocrDependencies.pdfText != nil
+                )
+                LabeledContent(
+                    "Verfügbarkeit",
+                    value: state.ocrDependencies.isReady ? "Bereit" : "Unvollständig"
+                )
                 ForEach(state.ocrDependencies.messages, id: \.self) { Text($0).foregroundStyle(.orange) }
+                if state.ocrDependencies.homebrew != nil, !state.ocrDependencies.isReady {
+                    Button("Fehlende Komponenten installieren") {
+                        confirmsInstallation = true
+                    }
+                    .disabled(state.isInstallingOCRComponents)
+                } else if state.ocrDependencies.homebrew == nil {
+                    Text("Homebrew fehlt. Installiere es zuerst nach der offiziellen Anleitung von brew.sh.")
+                        .foregroundStyle(.secondary)
+                    Button("Offiziellen Installationsbefehl kopieren") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(
+                            "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
+                            forType: .string
+                        )
+                    }
+                }
+                if let message = state.ocrInstallationMessage {
+                    Text(message).foregroundStyle(.secondary)
+                }
+                Button("Erneut prüfen") {
+                    Task { await state.refreshOCRComponents() }
+                }
             }
             Section("Verarbeitung") {
                 Toggle("OCR aktiviert", isOn: $state.ocrConfiguration.isEnabled)
+                Picker("Speichermodus", selection: $state.ocrConfiguration.persistenceMode) {
+                    ForEach(OCRPersistenceMode.allCases, id: \.self) {
+                        Text($0.displayName).tag($0)
+                    }
+                }
+                Text(
+                    state.ocrConfiguration.persistenceMode == .nonDestructive
+                        ? "Das Original bleibt unverändert. OCR-Text, Seiten- und Qualitätsdaten werden lokal in SQLite gespeichert."
+                        : "Die validierte OCR-Ausgabe ersetzt die PDF atomar. Bei einem Fehler bleibt das Original unverändert."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 Toggle("Seiten automatisch drehen", isOn: $state.ocrConfiguration.rotatePages)
                 Toggle("Seiten begradigen", isOn: $state.ocrConfiguration.deskew)
                 Toggle("Bild vor OCR bereinigen", isOn: $state.ocrConfiguration.clean)
@@ -1068,12 +1257,18 @@ struct OCRView: View {
                 Picker("CPU-Modus", selection: $state.ocrConfiguration.cpuMode) {
                     ForEach(OCRCPUMode.allCases, id: \.self) { Text($0.displayName).tag($0) }
                 }
+                Text("Sparsam verarbeitet jeweils eine Datei. Normal nutzt die gewählte Parallelität. Schnell nutzt höchstens die Hälfte der CPU-Kerne und benötigt mehr Arbeitsspeicher.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Stepper("Optimierung: \(state.ocrConfiguration.optimizeLevel)", value: $state.ocrConfiguration.optimizeLevel, in: 0...3)
+                Text("0 bewahrt die Bilddaten weitgehend. Höhere Stufen verkleinern die Ausgabedatei, benötigen aber mehr CPU und können Bilder neu komprimieren; die Texterkennung wird dadurch nicht besser.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Stepper(
                     "Maximale Parallelität: \(state.ocrConfiguration.maximumParallelFiles)",
                     value: $state.ocrConfiguration.maximumParallelFiles,
                     in: 1...4
                 )
+                Text("Auf Macs mit 8 GB ist 1 empfohlen. Mehr parallele Dateien erhöhen Tempo und Speicherbedarf, nicht die OCR-Qualität.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Menu("Sprachen: \(state.ocrConfiguration.languages.joined(separator: " + "))") {
                     ForEach(state.ocrDependencies.installedLanguages, id: \.self) { language in
                         Button {
@@ -1090,10 +1285,30 @@ struct OCRView: View {
                 Button("Fehler erneut versuchen") {
                     state.retryFailedJobs()
                 }
+                Button("OCR-Einstellungen speichern") {
+                    state.saveSettings()
+                }
             }
         }
         .formStyle(.grouped)
         .navigationTitle("OCR")
+        .confirmationDialog(
+            "OCR-Komponenten mit Homebrew installieren?",
+            isPresented: $confirmsInstallation
+        ) {
+            Button("ocrmypdf, tesseract-lang und poppler installieren") {
+                state.installMissingOCRComponents()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Homebrew wird ohne sudo und ausschließlich mit festen Paketnamen aufgerufen.")
+        }
+    }
+
+    @ViewBuilder
+    private func componentRow(_ name: String, available: Bool) -> some View {
+        Label(name, systemImage: available ? "checkmark.circle.fill" : "xmark.circle.fill")
+            .foregroundStyle(available ? .green : .red)
     }
 
     private func toggleLanguage(_ language: String) {
@@ -1110,6 +1325,7 @@ struct OCRView: View {
 struct ModelsView: View {
     @Environment(AppState.self) private var state
     @State private var pendingEmbeddingActivation: InstalledModel?
+    @State private var pendingEmbeddingUpdate: InstalledModel?
 
     var body: some View {
         ScrollView {
@@ -1201,13 +1417,28 @@ struct ModelsView: View {
                 "Beim Wechsel zu \(model.descriptor.displayName) müssen alle Dokument-Chunks neu eingebettet werden. Der bisherige Index bleibt bis zum erfolgreichen Aufbau erhalten."
             )
         }
+        .confirmationDialog(
+            "Embedding-Modell aktualisieren?",
+            isPresented: Binding(
+                get: { pendingEmbeddingUpdate != nil },
+                set: { if !$0 { pendingEmbeddingUpdate = nil } }
+            ),
+            presenting: pendingEmbeddingUpdate
+        ) { model in
+            Button("Aktualisieren und Index neu aufbauen") {
+                state.installModel(model, activateAfterInstall: true)
+                pendingEmbeddingUpdate = nil
+            }
+            Button("Abbrechen", role: .cancel) { pendingEmbeddingUpdate = nil }
+        } message: { model in
+            Text("Die neue Version wird vollständig geladen und geprüft. Erst danach wird der Index aus gespeichertem Text neu aufgebaut; bei Fehler bleibt die alte Version erhalten.")
+        }
     }
 
     private func visibleModels(kind: ModelKind) -> [InstalledModel] {
         state.availableModels.filter {
             $0.descriptor.kind == kind
                 && ($0.compatibility != .experimental || state.showExperimentalModels)
-                && $0.compatibility != .incompatible
         }
     }
 
@@ -1251,12 +1482,33 @@ struct ModelsView: View {
                         Text(String(model.descriptor.modelVersion.prefix(10)))
                             .monospaced()
                     }
+                    if let installedVersion = model.installedVersion {
+                        GridRow {
+                            Text("Installiert").foregroundStyle(.secondary)
+                            Text(String(installedVersion.prefix(10))).monospaced()
+                            Text("SHA-256").foregroundStyle(.secondary)
+                            Text(String(model.descriptor.checksumSHA256.prefix(12))).monospaced()
+                        }
+                    }
                 }
 
                 HStack {
                     Link("Lizenz: \(model.descriptor.licenseName)", destination: model.descriptor.licenseURL)
                     Spacer()
-                    if model.isInstalled {
+                    if model.updateAvailable {
+                        Button("Modell aktualisieren") {
+                            if model.descriptor.kind == .embedding {
+                                pendingEmbeddingUpdate = model
+                            } else {
+                                state.installModel(model, activateAfterInstall: true)
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(
+                            state.downloadingModelID != nil
+                                || model.compatibility == .incompatible
+                        )
+                    } else if model.isInstalled {
                         Button("Testen") { state.testModel(model) }
                         Button(model.isActive ? "Aktiv" : "Aktivieren") {
                             if model.descriptor.kind == .embedding {
@@ -1280,7 +1532,10 @@ struct ModelsView: View {
                         } else {
                             Button("Herunterladen") { state.installModel(model) }
                             .buttonStyle(.borderedProminent)
-                            .disabled(state.downloadingModelID != nil)
+                            .disabled(
+                                state.downloadingModelID != nil
+                                    || model.compatibility == .incompatible
+                            )
                         }
                     }
                 }
@@ -1308,6 +1563,9 @@ struct ModelsView: View {
 
 struct SettingsView: View {
     @Environment(AppState.self) private var state
+    @State private var confirmsRebuild = false
+    @State private var confirmsOCRReset = false
+    @State private var confirmsIndexDeletion = false
 
     var body: some View {
         @Bindable var state = state
@@ -1335,6 +1593,22 @@ struct SettingsView: View {
                 Text("Dokumente, Suchanfragen, Embeddings und Antworten bleiben lokal. Telemetrie ist deaktiviert.")
                     .foregroundStyle(.secondary)
             }
+            Section("Indexwartung") {
+                Button("Suchindex neu aufbauen …") { confirmsRebuild = true }
+                Text("Löscht Chunks, Volltextindex und Embeddings und baut sie ausschließlich aus dem bereits gespeicherten Seitentext neu auf.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("OCR zurücksetzen …") { confirmsOCRReset = true }
+                Text("Löscht OCR-Text, Qualitätswerte und davon abhängige Indexdaten. Original-PDFs bleiben erhalten und OCR wird erneut eingeplant.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Inkonsistenzen reparieren") { state.repairIndex() }
+                Text("Prüft SQLite und Fremdschlüssel, gleicht Jobzustände ab und baut den Volltextindex aus vorhandenen Chunks neu auf.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Vollständigen Dokumentindex löschen …", role: .destructive) {
+                    confirmsIndexDeletion = true
+                }
+                Text("Löscht Dokumente, Seiten, OCR-Daten, Chunks, Embeddings und Suchverlauf. PDFs, Modelle und Einstellungen bleiben erhalten.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section {
                 Button("Einstellungen speichern") {
                     state.saveSettings()
@@ -1344,6 +1618,24 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Einstellungen")
+        .confirmationDialog("Suchindex neu aufbauen?", isPresented: $confirmsRebuild) {
+            Button("Neu aufbauen") { state.rebuildSearchIndex() }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Gespeicherter Seiten- und OCR-Text bleibt erhalten.")
+        }
+        .confirmationDialog("OCR-Daten wirklich zurücksetzen?", isPresented: $confirmsOCRReset) {
+            Button("OCR zurücksetzen", role: .destructive) { state.resetOCRData() }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Original-PDFs werden nicht gelöscht oder verschoben.")
+        }
+        .confirmationDialog("Dokumentindex vollständig löschen?", isPresented: $confirmsIndexDeletion) {
+            Button("Dokumentindex löschen", role: .destructive) { state.deleteDocumentIndex() }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Die Verarbeitung wird danach pausiert. PDFs, Modelle und Einstellungen bleiben erhalten.")
+        }
     }
 }
 

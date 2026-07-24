@@ -198,7 +198,7 @@ func corruptPDFIsNeverChangedByOCR() async throws {
 }
 
 @Test(.timeLimit(.minutes(1)))
-func ocrAddsTextLayerToSyntheticScan() async throws {
+func nonDestructiveOCRKeepsOriginalAndReturnsRecognizedPages() async throws {
     let dependencies = OCRDependencyChecker().check()
     guard dependencies.isReady else { return }
     let root = temporaryTestDirectory()
@@ -216,11 +216,40 @@ func ocrAddsTextLayerToSyntheticScan() async throws {
         )
     )
 
-    let pages = try PDFKitTextExtractor().extractPages(from: pdf)
     #expect(result.pageCount == 1)
-    #expect(try Data(contentsOf: pdf) != before)
-    #expect(pages.first?.text.uppercased().contains("SYNTHETIC") == true)
+    #expect(try Data(contentsOf: pdf) == before)
+    #expect(result.persistedToOriginal == false)
+    #expect(result.pages.first?.text.uppercased().contains("SYNTHETIC") == true)
+    #expect(result.pageQualities.first?.wordCount ?? 0 > 0)
     #expect(FileManager.default.fileExists(atPath: pdf.path))
+}
+
+@Test(.timeLimit(.minutes(1)))
+func persistentOCRAtomicallyAddsValidatedTextLayer() async throws {
+    let dependencies = OCRDependencyChecker().check()
+    guard dependencies.isReady else { return }
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pdf = root.appending(path: "scan.pdf")
+    try createImagePDF(at: pdf, text: "PERSISTENT OCR TEST 67890")
+    let before = try Data(contentsOf: pdf)
+
+    let result = try await OCRmyPDFProcessor(dependencies: dependencies).process(
+        discoveredPDF(pdf),
+        configuration: OCRConfiguration(
+            languages: ["eng"],
+            rotatePages: false,
+            deskew: false,
+            persistenceMode: .persistent
+        )
+    )
+
+    #expect(result.persistedToOriginal)
+    #expect(try Data(contentsOf: pdf) != before)
+    #expect(
+        try PDFKitTextExtractor().extractPages(from: pdf)
+            .first?.text.uppercased().contains("PERSISTENT") == true
+    )
 }
 
 @Test(.timeLimit(.minutes(1)))
@@ -273,13 +302,13 @@ func configuredParallelOCRProcessesMoreThanOneFileAtOnce() async throws {
     #expect(peak == 2)
     let statistics = try await database.statistics()
     #expect(statistics.totalPDFs == 2)
-    #expect(statistics.indexedPDFs == 1)
+    #expect(statistics.indexedPDFs == 2)
 }
 
 @Test
 func bundledModelCatalogIsPinnedAndFitsEightGigabyteProfile() throws {
     let catalog = try ModelCatalog.bundled()
-    #expect(catalog.models.count == 3)
+    #expect(catalog.models.count == 4)
     #expect(catalog.models.allSatisfy { !$0.files.isEmpty })
     #expect(catalog.models.allSatisfy { $0.files.allSatisfy { $0.checksumSHA256.count == 64 } })
 
@@ -291,8 +320,10 @@ func bundledModelCatalogIsPinnedAndFitsEightGigabyteProfile() throws {
     )
     let compact = try #require(catalog.models.first { $0.id.contains("1.7B") })
     let larger = try #require(catalog.models.first { $0.id.contains("4B-4bit") })
+    let experimental = try #require(catalog.models.first { $0.id.contains("8B-4bit") })
     #expect(profile.compatibility(for: compact) == .recommended)
     #expect(profile.compatibility(for: larger) == .compatible)
+    #expect(profile.compatibility(for: experimental) == .experimental)
 }
 
 @Test
@@ -386,6 +417,229 @@ func indexingSearchRenameAndDeletionStayConsistent() async throws {
     results = try await search.search("Jugendamt Kindeswohl")
     #expect(results.isEmpty)
     #expect((try await database.statistics()).totalPDFs == 0)
+}
+
+@Test
+func contentIdentityHandlesCopyMetadataMoveAndChangedContent() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    let embedder = TokenHashEmbedding(dimensions: 64)
+    let processor = DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: embedder
+    )
+    let original = root.appending(path: "Original.pdf")
+    try createTextPDF(at: original, pages: ["ALPHAIDENTITAET " + String(repeating: "Text ", count: 80)])
+
+    var files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+    let initial = try await database.embeddingCoverage(
+        modelID: embedder.modelID,
+        modelVersion: embedder.modelVersion
+    )
+
+    let copy = root.appending(path: "Kopie.pdf")
+    try FileManager.default.copyItem(at: original, to: copy)
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+    let afterCopy = try await database.embeddingCoverage(
+        modelID: embedder.modelID,
+        modelVersion: embedder.modelVersion
+    )
+    #expect(afterCopy == initial)
+    #expect((try await database.statistics()).totalPDFs == 2)
+
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date().addingTimeInterval(120)],
+        ofItemAtPath: copy.path
+    )
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+    #expect(
+        try await database.embeddingCoverage(
+            modelID: embedder.modelID,
+            modelVersion: embedder.modelVersion
+        ) == initial
+    )
+
+    let movedFolder = root.appending(path: "Unterordner", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: movedFolder, withIntermediateDirectories: true)
+    let moved = movedFolder.appending(path: "Verschoben.pdf")
+    try FileManager.default.moveItem(at: original, to: moved)
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+    #expect(
+        try await database.embeddingCoverage(
+            modelID: embedder.modelID,
+            modelVersion: embedder.modelVersion
+        ) == initial
+    )
+
+    try FileManager.default.removeItem(at: copy)
+    try FileManager.default.removeItem(at: moved)
+    try createTextPDF(at: moved, pages: ["BETAINHALT " + String(repeating: "Neu ", count: 80)])
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+    let search = HybridSearchService(database: database, embedder: embedder)
+    #expect((try await search.search("ALPHAIDENTITAET")).isEmpty)
+    #expect(!(try await search.search("BETAINHALT")).isEmpty)
+    #expect((try await database.statistics()).totalPDFs == 1)
+}
+
+@Test
+func switchingOCRModeDoesNotReprocessKnownDocument() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let pdf = root.appending(path: "Scan.pdf")
+    try createImagePDF(at: pdf, text: "MODE SWITCH")
+    let original = try Data(contentsOf: pdf)
+    let replacement = root.appending(path: "Replacement.pdf")
+    try createTextPDF(at: replacement, pages: [String(repeating: "Erkannter Text ", count: 30)])
+    let replacementData = try Data(contentsOf: replacement)
+    try FileManager.default.removeItem(at: replacement)
+    let probe = OCRConcurrencyProbe()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    let processor = DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: TokenHashEmbedding(dimensions: 64),
+        ocrProcessorFactory: {
+            SyntheticOCRProcessor(replacementData: replacementData, probe: probe)
+        }
+    )
+
+    var files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    await processor.processPending(
+        ocrConfiguration: OCRConfiguration(persistenceMode: .nonDestructive)
+    ) { _ in }
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    await processor.processPending(
+        ocrConfiguration: OCRConfiguration(persistenceMode: .persistent)
+    ) { _ in }
+
+    #expect(await probe.calls == 1)
+    #expect(try Data(contentsOf: pdf) == original)
+
+    try await database.resetOCRData()
+    #expect((try await database.statistics()).indexedPDFs == 0)
+    #expect((try await database.pendingFiles()).count == 1)
+    #expect(try Data(contentsOf: pdf) == original)
+}
+
+@Test
+func indexMaintenanceRebuildsFromStoredTextAndPreservesSettings() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    try await database.setSetting(key: "test-setting", value: "bleibt")
+    let pdf = root.appending(path: "Wartung.pdf")
+    try createTextPDF(
+        at: pdf,
+        pages: ["WARTUNGSBEGRIFF " + String(repeating: "Gespeicherter Seitentext. ", count: 30)]
+    )
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    let files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    let embedder = TokenHashEmbedding(dimensions: 64)
+    let processor = DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: embedder
+    )
+    await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+
+    try await processor.rebuildSearchIndex { _ in }
+    let search = HybridSearchService(database: database, embedder: embedder)
+    #expect(!(try await search.search("WARTUNGSBEGRIFF")).isEmpty)
+    #expect((try await database.repairIndex()).contains("Integrität"))
+
+    try await database.deleteDocumentIndex()
+    #expect((try await database.statistics()).totalPDFs == 0)
+    #expect(try await database.setting(key: "test-setting") == "bleibt")
+    #expect(FileManager.default.fileExists(atPath: pdf.path))
+}
+
+@Test
+func finderSafeToolResolutionAndMissingInstallerAreDeterministic() async throws {
+    let dependencies = OCRDependencyChecker().check()
+    #expect(dependencies.environmentPATH.hasPrefix("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"))
+    #expect(OCRDependencyChecker().check().ocrMyPDF == dependencies.ocrMyPDF)
+    #expect(
+        OCRComponentInstaller.packageArguments
+            == ["install", "ocrmypdf", "tesseract-lang", "poppler"]
+    )
+
+    let missing = OCRDependencies(
+        homebrew: nil,
+        ocrMyPDF: nil,
+        tesseract: nil,
+        pdfText: nil,
+        pdfInfo: nil,
+        pdfToPPM: nil,
+        environmentPATH: "/usr/bin:/bin",
+        installedLanguages: [],
+        versions: [:],
+        selfTestPassed: false,
+        messages: ["Homebrew fehlt."]
+    )
+    do {
+        _ = try await OCRComponentInstaller().installMissing(from: missing)
+        Issue.record("Installation ohne Homebrew hätte abgewiesen werden müssen.")
+    } catch {
+        #expect(error.localizedDescription.contains("Homebrew"))
+    }
+}
+
+@Test
+func bundledCatalogDetectsAnOlderInstalledModelVersion() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let catalog = try ModelCatalog.bundled()
+    let descriptor = try #require(catalog.models.first)
+    let old = paths.models
+        .appending(path: descriptor.id.replacingOccurrences(of: "/", with: "_"))
+        .appending(path: "older-app-catalog-version")
+    try FileManager.default.createDirectory(at: old, withIntermediateDirectories: true)
+    let manager = LocalModelManager(catalog: catalog, paths: paths)
+    let profile = HardwareProfile(
+        isAppleSilicon: true,
+        chipName: "Test",
+        physicalMemoryBytes: 8_589_934_592,
+        availableStorageBytes: 100_000_000_000
+    )
+    let model = try #require(await manager.models(profile: profile).first)
+    #expect(model.updateAvailable)
+    #expect(model.installedVersion == "older-app-catalog-version")
 }
 
 @Test(.timeLimit(.minutes(10)))
@@ -489,9 +743,11 @@ private func discoveredPDF(_ url: URL) -> DiscoveredPDF {
 private actor OCRConcurrencyProbe {
     private var active = 0
     private(set) var peak = 0
+    private(set) var calls = 0
 
     func begin() {
         active += 1
+        calls += 1
         peak = max(peak, active)
     }
 
@@ -518,7 +774,9 @@ private struct SyntheticOCRProcessor: OCRProcessing {
         await probe.begin()
         do {
             try await Task.sleep(for: .milliseconds(200))
-            try replacementData.write(to: file.url, options: .atomic)
+            if configuration.persistenceMode == .persistent {
+                try replacementData.write(to: file.url, options: .atomic)
+            }
             await probe.end()
         } catch {
             await probe.end()
@@ -526,8 +784,15 @@ private struct SyntheticOCRProcessor: OCRProcessing {
         }
         return OCRResult(
             inputHash: inputHash,
-            outputHash: try SHA256Hasher().hash(fileAt: file.url),
+            outputHash: SHA256Hasher().hash(data: replacementData),
             pageCount: 1,
+            pages: [
+                ExtractedPage(
+                    pageNumber: 1,
+                    text: String(repeating: "Synthetischer Text für den Parallelitätstest. ", count: 5)
+                )
+            ],
+            persistedToOriginal: configuration.persistenceMode == .persistent,
             completedAt: .now
         )
     }

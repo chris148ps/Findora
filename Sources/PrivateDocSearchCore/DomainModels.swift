@@ -10,6 +10,7 @@ public enum ProcessingState: String, Codable, Sendable {
     case indexed
     case failed
     case unavailable
+    case retired
 }
 
 public struct DiscoveredPDF: Identifiable, Hashable, Sendable {
@@ -113,9 +114,47 @@ public struct DocumentStatistics: Equatable, Sendable {
     public var ocrProcessedPDFs = 0
     public var pendingJobs = 0
     public var failedJobs = 0
+    public var ocrQualityGoodPages = 0
+    public var ocrQualityReviewPages = 0
+    public var ocrQualityFailedPages = 0
     public var lastFullScan: Date?
 
     public init() {}
+}
+
+public struct StoredDocumentText: Sendable {
+    public let documentID: Int64
+    public let contentHash: String
+    public let modifiedAt: Date
+    public let pages: [ExtractedPage]
+
+    public init(
+        documentID: Int64,
+        contentHash: String,
+        modifiedAt: Date,
+        pages: [ExtractedPage]
+    ) {
+        self.documentID = documentID
+        self.contentHash = contentHash
+        self.modifiedAt = modifiedAt
+        self.pages = pages
+    }
+}
+
+public struct RebuiltDocumentIndex: Sendable {
+    public let document: StoredDocumentText
+    public let chunks: [TextChunk]
+    public let embeddings: [[Float]]
+
+    public init(
+        document: StoredDocumentText,
+        chunks: [TextChunk],
+        embeddings: [[Float]]
+    ) {
+        self.document = document
+        self.chunks = chunks
+        self.embeddings = embeddings
+    }
 }
 
 public enum PrivateDocSearchError: LocalizedError, Sendable {

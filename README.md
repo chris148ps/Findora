@@ -17,8 +17,10 @@ xcodebuild -downloadComponent MetalToolchain
 brew install ocrmypdf tesseract-lang poppler
 ```
 
-PrivateDocSearch erkennt standardmäßig Homebrew unter `/opt/homebrew/bin` und
-`/usr/local/bin`. Die App installiert keine Systempakete selbst.
+PrivateDocSearch erkennt Homebrew-Werkzeuge auch bei einem Finder-Start ohne
+Terminal-`PATH`. Fehlende OCR-Komponenten können nach ausdrücklicher
+Bestätigung über Homebrew installiert werden; die App verwendet dabei nur
+feste Paketnamen und weder eine Shell noch `sudo`.
 
 ## Build
 
@@ -63,10 +65,12 @@ Textschicht bleibt unverändert. Für Scan-PDFs läuft OCRmyPDF standardmäßig 
 Deutsch und Englisch, Rotation, Begradigung, ohne PDF/A-Konvertierung und ohne
 Bildoptimierung.
 
-OCR schreibt nie direkt in das Original. Erst nach PDF-, Seitenzahl-,
-Textschicht- und Hashprüfung ersetzt die App die Datei atomar am selben Ort.
-Dateiname und Ordner bleiben gleich. Schlägt ein Schritt fehl, bleibt das
-Original erhalten.
+Standard ist die nicht-destruktive OCR: Die OCR-PDF ist nur temporär, Text,
+Seiteninformationen und Qualitätswerte werden in SQLite gespeichert, und das
+Original bleibt unverändert. Optional kann der Nutzer die validierte OCR-PDF
+atomar am selben Ort übernehmen lassen. Bei jedem Fehler bleibt das Original
+unverändert. Ein Moduswechsel verarbeitet vorhandene Dokumente nicht
+automatisch neu.
 
 Unter **OCR** lassen sich Sprachen und konservative Optionen ändern. OCR und
 Indexierung können pausiert und fehlgeschlagene Jobs erneut eingeplant werden.
@@ -90,7 +94,8 @@ Downloadgröße und RAM-Einstufung. Jede Datei wird per SHA-256 validiert.
 
 - Embeddings: multilingual E5 Small, 384 Dimensionen
 - Antworten: Qwen3 1.7B 4 Bit für 8-GB-Macs empfohlen
-- Qwen3 4B 4 Bit nur bei ausreichendem Speicher
+- Qwen3 4B 4 Bit bei ausreichendem Speicher
+- Qwen3 8B 4 Bit auf 8-GB-Macs nur experimentell
 
 Downloads lassen sich pausieren, fortsetzen und abbrechen. Ein
 Embedding-Modellwechsel erfordert eine Neuindexierung. Das Sprachmodell wird
@@ -113,9 +118,12 @@ scheinbar belegte Antwort aus.
 
 Version 1 enthält keinen automatischen App- oder Online-Katalog-Updater.
 App-Updates werden als vollständig neuer, signierter Build installiert.
-Modellupdates sind nur über einen neuen eingebauten, fest versionierten
-Katalog vorgesehen; eine aktive alte Modellversion bleibt bis zur
-erfolgreichen Prüfung einer neuen Version erhalten.
+Modellupdates sind ausschließlich über den Katalog einer neueren App-Version
+möglich. Die neue Version wird vollständig heruntergeladen, größen- und
+SHA-256-geprüft und erst danach aktiviert. Bei einem Fehler bleibt die alte
+Version erhalten. Für Embedding-Updates wird der Index aus dem gespeicherten
+Seitentext neu aufgebaut; Antwortmodell-Updates benötigen keine
+Neuindexierung.
 
 ## Fehlerbehebung
 

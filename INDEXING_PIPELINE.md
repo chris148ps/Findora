@@ -18,10 +18,11 @@ als schneller Vorfilter; allein lösen sie keine OCR aus.
 - gleicher Pfad und neuer Hash: neue Dokumentversion;
 - neuer Pfad und bekannter Hash: Umbenennung, Verschiebung oder Duplikat;
 - verschwundener Pfad: Location gelöscht markieren;
-- letzter Pfad eines Inhalts verschwunden: Dokument und Chunks bleiben
-  revisionssicher markiert, werden aber nicht mehr durchsucht.
+- letzter Pfad eines Inhalts verschwunden: Dokument, FTS-Zeilen, Chunks,
+  OCR-Qualität und Embeddings werden nach dem Scan kontrolliert entfernt.
 
-Mehrere Pfade für denselben Hash bleiben als getrennte Quellen sichtbar.
+Mehrere Pfade für denselben Hash werden als Speicherorte eines Dokuments
+geführt. Seiten, Chunks, OCR-Text und Embeddings werden nicht dupliziert.
 
 ## Textextraktion
 
@@ -49,12 +50,12 @@ etwas Kontext verloren geht. Die Chunker-Version ist Teil des Indexstands.
 
 Ein Dokumentupdate läuft in einer Datenbanktransaktion:
 
-1. neue Dokumentversion anlegen;
+1. neuen Inhaltshash anlegen oder bekannten Inhalt wiederverwenden;
 2. Seiten und Chunks erzeugen;
 3. FTS-Zeilen aktualisieren;
 4. Embeddings batchweise erstellen;
 5. neuen Indexstand aktivieren;
-6. alte aktive Version deaktivieren.
+6. verwaiste alte Inhalte nach erfolgreicher Standortzuordnung entfernen.
 
 Ein Abbruch vor Schritt 5 lässt die letzte vollständige Version aktiv.
 Veraltete Chunks werden erst nach erfolgreicher Aktivierung aus dem aktiven
@@ -66,4 +67,3 @@ Jeder Vektor trägt Modell-ID, Modellversion, Dimension und Normalisierung.
 Bei einem Modellwechsel wird ein paralleler Indexstand aufgebaut. Die UI zeigt
 Dokument-/Chunk-Fortschritt. Abbruch oder Fehler lassen den vorherigen
 Indexstand unverändert.
-
