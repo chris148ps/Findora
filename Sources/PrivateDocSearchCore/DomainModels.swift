@@ -256,6 +256,8 @@ public struct DocumentStatistics: Equatable, Sendable {
     public var ocrQualityGoodPages = 0
     public var ocrQualityReviewPages = 0
     public var ocrQualityFailedPages = 0
+    public var emptyPageCandidates = 0
+    public var fullyEmptyPDFs = 0
     public var processedJobs = 0
     public var totalJobs = 0
     public var currentStep: String?
@@ -272,6 +274,265 @@ public struct DocumentStatistics: Equatable, Sendable {
     }
 
     public init() {}
+}
+
+public enum DocumentStatusPrimaryMetric: String, CaseIterable, Identifiable, Sendable {
+    case totalPDFs
+    case indexedPDFs
+    case pendingJobs
+    case duplicates
+
+    public var id: Self { self }
+
+    public var displayName: String {
+        switch self {
+        case .totalPDFs: "PDFs insgesamt"
+        case .indexedPDFs: "Indexiert"
+        case .pendingJobs: "In Warteschlange"
+        case .duplicates: "Duplikate"
+        }
+    }
+
+    public func value(in statistics: DocumentStatistics) -> Int {
+        switch self {
+        case .totalPDFs: statistics.totalPDFs
+        case .indexedPDFs: statistics.indexedPDFs
+        case .pendingJobs: statistics.pendingJobs
+        case .duplicates: statistics.duplicateLocations
+        }
+    }
+}
+
+public enum PageContentStatus: String, Codable, CaseIterable, Hashable, Sendable {
+    case fullyEmpty
+    case probablyEmpty
+    case imageWithoutText
+    case needsOCRReview
+    case content
+    case technicalError
+
+    public var displayName: String {
+        switch self {
+        case .fullyEmpty: "Vollständig leer"
+        case .probablyEmpty: "Vermutlich leer"
+        case .imageWithoutText: "Bild ohne erkannten Text"
+        case .needsOCRReview: "OCR überprüfen"
+        case .content: "Inhalt vorhanden"
+        case .technicalError: "Technischer Fehler"
+        }
+    }
+
+    public var isEmptyCandidate: Bool {
+        self == .fullyEmpty || self == .probablyEmpty
+    }
+}
+
+public enum PageReviewDecision: String, Codable, CaseIterable, Hashable, Sendable {
+    case undecided
+    case confirmedEmpty
+    case notEmpty
+    case excluded
+
+    public var displayName: String {
+        switch self {
+        case .undecided: "Nicht geprüft"
+        case .confirmedEmpty: "Als leer bestätigt"
+        case .notEmpty: "Als nicht leer markiert"
+        case .excluded: "Von Prüfungen ausgeschlossen"
+        }
+    }
+}
+
+public struct PageVisualMetrics: Codable, Equatable, Hashable, Sendable {
+    public let renderSucceeded: Bool
+    public let pixelWidth: Int
+    public let pixelHeight: Int
+    public let whiteRatio: Double
+    public let darkPixelRatio: Double
+    public let variance: Double
+    public let edgeRatio: Double
+    public let contrast: Double
+    public let characterCount: Int
+    public let wordCount: Int
+    public let ocrConfidence: Double?
+    public let embeddedImageCount: Int
+    public let annotationCount: Int
+    public let hasSmallText: Bool
+
+    public init(
+        renderSucceeded: Bool,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        whiteRatio: Double,
+        darkPixelRatio: Double,
+        variance: Double,
+        edgeRatio: Double,
+        contrast: Double,
+        characterCount: Int,
+        wordCount: Int,
+        ocrConfidence: Double?,
+        embeddedImageCount: Int,
+        annotationCount: Int,
+        hasSmallText: Bool
+    ) {
+        self.renderSucceeded = renderSucceeded
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.whiteRatio = whiteRatio
+        self.darkPixelRatio = darkPixelRatio
+        self.variance = variance
+        self.edgeRatio = edgeRatio
+        self.contrast = contrast
+        self.characterCount = characterCount
+        self.wordCount = wordCount
+        self.ocrConfidence = ocrConfidence
+        self.embeddedImageCount = embeddedImageCount
+        self.annotationCount = annotationCount
+        self.hasSmallText = hasSmallText
+    }
+}
+
+public struct PageContentAnalysis: Equatable, Hashable, Sendable {
+    public let pageNumber: Int
+    public let pageCount: Int
+    public let status: PageContentStatus
+    public let confidence: Double
+    public let reason: String
+    public let metrics: PageVisualMetrics
+
+    public init(
+        pageNumber: Int,
+        pageCount: Int,
+        status: PageContentStatus,
+        confidence: Double,
+        reason: String,
+        metrics: PageVisualMetrics
+    ) {
+        self.pageNumber = pageNumber
+        self.pageCount = pageCount
+        self.status = status
+        self.confidence = min(1, max(0, confidence))
+        self.reason = reason
+        self.metrics = metrics
+    }
+}
+
+public struct EmptyPageCandidate: Identifiable, Equatable, Hashable, Sendable {
+    public var id: String { "\(absolutePath)#\(pageNumber)" }
+    public let absolutePath: String
+    public let relativePath: String
+    public let fileName: String
+    public let originalHash: String
+    public let pageNumber: Int
+    public let pageCount: Int
+    public let status: PageContentStatus
+    public let confidence: Double
+    public let reason: String
+    public let metrics: PageVisualMetrics
+    public let decision: PageReviewDecision
+
+    public init(
+        absolutePath: String,
+        relativePath: String,
+        fileName: String,
+        originalHash: String,
+        pageNumber: Int,
+        pageCount: Int,
+        status: PageContentStatus,
+        confidence: Double,
+        reason: String,
+        metrics: PageVisualMetrics,
+        decision: PageReviewDecision
+    ) {
+        self.absolutePath = absolutePath
+        self.relativePath = relativePath
+        self.fileName = fileName
+        self.originalHash = originalHash
+        self.pageNumber = pageNumber
+        self.pageCount = pageCount
+        self.status = status
+        self.confidence = confidence
+        self.reason = reason
+        self.metrics = metrics
+        self.decision = decision
+    }
+}
+
+public struct EmptyPDFCandidate: Identifiable, Equatable, Hashable, Sendable {
+    public var id: String { absolutePath }
+    public let absolutePath: String
+    public let relativePath: String
+    public let fileName: String
+    public let originalHash: String
+    public let pageCount: Int
+    public let confidence: Double
+
+    public init(
+        absolutePath: String,
+        relativePath: String,
+        fileName: String,
+        originalHash: String,
+        pageCount: Int,
+        confidence: Double
+    ) {
+        self.absolutePath = absolutePath
+        self.relativePath = relativePath
+        self.fileName = fileName
+        self.originalHash = originalHash
+        self.pageCount = pageCount
+        self.confidence = confidence
+    }
+}
+
+public struct DuplicateLocation: Identifiable, Equatable, Hashable, Sendable {
+    public var id: String { absolutePath }
+    public let absolutePath: String
+    public let relativePath: String
+    public let fileName: String
+    public let modifiedAt: Date
+    public let fileSize: Int64
+
+    public init(
+        absolutePath: String,
+        relativePath: String,
+        fileName: String,
+        modifiedAt: Date,
+        fileSize: Int64
+    ) {
+        self.absolutePath = absolutePath
+        self.relativePath = relativePath
+        self.fileName = fileName
+        self.modifiedAt = modifiedAt
+        self.fileSize = fileSize
+    }
+}
+
+public struct DuplicateGroup: Identifiable, Equatable, Hashable, Sendable {
+    public var id: String { contentHash }
+    public let contentHash: String
+    public let locations: [DuplicateLocation]
+
+    public init(contentHash: String, locations: [DuplicateLocation]) {
+        self.contentHash = contentHash
+        self.locations = locations
+    }
+
+    public var recommendedLocation: DuplicateLocation? {
+        locations.sorted { lhs, rhs in
+            let lhsScore = Self.archiveScore(lhs.absolutePath)
+            let rhsScore = Self.archiveScore(rhs.absolutePath)
+            if lhsScore != rhsScore { return lhsScore > rhsScore }
+            if lhs.modifiedAt != rhs.modifiedAt { return lhs.modifiedAt < rhs.modifiedAt }
+            return lhs.absolutePath.count < rhs.absolutePath.count
+        }.first
+    }
+
+    private static func archiveScore(_ path: String) -> Int {
+        let lower = path.lowercased()
+        if lower.contains("archiv") || lower.contains("dokument") { return 2 }
+        if lower.contains("/downloads/") || lower.contains("/desktop/") { return 0 }
+        return 1
+    }
 }
 
 public struct StoredDocumentText: Sendable {

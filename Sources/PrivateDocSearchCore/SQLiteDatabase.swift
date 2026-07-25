@@ -237,6 +237,355 @@ public actor SQLiteDatabase {
         publishStatusChange(.jobChanged)
     }
 
+    public func updateObservedHash(path: String, hash: String) throws {
+        try execute(
+            """
+            UPDATE processing_jobs
+            SET content_hash = ?, updated_at = ?
+            WHERE job_key = ?
+            """,
+            bindings: [
+                .text(hash),
+                .real(Date().timeIntervalSince1970),
+                .text(path)
+            ]
+        )
+        publishStatusChange(.jobChanged)
+    }
+
+    public func replacePageContentAnalyses(
+        path: String,
+        originalHash: String,
+        analyses: [PageContentAnalysis]
+    ) throws {
+        let existingRows = try query(
+            """
+            SELECT page_number, original_hash, user_decision
+            FROM page_content_analysis
+            WHERE absolute_path = ?
+            """,
+            bindings: [.text(path)]
+        )
+        let existingDecisions = Dictionary(uniqueKeysWithValues: existingRows.compactMap {
+            row -> (Int, PageReviewDecision)? in
+            guard row.string("original_hash") == originalHash,
+                  let page = row.int64("page_number"),
+                  let rawDecision = row.string("user_decision"),
+                  let decision = PageReviewDecision(rawValue: rawDecision) else {
+                return nil
+            }
+            return (Int(page), decision)
+        })
+        try transaction {
+            try execute(
+                "DELETE FROM page_content_analysis WHERE absolute_path = ?",
+                bindings: [.text(path)]
+            )
+            let now = Date().timeIntervalSince1970
+            for analysis in analyses {
+                let metrics = analysis.metrics
+                try execute(
+                    """
+                    INSERT INTO page_content_analysis (
+                        absolute_path, original_hash, page_number, page_count,
+                        status, confidence, reason, render_succeeded, pixel_width,
+                        pixel_height, white_ratio, dark_pixel_ratio, variance,
+                        edge_ratio, contrast, character_count, word_count,
+                        ocr_confidence, embedded_image_count, annotation_count,
+                        has_small_text, user_decision, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    bindings: [
+                        .text(path),
+                        .text(originalHash),
+                        .integer(Int64(analysis.pageNumber)),
+                        .integer(Int64(analysis.pageCount)),
+                        .text(analysis.status.rawValue),
+                        .real(analysis.confidence),
+                        .text(analysis.reason),
+                        .integer(metrics.renderSucceeded ? 1 : 0),
+                        .integer(Int64(metrics.pixelWidth)),
+                        .integer(Int64(metrics.pixelHeight)),
+                        .real(metrics.whiteRatio),
+                        .real(metrics.darkPixelRatio),
+                        .real(metrics.variance),
+                        .real(metrics.edgeRatio),
+                        .real(metrics.contrast),
+                        .integer(Int64(metrics.characterCount)),
+                        .integer(Int64(metrics.wordCount)),
+                        metrics.ocrConfidence.map(SQLiteValue.real) ?? .null,
+                        .integer(Int64(metrics.embeddedImageCount)),
+                        .integer(Int64(metrics.annotationCount)),
+                        .integer(metrics.hasSmallText ? 1 : 0),
+                        .text(
+                            (existingDecisions[analysis.pageNumber] ?? .undecided).rawValue
+                        ),
+                        .real(now)
+                    ]
+                )
+            }
+        }
+        publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func copyPageContentAnalyses(
+        originalHash: String,
+        toPath path: String
+    ) throws {
+        let exists = try scalarInt64(
+            """
+            SELECT COUNT(*) FROM page_content_analysis
+            WHERE absolute_path = ? AND original_hash = ?
+            """,
+            bindings: [.text(path), .text(originalHash)]
+        )
+        guard exists == 0 else { return }
+        guard let sourcePath = try query(
+            """
+            SELECT absolute_path
+            FROM page_content_analysis
+            WHERE original_hash = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            bindings: [.text(originalHash)]
+        ).first?.string("absolute_path") else { return }
+        try execute(
+            """
+            INSERT INTO page_content_analysis (
+                absolute_path, original_hash, page_number, page_count,
+                status, confidence, reason, render_succeeded, pixel_width,
+                pixel_height, white_ratio, dark_pixel_ratio, variance,
+                edge_ratio, contrast, character_count, word_count,
+                ocr_confidence, embedded_image_count, annotation_count,
+                has_small_text, user_decision, updated_at
+            )
+            SELECT ?, original_hash, page_number, page_count,
+                   status, confidence, reason, render_succeeded, pixel_width,
+                   pixel_height, white_ratio, dark_pixel_ratio, variance,
+                   edge_ratio, contrast, character_count, word_count,
+                   ocr_confidence, embedded_image_count, annotation_count,
+                   has_small_text, 'undecided', ?
+            FROM page_content_analysis
+            WHERE absolute_path = ? AND original_hash = ?
+            """,
+            bindings: [
+                .text(path),
+                .real(Date().timeIntervalSince1970),
+                .text(sourcePath),
+                .text(originalHash)
+            ]
+        )
+        publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func setPageReviewDecision(
+        path: String,
+        pageNumber: Int,
+        decision: PageReviewDecision
+    ) throws {
+        try execute(
+            """
+            UPDATE page_content_analysis
+            SET user_decision = ?, updated_at = ?
+            WHERE absolute_path = ? AND page_number = ?
+            """,
+            bindings: [
+                .text(decision.rawValue),
+                .real(Date().timeIntervalSince1970),
+                .text(path),
+                .integer(Int64(pageNumber))
+            ]
+        )
+        publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func emptyPageCandidates() throws -> [EmptyPageCandidate] {
+        let rows = try query(
+            """
+            SELECT a.*, j.relative_path, j.file_name
+            FROM page_content_analysis a
+            JOIN processing_jobs j ON j.job_key = a.absolute_path
+            WHERE j.state NOT IN ('retired', 'unavailable')
+              AND a.status != 'content'
+              AND a.user_decision NOT IN ('notEmpty', 'excluded')
+            ORDER BY j.file_name, a.page_number
+            """
+        )
+        return rows.compactMap(Self.emptyPageCandidate)
+    }
+
+    public func emptyPDFCandidates() throws -> [EmptyPDFCandidate] {
+        let rows = try query(
+            """
+            SELECT a.absolute_path, j.relative_path, j.file_name,
+                   a.original_hash, MAX(a.page_count) AS page_count,
+                   MIN(a.confidence) AS confidence,
+                   COUNT(*) AS analyzed_pages,
+                   SUM(CASE WHEN a.status IN ('fullyEmpty', 'probablyEmpty')
+                                 AND a.user_decision NOT IN ('notEmpty', 'excluded')
+                            THEN 1 ELSE 0 END) AS empty_pages
+            FROM page_content_analysis a
+            JOIN processing_jobs j ON j.job_key = a.absolute_path
+            WHERE j.state NOT IN ('retired', 'unavailable')
+            GROUP BY a.absolute_path, j.relative_path, j.file_name, a.original_hash
+            HAVING analyzed_pages = page_count AND empty_pages = page_count
+            ORDER BY j.file_name
+            """
+        )
+        return rows.compactMap { row in
+            guard let path = row.string("absolute_path"),
+                  let relative = row.string("relative_path"),
+                  let name = row.string("file_name"),
+                  let hash = row.string("original_hash"),
+                  let count = row.int64("page_count"),
+                  let confidence = row.double("confidence") else { return nil }
+            return EmptyPDFCandidate(
+                absolutePath: path,
+                relativePath: relative,
+                fileName: name,
+                originalHash: hash,
+                pageCount: Int(count),
+                confidence: confidence
+            )
+        }
+    }
+
+    public func duplicateGroups() throws -> [DuplicateGroup] {
+        let rows = try query(
+            """
+            SELECT content_hash, absolute_path, relative_path, file_name,
+                   discovered_modified_at, discovered_size
+            FROM processing_jobs
+            WHERE state NOT IN ('retired', 'unavailable')
+              AND content_hash IS NOT NULL
+              AND content_hash IN (
+                  SELECT content_hash
+                  FROM processing_jobs
+                  WHERE state NOT IN ('retired', 'unavailable')
+                    AND content_hash IS NOT NULL
+                  GROUP BY content_hash
+                  HAVING COUNT(*) > 1
+              )
+            ORDER BY content_hash, absolute_path
+            """
+        )
+        var grouped: [String: [DuplicateLocation]] = [:]
+        for row in rows {
+            guard let hash = row.string("content_hash"),
+                  let path = row.string("absolute_path"),
+                  let relative = row.string("relative_path"),
+                  let name = row.string("file_name"),
+                  let modified = row.double("discovered_modified_at"),
+                  let size = row.int64("discovered_size") else { continue }
+            grouped[hash, default: []].append(
+                DuplicateLocation(
+                    absolutePath: path,
+                    relativePath: relative,
+                    fileName: name,
+                    modifiedAt: Date(timeIntervalSince1970: modified),
+                    fileSize: size
+                )
+            )
+        }
+        return grouped.sorted(by: { $0.key < $1.key }).map {
+            DuplicateGroup(contentHash: $0.key, locations: $0.value)
+        }
+    }
+
+    public func filesMissingPageContentAnalysis() throws -> [(path: String, hash: String)] {
+        try query(
+            """
+            SELECT absolute_path, content_hash
+            FROM processing_jobs j
+            WHERE j.state = 'indexed'
+              AND j.content_hash IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM page_content_analysis a
+                  WHERE a.absolute_path = j.absolute_path
+                    AND a.original_hash = j.content_hash
+              )
+            ORDER BY updated_at DESC
+            """
+        ).compactMap { row in
+            guard let path = row.string("absolute_path"),
+                  let hash = row.string("content_hash") else { return nil }
+            return (path, hash)
+        }
+    }
+
+    public func markPathsRemoved(_ paths: [String]) throws {
+        guard !paths.isEmpty else { return }
+        try transaction {
+            let now = Date().timeIntervalSince1970
+            for path in paths {
+                try execute(
+                    """
+                    UPDATE processing_jobs
+                    SET state = 'retired', last_stage = 'retired',
+                        last_error = NULL, updated_at = ?
+                    WHERE job_key = ?
+                    """,
+                    bindings: [.real(now), .text(path)]
+                )
+                try execute(
+                    """
+                    UPDATE document_locations
+                    SET deleted_at = ?
+                    WHERE absolute_path = ? AND deleted_at IS NULL
+                    """,
+                    bindings: [.real(now), .text(path)]
+                )
+                try execute(
+                    "DELETE FROM page_content_analysis WHERE absolute_path = ?",
+                    bindings: [.text(path)]
+                )
+            }
+            try removeOrphanedDocumentsInTransaction()
+        }
+        publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func markPathForReindex(
+        path: String,
+        size: Int64,
+        modifiedAt: Date
+    ) throws {
+        try transaction {
+            let now = Date().timeIntervalSince1970
+            try execute(
+                """
+                UPDATE processing_jobs
+                SET state = 'discovered', last_stage = 'discovered',
+                    content_hash = NULL, discovered_size = ?,
+                    discovered_modified_at = ?, last_error = NULL, updated_at = ?
+                WHERE job_key = ?
+                """,
+                bindings: [
+                    .integer(size),
+                    .real(modifiedAt.timeIntervalSince1970),
+                    .real(now),
+                    .text(path)
+                ]
+            )
+            try execute(
+                """
+                UPDATE document_locations
+                SET deleted_at = ?
+                WHERE absolute_path = ? AND deleted_at IS NULL
+                """,
+                bindings: [.real(now), .text(path)]
+            )
+            try execute(
+                "DELETE FROM page_content_analysis WHERE absolute_path = ?",
+                bindings: [.text(path)]
+            )
+            try removeOrphanedDocumentsInTransaction()
+        }
+        publishStatusChange(.maintenanceCompleted)
+    }
+
     public func indexDocument(
         file: DiscoveredPDF,
         hash: String,
@@ -754,8 +1103,15 @@ public actor SQLiteDatabase {
                  )) AS e5_embedded_chunks,
                 MAX(
                     0,
-                    (SELECT COUNT(*) FROM active_locations)
-                    - (SELECT COUNT(*) FROM active_documents)
+                    (SELECT COALESCE(SUM(location_count - 1), 0)
+                     FROM (
+                         SELECT COUNT(*) AS location_count
+                         FROM processing_jobs
+                         WHERE state NOT IN ('retired', 'unavailable')
+                           AND content_hash IS NOT NULL
+                         GROUP BY content_hash
+                         HAVING COUNT(*) > 1
+                     ))
                 ) AS duplicate_locations,
                 (SELECT COUNT(*) FROM document_locations WHERE deleted_at IS NOT NULL)
                     + (SELECT COUNT(*) FROM processing_jobs WHERE state = 'unavailable')
@@ -769,6 +1125,30 @@ public actor SQLiteDatabase {
                 (SELECT COUNT(*) FROM ocr_page_quality q
                  JOIN active_documents d ON d.document_id = q.document_id
                  WHERE q.status = 'likelyFailed') AS ocr_quality_failed,
+                (SELECT COUNT(*)
+                 FROM page_content_analysis a
+                 JOIN processing_jobs j ON j.job_key = a.absolute_path
+                 WHERE j.state NOT IN ('retired', 'unavailable')
+                   AND a.status IN (
+                       'fullyEmpty', 'probablyEmpty', 'imageWithoutText',
+                       'needsOCRReview', 'technicalError'
+                   )
+                   AND a.user_decision NOT IN ('notEmpty', 'excluded'))
+                    AS empty_page_candidates,
+                (SELECT COUNT(*)
+                 FROM (
+                     SELECT a.absolute_path
+                     FROM page_content_analysis a
+                     JOIN processing_jobs j ON j.job_key = a.absolute_path
+                     WHERE j.state NOT IN ('retired', 'unavailable')
+                     GROUP BY a.absolute_path
+                     HAVING COUNT(*) = MAX(a.page_count)
+                        AND SUM(
+                            CASE WHEN a.status IN ('fullyEmpty', 'probablyEmpty')
+                                      AND a.user_decision NOT IN ('notEmpty', 'excluded')
+                                 THEN 1 ELSE 0 END
+                        ) = MAX(a.page_count)
+                 )) AS fully_empty_pdfs,
                 (SELECT COUNT(*) FROM processing_jobs
                  WHERE state IN ('indexed', 'failed')) AS processed_jobs,
                 (SELECT COUNT(*) FROM processing_jobs
@@ -796,6 +1176,8 @@ public actor SQLiteDatabase {
         result.ocrQualityGoodPages = Int(row?.int64("ocr_quality_good") ?? 0)
         result.ocrQualityReviewPages = Int(row?.int64("ocr_quality_review") ?? 0)
         result.ocrQualityFailedPages = Int(row?.int64("ocr_quality_failed") ?? 0)
+        result.emptyPageCandidates = Int(row?.int64("empty_page_candidates") ?? 0)
+        result.fullyEmptyPDFs = Int(row?.int64("fully_empty_pdfs") ?? 0)
         result.processedJobs = Int(row?.int64("processed_jobs") ?? 0)
         result.totalJobs = Int(row?.int64("total_jobs") ?? 0)
         result.isPaused = try setting(key: "processingPaused") == "1"
@@ -1249,12 +1631,48 @@ public actor SQLiteDatabase {
                 )
             }
         }
+        if current < 7 {
+            try transaction {
+                for statement in Self.migration7 {
+                    try execute(statement)
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (7, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
     }
 
     private func ensureOpen() throws {
         guard connection != nil else {
             throw PrivateDocSearchError.database("Die Datenbank wurde noch nicht initialisiert.")
         }
+    }
+
+    private func removeOrphanedDocumentsInTransaction() throws {
+        try execute(
+            """
+            DELETE FROM chunks_fts
+            WHERE chunk_id IN (
+                SELECT c.id
+                FROM chunks c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_locations l
+                    WHERE l.document_id = c.document_id AND l.deleted_at IS NULL
+                )
+            )
+            """
+        )
+        try execute(
+            """
+            DELETE FROM documents
+            WHERE NOT EXISTS (
+                SELECT 1 FROM document_locations l
+                WHERE l.document_id = documents.id AND l.deleted_at IS NULL
+            )
+            """
+        )
     }
 
     @discardableResult
@@ -1407,6 +1825,64 @@ public actor SQLiteDatabase {
             pageNumber: Int(page),
             excerpt: excerpt,
             score: score
+        )
+    }
+
+    private static func emptyPageCandidate(_ row: SQLiteRow) -> EmptyPageCandidate? {
+        guard let path = row.string("absolute_path"),
+              let relative = row.string("relative_path"),
+              let name = row.string("file_name"),
+              let hash = row.string("original_hash"),
+              let pageNumber = row.int64("page_number"),
+              let pageCount = row.int64("page_count"),
+              let statusRaw = row.string("status"),
+              let status = PageContentStatus(rawValue: statusRaw),
+              let confidence = row.double("confidence"),
+              let reason = row.string("reason"),
+              let renderSucceeded = row.int64("render_succeeded"),
+              let pixelWidth = row.int64("pixel_width"),
+              let pixelHeight = row.int64("pixel_height"),
+              let whiteRatio = row.double("white_ratio"),
+              let darkPixelRatio = row.double("dark_pixel_ratio"),
+              let variance = row.double("variance"),
+              let edgeRatio = row.double("edge_ratio"),
+              let contrast = row.double("contrast"),
+              let characterCount = row.int64("character_count"),
+              let wordCount = row.int64("word_count"),
+              let embeddedImageCount = row.int64("embedded_image_count"),
+              let annotationCount = row.int64("annotation_count"),
+              let hasSmallText = row.int64("has_small_text"),
+              let decisionRaw = row.string("user_decision"),
+              let decision = PageReviewDecision(rawValue: decisionRaw) else {
+            return nil
+        }
+        return EmptyPageCandidate(
+            absolutePath: path,
+            relativePath: relative,
+            fileName: name,
+            originalHash: hash,
+            pageNumber: Int(pageNumber),
+            pageCount: Int(pageCount),
+            status: status,
+            confidence: confidence,
+            reason: reason,
+            metrics: PageVisualMetrics(
+                renderSucceeded: renderSucceeded == 1,
+                pixelWidth: Int(pixelWidth),
+                pixelHeight: Int(pixelHeight),
+                whiteRatio: whiteRatio,
+                darkPixelRatio: darkPixelRatio,
+                variance: variance,
+                edgeRatio: edgeRatio,
+                contrast: contrast,
+                characterCount: Int(characterCount),
+                wordCount: Int(wordCount),
+                ocrConfidence: row.double("ocr_confidence"),
+                embeddedImageCount: Int(embeddedImageCount),
+                annotationCount: Int(annotationCount),
+                hasSmallText: hasSmallText == 1
+            ),
+            decision: decision
         )
     }
 
@@ -1642,6 +2118,39 @@ public actor SQLiteDatabase {
 
     private static let migration6 = [
         "ALTER TABLE processing_jobs ADD COLUMN ocr_engine TEXT"
+    ]
+
+    private static let migration7 = [
+        """
+        CREATE TABLE page_content_analysis (
+            absolute_path TEXT NOT NULL,
+            original_hash TEXT NOT NULL,
+            page_number INTEGER NOT NULL,
+            page_count INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            reason TEXT NOT NULL,
+            render_succeeded INTEGER NOT NULL,
+            pixel_width INTEGER NOT NULL,
+            pixel_height INTEGER NOT NULL,
+            white_ratio REAL NOT NULL,
+            dark_pixel_ratio REAL NOT NULL,
+            variance REAL NOT NULL,
+            edge_ratio REAL NOT NULL,
+            contrast REAL NOT NULL,
+            character_count INTEGER NOT NULL,
+            word_count INTEGER NOT NULL,
+            ocr_confidence REAL,
+            embedded_image_count INTEGER NOT NULL,
+            annotation_count INTEGER NOT NULL,
+            has_small_text INTEGER NOT NULL,
+            user_decision TEXT NOT NULL DEFAULT 'undecided',
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(absolute_path, page_number)
+        )
+        """,
+        "CREATE INDEX idx_page_analysis_status ON page_content_analysis(status, user_decision)",
+        "CREATE INDEX idx_page_analysis_hash ON page_content_analysis(original_hash)"
     ]
 }
 

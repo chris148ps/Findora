@@ -39,6 +39,17 @@ Abgedeckt sind:
 - ereignisgetriebener Dokumentenstatus unter 500 ms;
 - konsistente OCR-/Job-/Chunk-/Embedding-/Duplikatzähler;
 - persistierte Pause und identische Statusrekonstruktion nach Datenbank-Neustart;
+- genau vier primäre Dokumentenstatus-Kennzahlen;
+- visuelle Leerseitenerkennung für vollständig leere Seiten, Trennseiten,
+  Bildseiten, Unterschriften, Stempel, kontrastarme Seiten und kleine
+  Randnotizen;
+- getrennte Erkennung vollständig leerer und gemischter PDFs;
+- bestätigte Einzelseitenentfernung mit PDF-, Reihenfolge- und
+  Reindexierungsprüfung;
+- SHA-256-Duplikate über verschiedene Namen und Speicherorte sowie Ausschluss
+  gleichnamiger Dateien mit anderem Inhalt;
+- Papierkorb- und Datenbankaktualisierung einschließlich vollständigem
+  Rollback bei einem simulierten Mehrdateifehler;
 - Vollständigkeit, Revisionen und Hashes des Modellkatalogs;
 - Hardware-Einstufung des Katalogs.
 
@@ -87,6 +98,11 @@ Danach manuell:
 12. Quellen gegen PDF-Seiten verifizieren.
 13. Antwort abbrechen und Entladen bei Speicherdruck/Inaktivität prüfen.
 14. Volume aushängen; der Index darf nicht als leer behandelt werden.
+15. Dokumentenstatus auf vier Hauptkennzahlen und eingeklappte technische
+    Details prüfen.
+16. Wartungslisten durchsuchen, sortieren, Seiten vorschauen und Entscheidungen
+    zurücksetzen.
+17. Nur mit synthetischen PDFs Papierkorb- und Seitenaustauschdialoge prüfen.
 
 Der Memory-Pressure-Pfad lässt sich ohne echten Speichermangel kontrolliert
 beim App-Start auslösen:

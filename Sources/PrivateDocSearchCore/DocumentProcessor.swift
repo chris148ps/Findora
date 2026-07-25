@@ -19,6 +19,7 @@ public actor DocumentProcessor {
     private nonisolated let chunker: any Chunking
     private nonisolated let embedder: any EmbeddingProviding
     private nonisolated let hasher: SHA256Hasher
+    private nonisolated let pageContentAnalyzer: PageContentAnalyzer
     private nonisolated let ocrProcessor: (any OCRProcessing)?
     private nonisolated let ocrProcessorFactory: (@Sendable () -> any OCRProcessing)?
     private nonisolated let fileLogger: AppFileLogger?
@@ -31,6 +32,7 @@ public actor DocumentProcessor {
         chunker: any Chunking = PageChunker(),
         embedder: any EmbeddingProviding,
         hasher: SHA256Hasher = SHA256Hasher(),
+        pageContentAnalyzer: PageContentAnalyzer = PageContentAnalyzer(),
         ocrProcessor: (any OCRProcessing)? = nil,
         ocrProcessorFactory: (@Sendable () -> any OCRProcessing)? = nil,
         fileLogger: AppFileLogger? = nil
@@ -41,6 +43,7 @@ public actor DocumentProcessor {
         self.chunker = chunker
         self.embedder = embedder
         self.hasher = hasher
+        self.pageContentAnalyzer = pageContentAnalyzer
         self.ocrProcessor = ocrProcessor
         self.ocrProcessorFactory = ocrProcessorFactory
         self.fileLogger = fileLogger
@@ -170,7 +173,12 @@ public actor DocumentProcessor {
         try await database.updateJob(path: file.id, state: .waitingForStability)
         var stable = try await stabilityChecker.waitUntilStable(file)
         let inputHash = try hasher.hash(fileAt: stable.url)
+        try await database.updateObservedHash(path: file.id, hash: inputHash)
         if try await database.reuseIndexedDocument(file: stable, observedHash: inputHash) {
+            try await database.copyPageContentAnalyses(
+                originalHash: inputHash,
+                toPath: stable.url.path
+            )
             try? await fileLogger?.log(
                 .info,
                 category: "Indexierung",
@@ -182,6 +190,14 @@ public actor DocumentProcessor {
 
         try await database.updateJob(path: file.id, state: .extracting)
         var pages = try extractor.extractPages(from: stable.url)
+        try await database.replacePageContentAnalyses(
+            path: stable.url.path,
+            originalHash: inputHash,
+            analyses: try pageContentAnalyzer.analyze(
+                fileAt: stable.url,
+                textPages: pages
+            )
+        )
         var ocrPerformed = false
         var currentFileHash = inputHash
         var pageQualities: [OCRPageQuality] = []
@@ -264,6 +280,15 @@ public actor DocumentProcessor {
                 category: "OCR-Qualität",
                 message: "Seiten: gut=\(good), prüfen=\(review), wahrscheinlich fehlgeschlagen=\(failed).",
                 path: stable.url.path
+            )
+            try await database.replacePageContentAnalyses(
+                path: stable.url.path,
+                originalHash: inputHash,
+                analyses: try pageContentAnalyzer.analyze(
+                    fileAt: stable.url,
+                    textPages: pages,
+                    ocrQualities: pageQualities
+                )
             )
         }
 

@@ -34,6 +34,7 @@ struct PrivateDocSearchApplication: App {
 enum AppSection: String, CaseIterable, Identifiable {
     case search = "Suche"
     case status = "Dokumentenstatus"
+    case maintenance = "Dokumentenwartung"
     case ocr = "OCR"
     case models = "Modelle"
     case settings = "Einstellungen"
@@ -45,6 +46,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .search: "magnifyingglass"
         case .status: "doc.text"
+        case .maintenance: "wrench.and.screwdriver"
         case .ocr: "text.viewfinder"
         case .models: "cpu"
         case .settings: "gearshape"
@@ -100,6 +102,11 @@ final class AppState {
     var modelMessage: String?
     var isInstallingOCRComponents = false
     var ocrInstallationMessage: String?
+    var duplicateGroups: [DuplicateGroup] = []
+    var emptyPageCandidates: [EmptyPageCandidate] = []
+    var emptyPDFCandidates: [EmptyPDFCandidate] = []
+    var isMaintainingDocuments = false
+    var maintenanceMessage: String?
     let hardwareProfile: HardwareProfile
 
     var activeEmbeddingModelVersion: String? {
@@ -116,6 +123,7 @@ final class AppState {
     private let paths: AppPaths
     private let database: SQLiteDatabase
     private let fileLogger: AppFileLogger
+    private let maintenanceService: DocumentMaintenanceService
     private let bookmarkStore = FolderBookmarkStore()
     private let scanner: RecursivePDFScanner
     private var processor: DocumentProcessor
@@ -142,6 +150,7 @@ final class AppState {
             self.paths = paths
             self.database = SQLiteDatabase(url: paths.database)
             self.fileLogger = try AppFileLogger(logDirectory: paths.logs)
+            self.maintenanceService = DocumentMaintenanceService(database: database)
             self.scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
             let catalog = try ModelCatalog.bundled()
             self.modelManager = LocalModelManager(catalog: catalog, paths: paths)
@@ -459,6 +468,182 @@ final class AppState {
         }
     }
 
+    func refreshMaintenance() async {
+        do {
+            async let duplicates = database.duplicateGroups()
+            async let emptyPages = database.emptyPageCandidates()
+            async let emptyPDFs = database.emptyPDFCandidates()
+            let snapshot = try await (duplicates, emptyPages, emptyPDFs)
+            duplicateGroups = snapshot.0
+            emptyPageCandidates = snapshot.1
+            emptyPDFCandidates = snapshot.2
+        } catch {
+            report(error)
+        }
+    }
+
+    func analyzeMissingPages() {
+        guard !isMaintainingDocuments, !isProcessing else { return }
+        isMaintainingDocuments = true
+        maintenanceMessage = "Fehlende Seitenanalysen werden ergänzt …"
+        Task {
+            defer { isMaintainingDocuments = false }
+            do {
+                let count = try await maintenanceService.analyzeMissingPages()
+                maintenanceMessage = count == 0
+                    ? "Alle indexierten PDFs besitzen bereits eine Seitenanalyse."
+                    : "\(count) PDF(s) wurden ohne erneute OCR visuell analysiert."
+                try? await fileLogger.log(
+                    .info,
+                    category: "Dokumentenwartung",
+                    message: "Fehlende Seitenanalysen ergänzt: \(count)."
+                )
+                await refreshMaintenance()
+                await refreshDocumentStatus()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func setPageDecision(
+        _ candidate: EmptyPageCandidate,
+        decision: PageReviewDecision
+    ) {
+        Task {
+            do {
+                try await database.setPageReviewDecision(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber,
+                    decision: decision
+                )
+                await refreshMaintenance()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func removeConfirmedEmptyPages(_ candidates: [EmptyPageCandidate]) {
+        guard !candidates.isEmpty,
+              !isMaintainingDocuments,
+              !isProcessing else { return }
+        isMaintainingDocuments = true
+        maintenanceMessage = "Bestätigte leere Seiten werden sicher entfernt …"
+        Task {
+            defer { isMaintainingDocuments = false }
+            do {
+                for group in Dictionary(grouping: candidates, by: \.absolutePath).values {
+                    guard let representative = group.first else { continue }
+                    try await maintenanceService.removePages(
+                        from: representative,
+                        pageNumbers: Set(group.map(\.pageNumber))
+                    )
+                }
+                await processor.processPending(
+                    ocrConfiguration: ocrConfiguration
+                ) { _ in }
+                maintenanceMessage =
+                    "\(candidates.count) bestätigte Seite(n) entfernt; Originalfassungen liegen im Papierkorb und der Suchindex wurde gezielt aktualisiert."
+                try? await fileLogger.log(
+                    .warning,
+                    category: "Dokumentenwartung",
+                    message: "Bestätigte leere Seiten entfernt und betroffene PDFs neu indexiert: \(candidates.count)."
+                )
+                await refreshMaintenance()
+                await refreshDatabaseState()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func trashEmptyPDFs(_ candidates: [EmptyPDFCandidate]) {
+        guard !candidates.isEmpty,
+              !isMaintainingDocuments,
+              !isProcessing else { return }
+        isMaintainingDocuments = true
+        maintenanceMessage = "Bestätigte leere PDFs werden in den Papierkorb verschoben …"
+        Task {
+            defer { isMaintainingDocuments = false }
+            do {
+                let count = try await maintenanceService.trashEmptyPDFs(candidates)
+                maintenanceMessage =
+                    "\(count) vollständig leere PDF(s) wurden in den macOS-Papierkorb verschoben."
+                try? await fileLogger.log(
+                    .warning,
+                    category: "Dokumentenwartung",
+                    message: "Vollständig leere PDFs in den Papierkorb verschoben: \(count)."
+                )
+                await refreshMaintenance()
+                await refreshDatabaseState()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func trashDuplicateLocations(_ locations: [DuplicateLocation]) {
+        guard !locations.isEmpty,
+              !isMaintainingDocuments,
+              !isProcessing else { return }
+        let hashesByPath = Dictionary(uniqueKeysWithValues: locations.compactMap {
+            location -> (String, String)? in
+            guard let hash = duplicateGroups.first(where: {
+                $0.locations.contains(location)
+            })?.contentHash else { return nil }
+            return (location.absolutePath, hash)
+        })
+        guard hashesByPath.count == locations.count else {
+            report(
+                PrivateDocSearchError.processFailed(
+                    "Die Duplikatauswahl ist nicht mehr aktuell."
+                )
+            )
+            return
+        }
+        isMaintainingDocuments = true
+        maintenanceMessage = "Ausgewählte Duplikate werden in den Papierkorb verschoben …"
+        Task {
+            defer { isMaintainingDocuments = false }
+            do {
+                let count = try await maintenanceService.trashDuplicateLocations(
+                    expectedHashesByPath: hashesByPath
+                )
+                maintenanceMessage =
+                    "\(count) bestätigte SHA-256-Duplikat(e) wurden in den macOS-Papierkorb verschoben."
+                try? await fileLogger.log(
+                    .warning,
+                    category: "Dokumentenwartung",
+                    message: "SHA-256-Duplikate in den Papierkorb verschoben: \(count)."
+                )
+                await refreshMaintenance()
+                await refreshDatabaseState()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func previewMaintenanceFile(
+        path: String,
+        fileName: String,
+        relativePath: String,
+        pageNumber: Int = 1
+    ) {
+        previewSource = SearchSource(
+            id: "\(path)#\(pageNumber)",
+            documentID: 0,
+            chunkID: "maintenance",
+            fileName: fileName,
+            absolutePath: path,
+            relativePath: relativePath,
+            pageNumber: pageNumber,
+            excerpt: "",
+            score: 0
+        )
+    }
+
     func submitQuestion() {
         let value = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, !isSearching else { return }
@@ -600,6 +785,9 @@ final class AppState {
             let snapshot = try await database.statistics()
             statistics = snapshot
             isPaused = snapshot.isPaused
+            if selectedSection == .maintenance {
+                await refreshMaintenance()
+            }
         } catch {
             report(error)
         }
@@ -1070,6 +1258,7 @@ struct ContentView: View {
                 switch state.selectedSection ?? .search {
                 case .search: SearchView()
                 case .status: StatusView()
+                case .maintenance: MaintenanceView()
                 case .ocr: OCRView()
                 case .models: ModelsView()
                 case .settings: SettingsView()
@@ -1537,6 +1726,7 @@ struct PDFKitView: NSViewRepresentable {
 
 struct StatusView: View {
     @Environment(AppState.self) private var state
+    @State private var showsTechnicalDetails = false
 
     var body: some View {
         ScrollView {
@@ -1557,71 +1747,16 @@ struct StatusView: View {
                 .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
 
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 180))], spacing: 12) {
-                    MetricCard(title: "PDFs insgesamt", value: state.statistics.totalPDFs)
-                    MetricCard(title: "Indexiert", value: state.statistics.indexedPDFs)
-                    MetricCard(title: "Mit Textschicht", value: state.statistics.searchablePDFs)
-                    MetricCard(title: "Ohne Textschicht", value: state.statistics.withoutTextLayerPDFs)
-                    MetricCard(title: "OCR erforderlich", value: state.statistics.ocrRequiredPDFs)
-                    MetricCard(title: "OCR erfolgreich", value: state.statistics.ocrProcessedPDFs)
-                    MetricCard(title: "OCR fehlgeschlagen", value: state.statistics.ocrFailedPDFs)
-                    MetricCard(title: "In Warteschlange", value: state.statistics.pendingJobs)
-                    MetricCard(title: "In Bearbeitung", value: state.statistics.processingJobs)
-                    MetricCard(title: "Pausiert", value: state.statistics.pausedJobs)
-                    MetricCard(title: "Übersprungen", value: state.statistics.skippedJobs)
-                    MetricCard(title: "Fehler", value: state.statistics.failedJobs)
-                    MetricCard(title: "Chunks insgesamt", value: state.statistics.totalChunks)
-                    MetricCard(title: "Embeddings vorhanden", value: state.statistics.embeddedChunks)
-                    MetricCard(title: "Fallback-Embeddings", value: state.statistics.fallbackEmbeddedChunks)
-                    MetricCard(title: "E5-Embeddings", value: state.statistics.e5EmbeddedChunks)
-                    MetricCard(title: "Duplikate", value: state.statistics.duplicateLocations)
-                    MetricCard(title: "Fehlend oder verschoben", value: state.statistics.missingOrMovedFiles)
-                    MetricCard(title: "OCR-Seiten gut", value: state.statistics.ocrQualityGoodPages)
-                    MetricCard(title: "OCR-Seiten prüfen", value: state.statistics.ocrQualityReviewPages)
-                    MetricCard(title: "OCR vermutlich fehlgeschlagen", value: state.statistics.ocrQualityFailedPages)
-                }
-
-                GroupBox("Lokale KI") {
-                    Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 6) {
-                        GridRow {
-                            Text("Embedding-Modell").foregroundStyle(.secondary)
-                            Text(state.activeEmbeddingModelID ?? "Fallback (nicht neuronal)")
-                        }
-                        GridRow {
-                            Text("Embedding-Version").foregroundStyle(.secondary)
-                            Text(state.activeEmbeddingModelVersion ?? "Integriert")
-                        }
-                        GridRow {
-                            Text("Indexzustand").foregroundStyle(.secondary)
-                            Text(state.hasMixedEmbeddingIndex ? "Gemischte Embeddings" : "Konsistent")
-                                .foregroundStyle(state.hasMixedEmbeddingIndex ? .orange : .primary)
-                        }
-                        GridRow {
-                            Text("Antwortmodell").foregroundStyle(.secondary)
-                            Text(state.activeAnswerModelID ?? "Nicht aktiviert")
-                        }
-                        GridRow {
-                            Text("Speicherdruck").foregroundStyle(.secondary)
-                            Text(state.memoryPressure)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    if state.hasMixedEmbeddingIndex {
-                        Divider()
-                        Label(
-                            "E5- und Fallback-Vektoren sind gleichzeitig vorhanden. Die aktive Suche verwendet nur das aktive Modell; baue den Index vollständig neu auf.",
-                            systemImage: "exclamationmark.triangle.fill"
+                    ForEach(DocumentStatusPrimaryMetric.allCases) { metric in
+                        MetricCard(
+                            title: metric.displayName,
+                            value: metric.value(in: state.statistics)
                         )
-                        .foregroundStyle(.orange)
-                        Button("Suchindex neu aufbauen") {
-                            state.rebuildSearchIndex()
-                        }
-                        .disabled(state.isProcessing)
                     }
                 }
 
                 if state.isProcessing
-                    || state.statistics.totalJobs > 0
-                    || state.statistics.pendingJobs > 0
+                    || state.statistics.processingJobs > 0
                     || state.statistics.isPaused {
                     GroupBox(
                         state.statistics.isPaused
@@ -1643,55 +1778,87 @@ struct StatusView: View {
                                 )
                                 .monospacedDigit()
                             }
-                            Text("\(state.statistics.failedJobs) fehlgeschlagen")
-                                .foregroundStyle(
-                                    state.statistics.failedJobs > 0 ? .red : .secondary
-                                )
-                            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 6) {
-                                GridRow {
-                                    Text("Aktueller Schritt").foregroundStyle(.secondary)
-                                    Text(
-                                        state.statistics.currentStep
-                                            ?? (state.statistics.isPaused
-                                                ? "Pausiert"
-                                                : state.isProcessing
-                                                    ? "Ordner wird gescannt"
-                                                    : "Bereit")
-                                    )
-                                }
-                                GridRow {
-                                    Text("Aktuelle Datei").foregroundStyle(.secondary)
-                                    Text(state.statistics.currentFile ?? "—")
-                                }
-                                GridRow {
-                                    Text("OCR-Engine").foregroundStyle(.secondary)
-                                    Text(state.statistics.currentOCREngine ?? "—")
-                                }
-                                GridRow {
-                                    Text("Zustand").foregroundStyle(.secondary)
-                                    Text(
-                                        state.statistics.isPaused
-                                            ? "Pausiert"
-                                            : state.statistics.processingJobs > 0 || state.isProcessing
-                                                ? "Aktiv"
-                                                : state.statistics.pendingJobs > 0
-                                                    ? "Wartend"
-                                                    : "Bereit"
-                                    )
-                                }
-                                GridRow {
-                                    Text("Letzter Erfolg").foregroundStyle(.secondary)
-                                    Text(state.statistics.lastSuccessfulStep ?? "—")
-                                }
-                                GridRow {
-                                    Text("Letzter Fehler").foregroundStyle(.secondary)
-                                    Text(state.statistics.lastProcessingError ?? "—")
-                                        .lineLimit(3)
-                                }
-                            }
+                            Text("Aktuell:")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(state.statistics.currentFile ?? "Ordner wird gescannt …")
+                                .font(.headline)
                         }
                     }
                 }
+
+                DisclosureGroup(
+                    "Technische Details",
+                    isExpanded: $showsTechnicalDetails
+                ) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        LazyVGrid(
+                            columns: [GridItem(.adaptive(minimum: 170))],
+                            spacing: 10
+                        ) {
+                            MetricCard(title: "Mit Textschicht", value: state.statistics.searchablePDFs)
+                            MetricCard(title: "Ohne Textschicht", value: state.statistics.withoutTextLayerPDFs)
+                            MetricCard(title: "OCR erforderlich", value: state.statistics.ocrRequiredPDFs)
+                            MetricCard(title: "OCR erfolgreich", value: state.statistics.ocrProcessedPDFs)
+                            MetricCard(title: "OCR fehlgeschlagen", value: state.statistics.ocrFailedPDFs)
+                            MetricCard(title: "In Bearbeitung", value: state.statistics.processingJobs)
+                            MetricCard(title: "Pausiert", value: state.statistics.pausedJobs)
+                            MetricCard(title: "Übersprungen", value: state.statistics.skippedJobs)
+                            MetricCard(title: "Technische Fehler", value: state.statistics.failedJobs)
+                            MetricCard(title: "Chunks", value: state.statistics.totalChunks)
+                            MetricCard(title: "Embeddings", value: state.statistics.embeddedChunks)
+                            MetricCard(title: "Fallback-Embeddings", value: state.statistics.fallbackEmbeddedChunks)
+                            MetricCard(title: "E5-Embeddings", value: state.statistics.e5EmbeddedChunks)
+                            MetricCard(title: "Fehlende Dateien", value: state.statistics.missingOrMovedFiles)
+                            MetricCard(title: "OCR-Seiten gut", value: state.statistics.ocrQualityGoodPages)
+                            MetricCard(title: "OCR überprüfen", value: state.statistics.ocrQualityReviewPages)
+                            MetricCard(title: "Zu prüfende Seiten", value: state.statistics.emptyPageCandidates)
+                            MetricCard(title: "Vollständig leere PDFs", value: state.statistics.fullyEmptyPDFs)
+                        }
+                        Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 6) {
+                            GridRow {
+                                Text("OCR-Engine").foregroundStyle(.secondary)
+                                Text(state.statistics.currentOCREngine ?? "—")
+                            }
+                            GridRow {
+                                Text("Embedding-Modell").foregroundStyle(.secondary)
+                                Text(state.activeEmbeddingModelID ?? "Fallback (nicht neuronal)")
+                            }
+                            GridRow {
+                                Text("Embedding-Version").foregroundStyle(.secondary)
+                                Text(state.activeEmbeddingModelVersion ?? "Integriert")
+                            }
+                            GridRow {
+                                Text("Indexzustand").foregroundStyle(.secondary)
+                                Text(state.hasMixedEmbeddingIndex ? "Gemischte Embeddings" : "Konsistent")
+                                    .foregroundStyle(state.hasMixedEmbeddingIndex ? .orange : .primary)
+                            }
+                            GridRow {
+                                Text("Letzter Erfolg").foregroundStyle(.secondary)
+                                Text(state.statistics.lastSuccessfulStep ?? "—")
+                            }
+                            GridRow {
+                                Text("Letzter Fehler").foregroundStyle(.secondary)
+                                Text(state.statistics.lastProcessingError ?? "—")
+                                    .lineLimit(3)
+                            }
+                        }
+                        if state.hasMixedEmbeddingIndex {
+                            Label(
+                                "E5- und Fallback-Vektoren sind gleichzeitig vorhanden. Die Suche verwendet nur das aktive Modell.",
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            .foregroundStyle(.orange)
+                            Button("Embeddings neu erzeugen") {
+                                state.rebuildSearchIndex()
+                            }
+                            .disabled(state.isProcessing)
+                        }
+                    }
+                    .padding(.top, 10)
+                }
+                .padding()
+                .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
 
                 HStack {
                     Button("Jetzt scannen") { Task { await state.scanNow() } }
@@ -1719,6 +1886,646 @@ struct MetricCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding()
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private enum MaintenanceSection: String, CaseIterable, Identifiable {
+    case duplicates = "Duplikate"
+    case emptyPages = "Leere Seiten"
+    case emptyPDFs = "Leere PDFs"
+    case missingFiles = "Fehlende Dateien"
+    case index = "Index und Embeddings"
+
+    var id: Self { self }
+}
+
+private enum MaintenanceSort: String, CaseIterable, Identifiable {
+    case fileName = "Dateiname"
+    case path = "Pfad"
+    case confidence = "Sicherheit"
+
+    var id: Self { self }
+}
+
+struct MaintenanceView: View {
+    @Environment(AppState.self) private var state
+    @State private var section: MaintenanceSection = .duplicates
+    @State private var filter = ""
+    @State private var sort: MaintenanceSort = .fileName
+    @State private var selectedDuplicatePaths: Set<String> = []
+    @State private var selectedPageIDs: Set<String> = []
+    @State private var selectedEmptyPDFPaths: Set<String> = []
+    @State private var confirmsDuplicateTrash = false
+    @State private var confirmsPageRemoval = false
+    @State private var confirmsEmptyPDFTrash = false
+    @State private var confirmsIndexReset = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Picker("Wartungsbereich", selection: $section) {
+                    ForEach(MaintenanceSection.allCases) {
+                        Text($0.rawValue).tag($0)
+                    }
+                }
+                .pickerStyle(.segmented)
+                TextField("Liste durchsuchen", text: $filter)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 240)
+                Picker("Sortierung", selection: $sort) {
+                    ForEach(MaintenanceSort.allCases) {
+                        Text($0.rawValue).tag($0)
+                    }
+                }
+                .frame(width: 150)
+                Button("Aktualisieren") {
+                    Task { await state.refreshMaintenance() }
+                }
+            }
+            .padding()
+
+            Divider()
+
+            if state.isMaintainingDocuments {
+                ProgressView(state.maintenanceMessage ?? "Dokumentenwartung läuft …")
+                    .padding()
+            } else if let message = state.maintenanceMessage {
+                Label(message, systemImage: "checkmark.shield")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+            }
+
+            Group {
+                switch section {
+                case .duplicates:
+                    duplicateList
+                case .emptyPages:
+                    emptyPageList
+                case .emptyPDFs:
+                    emptyPDFList
+                case .missingFiles:
+                    missingFilesView
+                case .index:
+                    indexView
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .navigationTitle("Dokumentenwartung")
+        .task { await state.refreshMaintenance() }
+        .confirmationDialog(
+            "Ausgewählte Duplikate in den Papierkorb verschieben?",
+            isPresented: $confirmsDuplicateTrash
+        ) {
+            Button("In den Papierkorb", role: .destructive) {
+                state.trashDuplicateLocations(selectedDuplicateLocations)
+                selectedDuplicatePaths.removeAll()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text(
+                "Nur byteidentische SHA-256-Duplikate werden verschoben. Je Gruppe muss mindestens eine Datei erhalten bleiben."
+            )
+        }
+        .confirmationDialog(
+            "Bestätigte leere Seiten entfernen?",
+            isPresented: $confirmsPageRemoval
+        ) {
+            Button("Neue PDF erzeugen und austauschen", role: .destructive) {
+                state.removeConfirmedEmptyPages(selectedEmptyPages)
+                selectedPageIDs.removeAll()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text(
+                "Die PDF wird neu erzeugt und vollständig validiert. Die ursprüngliche Fassung wird nach dem atomaren Austausch in den Papierkorb verschoben."
+            )
+        }
+        .confirmationDialog(
+            "Vollständig leere PDFs in den Papierkorb verschieben?",
+            isPresented: $confirmsEmptyPDFTrash
+        ) {
+            Button("In den Papierkorb", role: .destructive) {
+                state.trashEmptyPDFs(selectedEmptyPDFs)
+                selectedEmptyPDFPaths.removeAll()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Die Dateien werden niemals endgültig gelöscht.")
+        }
+        .confirmationDialog(
+            "Dokumentindex zurücksetzen?",
+            isPresented: $confirmsIndexReset
+        ) {
+            Button("Index zurücksetzen", role: .destructive) {
+                state.deleteDocumentIndex()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("PDF-Dateien und Modelle bleiben unverändert.")
+        }
+    }
+
+    private var duplicateList: some View {
+        VStack(spacing: 0) {
+            List {
+                if filteredDuplicateGroups.isEmpty {
+                    ContentUnavailableView(
+                        "Keine SHA-256-Duplikate",
+                        systemImage: "doc.on.doc"
+                    )
+                }
+                ForEach(filteredDuplicateGroups) { group in
+                    Section {
+                        ForEach(sorted(group.locations)) { location in
+                            HStack(alignment: .top, spacing: 12) {
+                                Toggle(
+                                    "Entfernen",
+                                    isOn: selectionBinding(
+                                        location.absolutePath,
+                                        in: $selectedDuplicatePaths
+                                    )
+                                )
+                                .labelsHidden()
+                                MaintenanceThumbnail(
+                                    path: location.absolutePath,
+                                    pageNumber: 1
+                                )
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text(location.fileName).font(.headline)
+                                        if group.recommendedLocation == location {
+                                            Text("Empfohlen behalten")
+                                                .font(.caption2.bold())
+                                                .foregroundStyle(.green)
+                                        }
+                                    }
+                                    Text(location.relativePath)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(location.absolutePath)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                    Text(
+                                        "\(ByteCountFormatter.string(fromByteCount: location.fileSize, countStyle: .file)) · \(location.modifiedAt.formatted())"
+                                    )
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    HStack {
+                                        Button("Vorschau") {
+                                            state.previewMaintenanceFile(
+                                                path: location.absolutePath,
+                                                fileName: location.fileName,
+                                                relativePath: location.relativePath
+                                            )
+                                        }
+                                        Button("Diese Datei behalten") {
+                                            selectedDuplicatePaths.remove(
+                                                location.absolutePath
+                                            )
+                                        }
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    } header: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(group.locations.count) identische Dateien")
+                            Text("SHA-256 \(group.contentHash)")
+                                .font(.caption2.monospaced())
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
+            maintenanceActionBar(
+                selectionCount: selectedDuplicatePaths.count,
+                title: "Ausgewählte Duplikate in den Papierkorb",
+                enabled: duplicateSelectionIsSafe
+            ) {
+                confirmsDuplicateTrash = true
+            } reset: {
+                selectedDuplicatePaths.removeAll()
+            }
+        }
+    }
+
+    private var emptyPageList: some View {
+        VStack(spacing: 0) {
+            List {
+                if filteredEmptyPages.isEmpty {
+                    ContentUnavailableView(
+                        "Keine zu prüfenden Seiten",
+                        systemImage: "doc.text.magnifyingglass",
+                        description: Text(
+                            "Neue PDFs werden während der normalen Verarbeitung analysiert."
+                        )
+                    )
+                }
+                ForEach(filteredEmptyPages) { candidate in
+                    HStack(alignment: .top, spacing: 12) {
+                        Toggle(
+                            "Auswählen",
+                            isOn: selectionBinding(
+                                candidate.id,
+                                in: $selectedPageIDs
+                            )
+                        )
+                        .labelsHidden()
+                        .disabled(
+                            candidate.decision != .confirmedEmpty
+                                || !candidate.status.isEmptyCandidate
+                        )
+                        MaintenanceThumbnail(
+                            path: candidate.absolutePath,
+                            pageNumber: candidate.pageNumber
+                        )
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(candidate.fileName).font(.headline)
+                                Text("Seite \(candidate.pageNumber)")
+                                Spacer()
+                                Text(candidate.status.displayName)
+                                    .font(.caption.bold())
+                                    .foregroundStyle(
+                                        candidate.status.isEmptyCandidate
+                                            ? .orange
+                                            : .blue
+                                    )
+                            }
+                            Text(candidate.relativePath)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(candidate.absolutePath)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                            Text(
+                                "\(candidate.confidence, format: .percent.precision(.fractionLength(1))) Sicherheit · \(candidate.metrics.whiteRatio, format: .percent.precision(.fractionLength(2))) Weißfläche"
+                            )
+                            .font(.caption)
+                            Text(candidate.reason)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(
+                                "Dunkle Pixel \(candidate.metrics.darkPixelRatio, format: .percent.precision(.fractionLength(3))) · Kanten \(candidate.metrics.edgeRatio, format: .percent.precision(.fractionLength(3))) · Varianz \(candidate.metrics.variance.formatted(.number.precision(.fractionLength(5)))) · Bilder \(candidate.metrics.embeddedImageCount) · Annotationen \(candidate.metrics.annotationCount)"
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            HStack {
+                                Button("Vorschau") {
+                                    preview(candidate)
+                                }
+                                Button("In PDF öffnen") {
+                                    preview(candidate)
+                                }
+                                Button("Als leer bestätigen") {
+                                    state.setPageDecision(
+                                        candidate,
+                                        decision: .confirmedEmpty
+                                    )
+                                }
+                                .disabled(!candidate.status.isEmptyCandidate)
+                                Button("Nicht leer") {
+                                    selectedPageIDs.remove(candidate.id)
+                                    state.setPageDecision(
+                                        candidate,
+                                        decision: .notEmpty
+                                    )
+                                }
+                                Button("Ausschließen") {
+                                    selectedPageIDs.remove(candidate.id)
+                                    state.setPageDecision(
+                                        candidate,
+                                        decision: .excluded
+                                    )
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    .padding(.vertical, 5)
+                }
+            }
+            maintenanceActionBar(
+                selectionCount: selectedPageIDs.count,
+                title: "Ausgewählte Seiten entfernen",
+                enabled: !selectedEmptyPages.isEmpty
+            ) {
+                confirmsPageRemoval = true
+            } reset: {
+                selectedPageIDs.removeAll()
+            }
+        }
+    }
+
+    private var emptyPDFList: some View {
+        VStack(spacing: 0) {
+            List {
+                if filteredEmptyPDFs.isEmpty {
+                    ContentUnavailableView(
+                        "Keine vollständig leeren PDFs",
+                        systemImage: "doc"
+                    )
+                }
+                ForEach(filteredEmptyPDFs) { candidate in
+                    HStack(spacing: 12) {
+                        Toggle(
+                            "Auswählen",
+                            isOn: selectionBinding(
+                                candidate.absolutePath,
+                                in: $selectedEmptyPDFPaths
+                            )
+                        )
+                        .labelsHidden()
+                        MaintenanceThumbnail(
+                            path: candidate.absolutePath,
+                            pageNumber: 1
+                        )
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(candidate.fileName).font(.headline)
+                            Text(candidate.relativePath)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(candidate.absolutePath)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                            Text(
+                                "\(candidate.pageCount) vollständig analysierte leere Seite(n) · \(candidate.confidence, format: .percent.precision(.fractionLength(1))) Sicherheit"
+                            )
+                            .font(.caption)
+                            Button("Vorschau") {
+                                state.previewMaintenanceFile(
+                                    path: candidate.absolutePath,
+                                    fileName: candidate.fileName,
+                                    relativePath: candidate.relativePath
+                                )
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+            }
+            maintenanceActionBar(
+                selectionCount: selectedEmptyPDFPaths.count,
+                title: "Ausgewählte PDFs in den Papierkorb",
+                enabled: !selectedEmptyPDFs.isEmpty
+            ) {
+                confirmsEmptyPDFTrash = true
+            } reset: {
+                selectedEmptyPDFPaths.removeAll()
+            }
+        }
+    }
+
+    private var missingFilesView: some View {
+        ContentUnavailableView {
+            Label("Fehlende Dateien", systemImage: "questionmark.folder")
+        } description: {
+            Text(
+                "\(state.statistics.missingOrMovedFiles) Datei(en) fehlen oder wurden verschoben. Ein Scan gleicht Pfade und Suchindex gezielt ab."
+            )
+        } actions: {
+            Button("Jetzt prüfen") {
+                Task { await state.scanNow() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(state.documentFolderPath == nil || state.isProcessing)
+        }
+    }
+
+    private var indexView: some View {
+        Form {
+            Section("Leerseitenanalyse") {
+                Button("Fehlende Analysen ergänzen") {
+                    state.analyzeMissingPages()
+                }
+                Text(
+                    "Analysiert nur bisher nicht geprüfte PDFs und startet keine zusätzliche OCR."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Section("Embeddings") {
+                Button("Embeddings neu erzeugen") {
+                    state.rebuildSearchIndex()
+                }
+                Text(
+                    "Erzeugt Chunks und Embeddings ausschließlich aus dem bereits gespeicherten Text neu."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Section("Index zurücksetzen") {
+                Button("Dokumentindex zurücksetzen …", role: .destructive) {
+                    confirmsIndexReset = true
+                }
+                Text("PDF-Dateien werden weder verändert noch verschoben.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private func maintenanceActionBar(
+        selectionCount: Int,
+        title: String,
+        enabled: Bool,
+        action: @escaping () -> Void,
+        reset: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            Text("\(selectionCount) ausgewählt")
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Auswahl zurücksetzen", action: reset)
+                .disabled(selectionCount == 0)
+            Button(title, role: .destructive, action: action)
+                .disabled(
+                    !enabled
+                        || state.isMaintainingDocuments
+                        || state.isProcessing
+                )
+        }
+        .padding()
+        .background(.bar)
+    }
+
+    private var filteredDuplicateGroups: [DuplicateGroup] {
+        let query = normalizedFilter
+        let values = query.isEmpty ? state.duplicateGroups : state.duplicateGroups.filter {
+            $0.contentHash.localizedCaseInsensitiveContains(query)
+                || $0.locations.contains {
+                    $0.fileName.localizedCaseInsensitiveContains(query)
+                        || $0.relativePath.localizedCaseInsensitiveContains(query)
+                }
+        }
+        return values.sorted {
+            ($0.recommendedLocation?.fileName ?? $0.contentHash)
+                .localizedStandardCompare(
+                    $1.recommendedLocation?.fileName ?? $1.contentHash
+                ) == .orderedAscending
+        }
+    }
+
+    private var filteredEmptyPages: [EmptyPageCandidate] {
+        let values = state.emptyPageCandidates.filter(matchesFilter)
+        switch sort {
+        case .fileName:
+            return values.sorted {
+                $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending
+            }
+        case .path:
+            return values.sorted {
+                $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+            }
+        case .confidence:
+            return values.sorted { $0.confidence > $1.confidence }
+        }
+    }
+
+    private var filteredEmptyPDFs: [EmptyPDFCandidate] {
+        let values = state.emptyPDFCandidates.filter {
+            normalizedFilter.isEmpty
+                || $0.fileName.localizedCaseInsensitiveContains(normalizedFilter)
+                || $0.relativePath.localizedCaseInsensitiveContains(normalizedFilter)
+        }
+        switch sort {
+        case .fileName:
+            return values.sorted {
+                $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending
+            }
+        case .path:
+            return values.sorted {
+                $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+            }
+        case .confidence:
+            return values.sorted { $0.confidence > $1.confidence }
+        }
+    }
+
+    private var selectedDuplicateLocations: [DuplicateLocation] {
+        state.duplicateGroups.flatMap(\.locations).filter {
+            selectedDuplicatePaths.contains($0.absolutePath)
+        }
+    }
+
+    private var duplicateSelectionIsSafe: Bool {
+        guard !selectedDuplicatePaths.isEmpty else { return false }
+        return state.duplicateGroups.allSatisfy { group in
+            let selected = group.locations.filter {
+                selectedDuplicatePaths.contains($0.absolutePath)
+            }.count
+            return selected < group.locations.count
+        }
+    }
+
+    private var selectedEmptyPages: [EmptyPageCandidate] {
+        state.emptyPageCandidates.filter {
+            selectedPageIDs.contains($0.id)
+                && $0.decision == .confirmedEmpty
+                && $0.status.isEmptyCandidate
+        }
+    }
+
+    private var selectedEmptyPDFs: [EmptyPDFCandidate] {
+        state.emptyPDFCandidates.filter {
+            selectedEmptyPDFPaths.contains($0.absolutePath)
+        }
+    }
+
+    private var normalizedFilter: String {
+        filter.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func matchesFilter(_ candidate: EmptyPageCandidate) -> Bool {
+        normalizedFilter.isEmpty
+            || candidate.fileName.localizedCaseInsensitiveContains(normalizedFilter)
+            || candidate.relativePath.localizedCaseInsensitiveContains(normalizedFilter)
+            || candidate.status.displayName.localizedCaseInsensitiveContains(normalizedFilter)
+    }
+
+    private func sorted(_ locations: [DuplicateLocation]) -> [DuplicateLocation] {
+        switch sort {
+        case .fileName:
+            locations.sorted {
+                $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending
+            }
+        case .path:
+            locations.sorted {
+                $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+            }
+        case .confidence:
+            locations.sorted { $0.modifiedAt < $1.modifiedAt }
+        }
+    }
+
+    private func preview(_ candidate: EmptyPageCandidate) {
+        state.previewMaintenanceFile(
+            path: candidate.absolutePath,
+            fileName: candidate.fileName,
+            relativePath: candidate.relativePath,
+            pageNumber: candidate.pageNumber
+        )
+    }
+
+    private func selectionBinding(
+        _ id: String,
+        in selection: Binding<Set<String>>
+    ) -> Binding<Bool> {
+        Binding(
+            get: { selection.wrappedValue.contains(id) },
+            set: { enabled in
+                if enabled {
+                    selection.wrappedValue.insert(id)
+                } else {
+                    selection.wrappedValue.remove(id)
+                }
+            }
+        )
+    }
+}
+
+private struct MaintenanceThumbnail: View {
+    let path: String
+    let pageNumber: Int
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "doc")
+                    .font(.title)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 58, height: 78)
+        .background(.white, in: RoundedRectangle(cornerRadius: 4))
+        .overlay {
+            RoundedRectangle(cornerRadius: 4).stroke(.quaternary)
+        }
+        .task(id: "\(path)#\(pageNumber)") {
+            guard let document = PDFDocument(url: URL(filePath: path)),
+                  let page = document.page(at: max(0, pageNumber - 1)) else {
+                image = nil
+                return
+            }
+            image = page.thumbnail(
+                of: NSSize(width: 116, height: 156),
+                for: .mediaBox
+            )
+        }
     }
 }
 

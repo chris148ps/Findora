@@ -92,6 +92,11 @@ Embedding-Erstellung und Wartung automatisch. Datenbankereignisse werden
 gebündelt innerhalb von etwa 300 ms dargestellt; ein manueller Ansichtswechsel
 oder Neuladen ist nicht erforderlich.
 
+Die normale Ansicht zeigt bewusst nur **PDFs insgesamt**, **Indexiert**,
+**In Warteschlange** und **Duplikate**. OCR-, Embedding-, Fehler- und
+Qualitätswerte stehen weiterhin im standardmäßig eingeklappten Bereich
+**Technische Details** zur Verfügung.
+
 ## Modellauswahl
 
 Unter **Modelle** stehen nur fest versionierte, lizenzierte MLX-Modelle aus dem
@@ -132,6 +137,28 @@ Die Suchansicht zeigt Nutzerfrage und Markdown-Antwort chatähnlich in einem
 präsenten, während der Trefferansicht sichtbaren Bereich. Quellenlinks öffnen
 die richtige PDF-Seite. Folgefragen verwenden nur einen auf sechs Schritte
 begrenzten Sitzungskontext; ein dauerhaftes Chatgedächtnis gibt es nicht.
+
+## Dokumentenwartung
+
+Unter **Dokumentenwartung** werden SHA-256-Duplikate, leere Seiten,
+vollständig leere PDFs, fehlende Dateien sowie Index- und
+Embedding-Werkzeuge getrennt verwaltet. Die visuelle Leerseitenanalyse läuft
+bei der normalen Dokumentenverarbeitung mit. Für ältere Indexeinträge kann sie
+gezielt ergänzt werden, ohne eine zweite OCR zu starten.
+
+Eine Seite gilt nie allein wegen fehlenden OCR-Texts als leer. Die App prüft
+Rendering, Weiß- und Dunkelanteil, Varianz, Kanten, Kontrast, Textmenge,
+OCR-Konfidenz, eingebettete Bild-/Grafikobjekte sowie Annotationen. Bildseiten,
+Stempel, Unterschriften, kontrastarme Inhalte und kleine Randnotizen werden
+deshalb als Inhalt oder als manuell zu prüfen eingestuft.
+
+Dateien werden ausschließlich nach ausdrücklicher Auswahl und Bestätigung
+verändert. Duplikate müssen denselben SHA-256 des Originaldokuments besitzen.
+Löschaktionen verwenden ausschließlich den macOS-Papierkorb. Beim Entfernen
+einzelner Seiten wird zuerst eine neue PDF erzeugt und vollständig validiert;
+erst danach folgt ein atomarer Austausch. Die ursprüngliche Fassung landet
+zur Wiederherstellung im Papierkorb. Details stehen in
+[`MAINTENANCE.md`](MAINTENANCE.md).
 
 ## Updates
 
@@ -183,6 +210,7 @@ nicht gelöscht.
 - [`OCR_PIPELINE.md`](OCR_PIPELINE.md)
 - [`INDEXING_PIPELINE.md`](INDEXING_PIPELINE.md)
 - [`SEARCH_PIPELINE.md`](SEARCH_PIPELINE.md)
+- [`MAINTENANCE.md`](MAINTENANCE.md)
 - [`MODEL_MANAGER.md`](MODEL_MANAGER.md)
 - [`PRIVACY.md`](PRIVACY.md)
 - [`SECURITY.md`](SECURITY.md)

@@ -45,8 +45,17 @@ Vertragsdaten oder Suchpläne. Sie dürfen Dateiname, Pfad, Status und technisch
 Fehlermeldungen enthalten. Pfade können private Informationen verraten;
 Logdateien sollten daher wie andere lokale Anwendungsdaten behandelt werden.
 
+Leerseitenmetriken und manuelle Prüfentscheidungen werden ausschließlich in
+der lokalen SQLite-Datenbank gespeichert. Vorschaubilder werden bei Bedarf aus
+der lokalen PDF erzeugt und nicht exportiert.
+
 ## Löschen
 
 Index, Modelle, Einstellungen und Logs können durch Löschen der oben genannten
 App-Verzeichnisse entfernt werden. Die privaten Original-PDFs werden dadurch
 nicht verändert oder gelöscht.
+
+Dokumentenwartung löscht keine Datei endgültig. Ausdrücklich bestätigte
+Dateiaktionen verwenden den macOS-Papierkorb. Beim Entfernen einzelner Seiten
+wird auch die vorherige vollständige PDF-Fassung in den Papierkorb verschoben,
+damit sie wiederherstellbar bleibt.
