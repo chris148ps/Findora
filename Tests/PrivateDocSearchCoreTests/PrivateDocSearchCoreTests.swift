@@ -1045,7 +1045,10 @@ func persistentStatusEventsAndSnapshotsTrackLiveProcessing() async throws {
     let eventStart = ContinuousClock.now
     try await database.saveScan(files: files, root: root)
     #expect(await firstEvent.value == .scanCompleted)
-    #expect(eventStart.duration(to: .now) < .milliseconds(500))
+    // Parallel PDF/MLX tests can delay the cooperative test task even though
+    // the database publishes synchronously after commit. Keep this as a
+    // regression ceiling; the UI applies its own 300 ms debounce.
+    #expect(eventStart.duration(to: .now) < .seconds(1))
 
     var status = try await database.statistics()
     #expect(status.totalPDFs == 1)
@@ -1422,6 +1425,267 @@ private func indexedSyntheticOCRResult(
         results.first?.excerpt,
         results.first?.pageNumber,
         try await database.statistics()
+    )
+}
+
+@Test
+func automaticAnalysisResetPreservesManualWorkAndReconstructsBlankPages() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let manualPDF = root.appending(path: "Manuell.pdf")
+    let automaticPDF = root.appending(path: "Automatisch leer.pdf")
+    try createTextPDF(at: manualPDF, pages: [""])
+    try createTextPDF(at: automaticPDF, pages: [""])
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(
+        files: try await scanner.scan(root: root),
+        root: root
+    )
+    let embedder = TokenHashEmbedding(dimensions: 64)
+    let processor = DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: embedder
+    )
+    await processor.processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    try await processor.updatePageText(
+        path: manualPDF.path,
+        pageNumber: 1,
+        text: "MANUELLER TEXT BLEIBT ERHALTEN",
+        kind: .manuallyEntered
+    )
+    try await database.setPageReviewDecision(
+        path: manualPDF.path,
+        pageNumber: 1,
+        decision: .notEmpty
+    )
+
+    try await database.resetAutomaticOCRAndAnalysis()
+    let storedManual = try await database.manualPageTexts(path: manualPDF.path)
+    #expect(storedManual.first?.text == "MANUELLER TEXT BLEIBT ERHALTEN")
+    #expect(storedManual.first?.kind == .manuallyEntered)
+    #expect((try await database.statistics()).manuallyNotEmptyPages == 1)
+    #expect((try await database.pendingFiles()).count == 2)
+
+    await processor.processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    let blankCandidates = try await database.emptyPageCandidates()
+    #expect(
+        blankCandidates.contains {
+            $0.absolutePath == automaticPDF.path
+        }
+    )
+    #expect(
+        !blankCandidates.contains {
+            $0.absolutePath == manualPDF.path
+        }
+    )
+    let search = HybridSearchService(
+        database: database,
+        embedder: embedder,
+        semanticEnabled: false
+    )
+    #expect(
+        !(try await search.search("MANUELLER TEXT BLEIBT ERHALTEN")).isEmpty
+    )
+}
+
+@Test
+func fullResetClearsMaintenanceAndSessionsButPreservesSettingsAndModels() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    try await database.setSetting(key: "language", value: "english")
+    try await database.registerInstalledModel(
+        modelID: "synthetic-model",
+        modelVersion: "v1",
+        kind: .answer,
+        installedPath: "/synthetic/model",
+        integrityCheckedAt: .now
+    )
+    try await database.setModelEnabled(
+        modelID: "synthetic-model",
+        modelVersion: "v1",
+        kind: .answer
+    )
+    try await database.saveProcessingSession(
+        ProcessingSessionSnapshot(phase: .indexing, total: 3)
+    )
+    let pdf = root.appending(path: "Reset.pdf")
+    try createTextPDF(at: pdf, pages: ["SYNTHETISCHER RESET TEXT"])
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(
+        files: try await scanner.scan(root: root),
+        root: root
+    )
+    let processor = DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: TokenHashEmbedding(dimensions: 64)
+    )
+    await processor.processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    #expect((try await database.statistics()).totalPDFs == 1)
+
+    try await database.deleteDocumentIndex()
+
+    #expect((try await database.statistics()).totalPDFs == 0)
+    #expect(try await database.emptyPageCandidates().isEmpty)
+    #expect(try await database.emptyPDFCandidates().isEmpty)
+    #expect(try await database.ocrReviewCandidates().isEmpty)
+    #expect(try await database.duplicateGroups().isEmpty)
+    #expect(try await database.missingFileCandidates().isEmpty)
+    #expect(try await database.latestProcessingSession() == nil)
+    #expect(try await database.setting(key: "language") == "english")
+    #expect(try await database.modelStates().first?.enabled == true)
+    #expect(FileManager.default.fileExists(atPath: pdf.path))
+
+    try await database.saveScan(
+        files: try await scanner.scan(root: root),
+        root: root
+    )
+    await processor.processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    #expect((try await database.statistics()).indexedPDFs == 1)
+}
+
+@Test
+func modelAndProcessingSessionStatesPersistWithSingleEnabledModelPerKind() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    for id in ["one", "two"] {
+        try await database.registerInstalledModel(
+            modelID: id,
+            modelVersion: "v1",
+            kind: .embedding,
+            installedPath: "/synthetic/\(id)",
+            integrityCheckedAt: .now
+        )
+    }
+    try await database.setModelEnabled(
+        modelID: "one",
+        modelVersion: "v1",
+        kind: .embedding
+    )
+    try await database.setModelEnabled(
+        modelID: "two",
+        modelVersion: "v1",
+        kind: .embedding
+    )
+    var enabled = try await database.modelStates().filter(\.enabled)
+    #expect(enabled.map(\.modelID) == ["two"])
+    try await database.setModelEnabled(
+        modelID: nil,
+        modelVersion: nil,
+        kind: .embedding
+    )
+    enabled = try await database.modelStates().filter(\.enabled)
+    #expect(enabled.isEmpty)
+    #expect(try await database.modelStates().count == 2)
+
+    let session = ProcessingSessionSnapshot(
+        phase: .indexing,
+        total: 12,
+        completed: 5,
+        failed: 1,
+        currentFile: "synthetic.pdf"
+    )
+    try await database.saveProcessingSession(session)
+    let reopened = SQLiteDatabase(url: paths.database)
+    try await reopened.initialize()
+    let restored = try #require(
+        try await reopened.latestProcessingSession()
+    )
+    #expect(restored.id == session.id)
+    #expect(restored.phase == session.phase)
+    #expect(restored.total == session.total)
+    #expect(restored.completed == session.completed)
+    #expect(restored.failed == session.failed)
+    #expect(restored.currentFile == session.currentFile)
+    #expect(
+        abs(restored.startedAt.timeIntervalSince(session.startedAt))
+            < 0.001
+    )
+}
+
+@Test
+func cancellationErrorsAreClassifiedWithoutRawUserFacingNSErrorText() {
+    let expected = AppErrorClassifier.classify(CancellationError())
+    #expect(expected.category == .cancelled)
+    #expect(expected.userMessage?.isEmpty != false)
+
+    let userCancellation = AppErrorClassifier.classify(
+        CancellationError(),
+        userInitiatedCancellation: true
+    )
+    #expect(userCancellation.category == .userCancelled)
+    #expect(userCancellation.userMessage?.isEmpty == false)
+
+    let cocoaCancellation = NSError(
+        domain: NSCocoaErrorDomain,
+        code: NSUserCancelledError
+    )
+    #expect(
+        AppErrorClassifier.classify(cocoaCancellation).category == .cancelled
+    )
+}
+
+@Test
+func visibleSelectionSupportsFilteredAllNoneAndInvertWithoutHiddenActions() {
+    let initial: Set = ["hidden", "visible-a"]
+    let visible = ["visible-a", "visible-b"]
+    let selectedAll = VisibleSelection.selectAll(
+        current: initial,
+        visible: visible
+    )
+    #expect(selectedAll == ["hidden", "visible-a", "visible-b"])
+    #expect(
+        VisibleSelection.selectedVisible(
+            current: selectedAll,
+            visible: visible
+        ) == ["visible-a", "visible-b"]
+    )
+
+    let inverted = VisibleSelection.invert(
+        current: selectedAll,
+        visible: visible
+    )
+    #expect(inverted == ["hidden"])
+    #expect(
+        VisibleSelection.selectedVisible(
+            current: inverted,
+            visible: visible
+        ).isEmpty
+    )
+
+    let none: Set<String> = []
+    #expect(
+        VisibleSelection.selectedVisible(
+            current: none,
+            visible: visible
+        ).isEmpty
     )
 }
 

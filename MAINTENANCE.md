@@ -113,3 +113,27 @@ Embeddingdaten entfernt, sofern kein weiterer Speicherort desselben Dokuments
 existiert. **Embeddings neu erzeugen** baut den Suchindex aus dem bereits
 gespeicherten Seitentext auf; **Dokumentindex zurücksetzen** verändert keine
 PDF-Datei.
+
+## Getrennte Reset-Arten
+
+- **Suchindex neu aufbauen** entfernt nur FTS, Chunks und Embeddings und baut
+  sie aus gespeichertem Seitentext wieder auf.
+- **OCR und automatische Analysen zurücksetzen** entfernt automatische
+  OCR-Qualität, automatische Seitenklassifikationen und Retry-Zustände.
+  Manuelle Leer-/Nichtleerentscheidungen und manuell korrigierter oder
+  erfasster Text bleiben erhalten. Aktive Dokumente werden neu eingeplant.
+- **Vollständigen Dokumentindex löschen** entfernt nach zweifacher Bestätigung
+  alle Dokument-, Job-, OCR-, Analyse-, Wartungs- und Suchdaten einschließlich
+  manueller Entscheidungen. PDFs, Modelle und Einstellungen bleiben erhalten.
+
+Wartungslisten werden ausschließlich aus aktuellen SQLite-Zeilen rekonstruiert.
+Analysezeilen müssen zum aktuellen SHA-256 des Jobs passen; veraltete
+pfadbasierte Zeilen erscheinen nicht. Jede Liste bietet Text-/Statusfilter
+sowie Alle, Keine und Auswahl umkehren. Bei Duplikaten bleibt dabei mindestens
+eine Datei je Hashgruppe geschützt.
+
+In **Leere Seiten** kann die visuelle Analyse außerdem für eine einzelne Seite
+gezielt neu gestartet werden. Vorher wird der aktuelle SHA-256 geprüft; die PDF
+wird nicht verändert. Die Analyse des betroffenen Dokuments wird neu berechnet,
+während manuelle Entscheidungen und manuell erfasster Seitentext erhalten
+bleiben.

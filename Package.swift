@@ -4,6 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "PrivateDocSearch",
+    defaultLocalization: "de",
     platforms: [
         .macOS(.v14)
     ],
@@ -48,7 +49,8 @@ let package = Package(
         ),
         .executableTarget(
             name: "PrivateDocSearchApp",
-            dependencies: ["PrivateDocSearchCore", "PrivateDocSearchMLX"]
+            dependencies: ["PrivateDocSearchCore", "PrivateDocSearchMLX"],
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "PrivateDocSearchCoreTests",

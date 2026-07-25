@@ -274,6 +274,15 @@ ausgegeben, sondern die definierte Keine-Belege-Meldung.
 Nach jedem Gate werden Build und Tests ausgeführt. Ein Gate gilt nicht als
 fertig, wenn nur ein UI-Platzhalter ohne funktionalen Dienst existiert.
 
+## Persistente UI-Zustände
+
+Fachliche Dokumentzustände bleiben in SQLite. Erfolgreiche Transaktionen
+publizieren gedrosselte Statusereignisse; ein 30-Sekunden-Abgleich ist nur ein
+Sicherheitsnetz. `processing_sessions` hält den sichtbaren Arbeitsfortschritt
+über Jobgrenzen und Neustarts stabil. `model_states` trennt Installation,
+Aktivierung und flüchtigen RAM-Ladezustand. Sprache und Erscheinungsbild liegen
+als Einstellungen in derselben lokalen Datenbank.
+
 ## Risiken
 
 - **Sandbox und Homebrew:** Apple Vision benötigt keine externen Prozesse.

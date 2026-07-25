@@ -15,6 +15,8 @@ struct PrivateDocSearchApplication: App {
         WindowGroup("PrivateDocSearch", id: "main") {
             ContentView()
                 .environment(state)
+                .environment(\.locale, state.interfaceLocale)
+                .preferredColorScheme(state.preferredColorScheme)
                 .frame(minWidth: 980, minHeight: 680)
         }
         .defaultSize(width: 1180, height: 780)
@@ -22,12 +24,46 @@ struct PrivateDocSearchApplication: App {
         MenuBarExtra("PrivateDocSearch", systemImage: state.isProcessing ? "doc.text.magnifyingglass" : "magnifyingglass") {
             MenuBarContent()
                 .environment(state)
+                .environment(\.locale, state.interfaceLocale)
+                .preferredColorScheme(state.preferredColorScheme)
         }
 
         Settings {
             SettingsView()
                 .environment(state)
+                .environment(\.locale, state.interfaceLocale)
+                .preferredColorScheme(state.preferredColorScheme)
                 .frame(width: 620, height: 520)
+        }
+    }
+}
+
+enum InterfaceLanguage: String, CaseIterable, Identifiable {
+    case system
+    case german
+    case english
+
+    var id: Self { self }
+    var displayName: LocalizedStringKey {
+        switch self {
+        case .system: "Systemsprache"
+        case .german: "Deutsch"
+        case .english: "English"
+        }
+    }
+}
+
+enum InterfaceAppearance: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: Self { self }
+    var displayName: LocalizedStringKey {
+        switch self {
+        case .system: "System"
+        case .light: "Hell"
+        case .dark: "Dunkel"
         }
     }
 }
@@ -107,9 +143,43 @@ final class AppState {
     var emptyPageCandidates: [EmptyPageCandidate] = []
     var emptyPDFCandidates: [EmptyPDFCandidate] = []
     var ocrReviewCandidates: [OCRReviewCandidate] = []
+    var missingFileCandidates: [MissingFileCandidate] = []
     var isMaintainingDocuments = false
     var maintenanceMessage: String?
+    var processingSession: ProcessingSessionSnapshot?
+    var interfaceLanguage: InterfaceLanguage = .german
+    var interfaceAppearance: InterfaceAppearance = .system
+    var isAnswerModelLoaded = false
+    var isEmbeddingModelLoaded = false
     let hardwareProfile: HardwareProfile
+
+    var interfaceLocale: Locale {
+        switch interfaceLanguage {
+        case .system:
+            let language = Locale.current.language.languageCode?.identifier
+            return Locale(identifier: language == "de" ? "de" : "en")
+        case .german:
+            return Locale(identifier: "de")
+        case .english:
+            return Locale(identifier: "en")
+        }
+    }
+
+    var preferredColorScheme: ColorScheme? {
+        switch interfaceAppearance {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    var semanticSearchEnabled: Bool {
+        activeEmbeddingModelID != nil
+    }
+
+    var localAnswersEnabled: Bool {
+        activeAnswerModelID != nil
+    }
 
     var activeEmbeddingModelVersion: String? {
         guard let activeEmbeddingModelID else { return nil }
@@ -177,7 +247,11 @@ final class AppState {
                 ocrProcessorFactory: ocrFactory,
                 fileLogger: fileLogger
             )
-            self.searchService = HybridSearchService(database: database, embedder: embedder)
+            self.searchService = HybridSearchService(
+                database: database,
+                embedder: embedder,
+                semanticEnabled: false
+            )
         } catch {
             fatalError("PrivateDocSearch-Verzeichnisse konnten nicht angelegt werden: \(error)")
         }
@@ -197,6 +271,20 @@ final class AppState {
             await startDocumentStatusMonitoring()
             await runMemoryPressureDiagnosticIfRequested()
             await loadSettings()
+            processingSession = try await database.latestProcessingSession()
+            if let finishedAt = processingSession?.finishedAt,
+               Date().timeIntervalSince(finishedAt) > 8 {
+                processingSession = nil
+            }
+            if var restored = processingSession, restored.phase.isActive {
+                restored.phase = isPaused ? .paused : .scanning
+                restored.isPaused = isPaused
+                restored.currentFile = isPaused
+                    ? restored.currentFile
+                    : "Nächstes Dokument wird vorbereitet"
+                processingSession = restored
+                try? await database.saveProcessingSession(restored)
+            }
             if ocrConfiguration.requiresTesseractComponents {
                 await refreshOCRComponents()
             }
@@ -222,6 +310,7 @@ final class AppState {
                     configureFolderWatcher(for: folder.url)
                 }
             }
+            await refreshModels()
             await restoreModelSelection()
             await refreshModels()
             await refreshDatabaseState()
@@ -261,23 +350,49 @@ final class AppState {
 
     func scanNow() async {
         guard !isPaused else { return }
+        guard !isProcessing else { return }
         guard let folder = resolvedFolder else {
             report(PrivateDocSearchError.noDocumentFolder)
             return
         }
         isProcessing = true
+        await beginProcessingSession(phase: .scanning)
         folderStatus = "Scan läuft …"
         defer { isProcessing = false }
 
         do {
             let files = try await scanner.scan(root: folder.url)
+            await updateProcessingSession(
+                phase: .scanning,
+                total: files.count,
+                currentFile: nil
+            )
             try await database.saveScan(files: files, root: folder.url)
             folderStatus = "Erreichbar"
-            await processor.processPending(ocrConfiguration: ocrConfiguration) { _ in }
+            await updateProcessingSession(phase: .indexing)
+            await processor.processPending(ocrConfiguration: ocrConfiguration) {
+                [weak self] progress in
+                await self?.updateProcessingSession(
+                    phase: .indexing,
+                    total: progress.total,
+                    completed: progress.completed,
+                    currentFile: progress.currentFile
+                )
+            }
             await refreshDatabaseState()
+            await updateProcessingSession(failed: statistics.failedJobs)
+            await finishProcessingSession(phase: .completed)
+        } catch is CancellationError {
+            await finishProcessingSession(phase: .completed)
+            reportCancellation(
+                taskType: "Dokumentenscan",
+                trigger: "Task ersetzt oder App-Lifecycle",
+                userInitiated: false
+            )
         } catch {
             folderStatus = "Nicht erreichbar"
-            report(error)
+            await finishProcessingSession(phase: .failed)
+            report(error, taskType: "Dokumentenscan")
         }
     }
 
@@ -289,6 +404,12 @@ final class AppState {
             await processor.setPaused(paused)
             do {
                 try await database.setProcessingPaused(paused)
+                if var session = processingSession {
+                    session.isPaused = paused
+                    session.phase = paused ? .paused : .scanning
+                    processingSession = session
+                    try await database.saveProcessingSession(session)
+                }
                 await refreshDocumentStatus()
             } catch {
                 report(error)
@@ -331,6 +452,8 @@ final class AppState {
                 try await database.setSetting(key: "scanIntervalMinutes", value: String(scanIntervalMinutes))
                 try await database.setSetting(key: "llmIdleMinutes", value: String(llmIdleMinutes))
                 try await database.setSetting(key: "showExperimentalModels", value: showExperimentalModels ? "1" : "0")
+                try await database.setSetting(key: "interfaceLanguage", value: interfaceLanguage.rawValue)
+                try await database.setSetting(key: "interfaceAppearance", value: interfaceAppearance.rawValue)
                 startScanLoop()
                 modelMessage = "Einstellungen wurden lokal gespeichert."
             } catch {
@@ -407,28 +530,58 @@ final class AppState {
         Task {
             defer { isProcessing = false }
             do {
-                try await processor.rebuildSearchIndex { _ in }
+                await beginProcessingSession(phase: .rebuildingSearch)
+                try await processor.rebuildSearchIndex { [weak self] progress in
+                    await self?.updateProcessingSession(
+                        phase: .rebuildingSearch,
+                        total: progress.total,
+                        completed: progress.completed,
+                        currentFile: progress.currentFile
+                    )
+                }
                 modelMessage = "Der Suchindex wurde aus dem gespeicherten Text neu aufgebaut."
                 await refreshDatabaseState()
+                await finishProcessingSession(phase: .completed)
+            } catch is CancellationError {
+                await finishProcessingSession(phase: .completed)
+                reportCancellation(
+                    taskType: "Suchindex-Neuaufbau",
+                    trigger: "Reset oder Benutzerabbruch",
+                    userInitiated: false
+                )
             } catch {
-                report(error)
+                await finishProcessingSession(phase: .failed)
+                report(error, taskType: "Suchindex-Neuaufbau")
             }
         }
     }
 
     func resetOCRData() {
         guard !isProcessing else { return }
+        isProcessing = true
         Task {
+            defer { isProcessing = false }
             do {
-                try await database.resetOCRData()
+                await beginProcessingSession(phase: .resettingAnalysis)
+                try await database.resetAutomaticOCRAndAnalysis()
                 try? await fileLogger.log(
                     .warning,
                     category: "Indexwartung",
-                    message: "OCR-Text, OCR-Qualität und davon abhängige Indexdaten wurden zurückgesetzt."
+                    message: "Automatische OCR-, Retry- und Leerseitenanalysen wurden zurückgesetzt; manuelle Bewertungen und Texte blieben erhalten."
                 )
+                await refreshDatabaseState()
+                isProcessing = false
                 await scanNow()
+            } catch is CancellationError {
+                await finishProcessingSession(phase: .completed)
+                reportCancellation(
+                    taskType: "OCR-Analyse-Reset",
+                    trigger: "Reset abgebrochen",
+                    userInitiated: false
+                )
             } catch {
-                report(error)
+                await finishProcessingSession(phase: .failed)
+                report(error, taskType: "OCR-Analyse-Reset")
             }
         }
     }
@@ -438,6 +591,7 @@ final class AppState {
         setPaused(true)
         Task {
             do {
+                await beginProcessingSession(phase: .cancelling)
                 try await database.deleteDocumentIndex()
                 try? await fileLogger.log(
                     .warning,
@@ -446,8 +600,10 @@ final class AppState {
                 )
                 modelMessage = "Dokumentindex gelöscht. Verarbeitung bleibt bis zum manuellen Fortsetzen pausiert."
                 await refreshDatabaseState()
+                processingSession = nil
             } catch {
-                report(error)
+                await finishProcessingSession(phase: .failed)
+                report(error, taskType: "Vollständiger Index-Reset")
             }
         }
     }
@@ -476,13 +632,15 @@ final class AppState {
             async let emptyPages = database.emptyPageCandidates()
             async let emptyPDFs = database.emptyPDFCandidates()
             async let ocrReview = database.ocrReviewCandidates()
+            async let missingFiles = database.missingFileCandidates()
             let snapshot = try await (
-                duplicates, emptyPages, emptyPDFs, ocrReview
+                duplicates, emptyPages, emptyPDFs, ocrReview, missingFiles
             )
             duplicateGroups = snapshot.0
             emptyPageCandidates = snapshot.1
             emptyPDFCandidates = snapshot.2
             ocrReviewCandidates = snapshot.3
+            missingFileCandidates = snapshot.4
         } catch {
             report(error)
         }
@@ -532,6 +690,44 @@ final class AppState {
                 }
             } catch {
                 report(error)
+            }
+        }
+    }
+
+    func reanalyzeEmptyPage(_ candidate: EmptyPageCandidate) {
+        guard !isMaintainingDocuments, !isProcessing else { return }
+        isMaintainingDocuments = true
+        maintenanceMessage =
+            "Leerseitenanalyse für Seite \(candidate.pageNumber) wird neu ausgeführt …"
+        Task {
+            defer { isMaintainingDocuments = false }
+            do {
+                let result = try await maintenanceService.reanalyzePage(
+                    path: candidate.absolutePath,
+                    expectedHash: candidate.originalHash,
+                    pageNumber: candidate.pageNumber
+                )
+                maintenanceMessage =
+                    "Seite \(candidate.pageNumber) wurde neu geprüft: \(result.status.displayName)."
+                try? await fileLogger.log(
+                    .info,
+                    category: "Leerseitenanalyse",
+                    message:
+                        "Einzelseite gezielt neu geprüft; Seite=\(candidate.pageNumber); "
+                        + "Status=\(result.status.rawValue).",
+                    path: candidate.absolutePath
+                )
+                await refreshMaintenance()
+                await refreshDocumentStatus()
+            } catch is CancellationError {
+                reportCancellation(
+                    taskType: "Einzelne Leerseitenanalyse",
+                    trigger: "Task ersetzt oder App-Lifecycle",
+                    userInitiated: false,
+                    pageNumber: candidate.pageNumber
+                )
+            } catch {
+                report(error, taskType: "Einzelne Leerseitenanalyse")
             }
         }
     }
@@ -882,6 +1078,7 @@ final class AppState {
                 if sources.isEmpty {
                     answer = "Keine ausreichend passenden Dokumente gefunden."
                 } else if let answerGenerator {
+                    isAnswerModelLoaded = true
                     answer = try await answerGenerator.answer(
                         question: value,
                         sources: sources
@@ -1004,7 +1201,17 @@ final class AppState {
     }
 
     func refreshModels() async {
-        availableModels = await modelManager.models(profile: hardwareProfile)
+        let models = await modelManager.models(profile: hardwareProfile)
+        for model in models where model.isInstalled {
+            try? await database.registerInstalledModel(
+                modelID: model.id,
+                modelVersion: model.descriptor.modelVersion,
+                kind: model.descriptor.kind,
+                installedPath: model.directory.path,
+                integrityCheckedAt: .now
+            )
+        }
+        availableModels = models
     }
 
     func installModel(_ model: InstalledModel, activateAfterInstall: Bool = false) {
@@ -1096,12 +1303,23 @@ final class AppState {
                     let previousProcessor = processor
                     do {
                         processor = makeProcessor(embedder: provider)
-                        try await processor.rebuildSearchIndex { _ in }
-                        modelMessage = "Der neue Embedding-Index wird aufgebaut; die bisherige Suche bleibt aktiv."
-                        let coverage = try await database.embeddingCoverage(
+                        var coverage = try await database.embeddingCoverage(
                             modelID: model.id,
                             modelVersion: model.descriptor.modelVersion
                         )
+                        if coverage.totalChunks > 0,
+                           coverage.embeddedChunks == coverage.totalChunks {
+                            modelMessage =
+                                "Der vorhandene, passende Embedding-Index wird wiederverwendet."
+                        } else {
+                            modelMessage =
+                                "Der neue Embedding-Index wird aufgebaut; die bisherige Suche bleibt bis zum Abschluss erhalten."
+                            try await processor.rebuildSearchIndex { _ in }
+                            coverage = try await database.embeddingCoverage(
+                                modelID: model.id,
+                                modelVersion: model.descriptor.modelVersion
+                            )
+                        }
                         guard coverage.embeddedChunks == coverage.totalChunks else {
                             throw PrivateDocSearchError.processFailed(
                                 "Neuindexierung unvollständig (\(coverage.embeddedChunks) von \(coverage.totalChunks) Chunks)."
@@ -1109,7 +1327,17 @@ final class AppState {
                         }
                         try await modelManager.activate(modelID: model.id)
                         activeEmbeddingModelID = model.id
-                        searchService = HybridSearchService(database: database, embedder: provider)
+                        isEmbeddingModelLoaded = true
+                        searchService = HybridSearchService(
+                            database: database,
+                            embedder: provider,
+                            semanticEnabled: true
+                        )
+                        try await database.setModelEnabled(
+                            modelID: model.id,
+                            modelVersion: model.descriptor.modelVersion,
+                            kind: .embedding
+                        )
                         try await database.setSetting(key: "activeEmbeddingModelID", value: model.id)
                         modelMessage = "Embedding-Modell und vollständig aufgebauter Index wurden aktiviert."
                     } catch {
@@ -1128,12 +1356,70 @@ final class AppState {
                     await unloadAnswerModel(reason: "Modellwechsel")
                     answerGenerator = generator
                     activeAnswerModelID = model.id
+                    isAnswerModelLoaded = true
+                    try await database.setModelEnabled(
+                        modelID: model.id,
+                        modelVersion: model.descriptor.modelVersion,
+                        kind: .answer
+                    )
                     try await database.setSetting(key: "activeAnswerModelID", value: model.id)
                     modelMessage = "Antwortmodell wurde getestet und aktiviert."
                 }
                 await refreshModels()
             } catch {
                 report(error)
+            }
+        }
+    }
+
+    func deactivateModel(_ model: InstalledModel) {
+        Task {
+            do {
+                switch model.descriptor.kind {
+                case .answer:
+                    guard activeAnswerModelID == model.id else { return }
+                    await unloadAnswerModel(reason: "Vom Benutzer deaktiviert")
+                    answerGenerator = nil
+                    activeAnswerModelID = nil
+                    await modelManager.deactivate(kind: .answer)
+                    try await database.setModelEnabled(
+                        modelID: nil,
+                        modelVersion: nil,
+                        kind: .answer
+                    )
+                    try await database.setSetting(
+                        key: "activeAnswerModelID",
+                        value: ""
+                    )
+                    modelMessage =
+                        "Antwortmodell deaktiviert. Suche und regelbasierte Suchplanung bleiben verfügbar."
+                case .embedding:
+                    guard activeEmbeddingModelID == model.id else { return }
+                    let fallback = TokenHashEmbedding()
+                    processor = makeProcessor(embedder: fallback)
+                    searchService = HybridSearchService(
+                        database: database,
+                        embedder: fallback,
+                        semanticEnabled: false
+                    )
+                    activeEmbeddingModelID = nil
+                    isEmbeddingModelLoaded = false
+                    await modelManager.deactivate(kind: .embedding)
+                    try await database.setModelEnabled(
+                        modelID: nil,
+                        modelVersion: nil,
+                        kind: .embedding
+                    )
+                    try await database.setSetting(
+                        key: "activeEmbeddingModelID",
+                        value: ""
+                    )
+                    modelMessage =
+                        "Embedding-Modell deaktiviert. Die Volltextsuche bleibt aktiv; vorhandene Embeddings wurden nicht gelöscht."
+                }
+                await refreshModels()
+            } catch {
+                report(error, taskType: "Modell deaktivieren")
             }
         }
     }
@@ -1173,14 +1459,36 @@ final class AppState {
                     await unloadAnswerModel(reason: "Modellentfernung")
                     answerGenerator = nil
                     activeAnswerModelID = nil
+                    isAnswerModelLoaded = false
+                    try await database.setModelEnabled(
+                        modelID: nil,
+                        modelVersion: nil,
+                        kind: .answer
+                    )
+                    try await database.setSetting(key: "activeAnswerModelID", value: "")
                 }
                 if model.descriptor.kind == .embedding, activeEmbeddingModelID == model.id {
                     let fallback = TokenHashEmbedding()
                     processor = makeProcessor(embedder: fallback)
-                    searchService = HybridSearchService(database: database, embedder: fallback)
+                    searchService = HybridSearchService(
+                        database: database,
+                        embedder: fallback,
+                        semanticEnabled: false
+                    )
                     activeEmbeddingModelID = nil
+                    isEmbeddingModelLoaded = false
+                    try await database.setModelEnabled(
+                        modelID: nil,
+                        modelVersion: nil,
+                        kind: .embedding
+                    )
+                    try await database.setSetting(key: "activeEmbeddingModelID", value: "")
                 }
                 try await modelManager.remove(modelID: model.id)
+                try await database.removeModelState(
+                    modelID: model.id,
+                    modelVersion: model.descriptor.modelVersion
+                )
                 modelMessage = "Das Modell wurde in den Papierkorb verschoben."
                 await refreshModels()
             } catch {
@@ -1242,7 +1550,18 @@ final class AppState {
 
     private func restoreModelSelection() async {
         do {
-            if let embeddingID = try await database.setting(key: "activeEmbeddingModelID"),
+            let storedStates = try await database.modelStates()
+            let storedEmbeddingID = storedStates.first {
+                $0.kind == .embedding && $0.enabled
+            }?.modelID
+            let storedAnswerID = storedStates.first {
+                $0.kind == .answer && $0.enabled
+            }?.modelID
+            let legacyEmbeddingID = try await database.setting(
+                key: "activeEmbeddingModelID"
+            )
+            let embeddingID = storedEmbeddingID ?? legacyEmbeddingID
+            if let embeddingID, !embeddingID.isEmpty,
                let descriptor = await modelManager.descriptor(id: embeddingID),
                let directory = await modelManager.installedDirectory(modelID: embeddingID) {
                 let provider = MLXEmbeddingProvider(
@@ -1252,10 +1571,24 @@ final class AppState {
                 )
                 try await modelManager.activate(modelID: embeddingID)
                 processor = makeProcessor(embedder: provider)
-                searchService = HybridSearchService(database: database, embedder: provider)
+                searchService = HybridSearchService(
+                    database: database,
+                    embedder: provider,
+                    semanticEnabled: true
+                )
                 activeEmbeddingModelID = embeddingID
+                isEmbeddingModelLoaded = true
+                try await database.setModelEnabled(
+                    modelID: embeddingID,
+                    modelVersion: descriptor.modelVersion,
+                    kind: .embedding
+                )
             }
-            if let answerID = try await database.setting(key: "activeAnswerModelID"),
+            let legacyAnswerID = try await database.setting(
+                key: "activeAnswerModelID"
+            )
+            let answerID = storedAnswerID ?? legacyAnswerID
+            if let answerID, !answerID.isEmpty,
                let descriptor = await modelManager.descriptor(id: answerID),
                let directory = await modelManager.installedDirectory(modelID: answerID) {
                 answerGenerator = MLXAnswerGenerator(
@@ -1265,6 +1598,12 @@ final class AppState {
                 )
                 try await modelManager.activate(modelID: answerID)
                 activeAnswerModelID = answerID
+                isAnswerModelLoaded = false
+                try await database.setModelEnabled(
+                    modelID: answerID,
+                    modelVersion: descriptor.modelVersion,
+                    kind: .answer
+                )
             }
         } catch {
             report(error)
@@ -1287,6 +1626,14 @@ final class AppState {
                 llmIdleMinutes = min(max(decoded, 1), 120)
             }
             showExperimentalModels = try await database.setting(key: "showExperimentalModels") == "1"
+            if let value = try await database.setting(key: "interfaceLanguage"),
+               let language = InterfaceLanguage(rawValue: value) {
+                interfaceLanguage = language
+            }
+            if let value = try await database.setting(key: "interfaceAppearance"),
+               let appearance = InterfaceAppearance(rawValue: value) {
+                interfaceAppearance = appearance
+            }
             isPaused = try await database.setting(key: "processingPaused") == "1"
             await processor.setPaused(isPaused)
         } catch {
@@ -1398,18 +1745,132 @@ final class AppState {
             category: "Modelle",
             message: "Antwortmodell wurde entladen. Grund: \(reason)."
         )
+        isAnswerModelLoaded = false
     }
 
-    private func report(_ error: Error) {
-        let message = error.localizedDescription
-        lastError = message
+    private func beginProcessingSession(
+        phase: ProcessingSessionPhase,
+        total: Int = 0
+    ) async {
+        let session = ProcessingSessionSnapshot(
+            phase: phase,
+            total: total,
+            isPaused: false
+        )
+        processingSession = session
+        try? await database.saveProcessingSession(session)
+    }
+
+    private func updateProcessingSession(
+        phase: ProcessingSessionPhase? = nil,
+        total: Int? = nil,
+        completed: Int? = nil,
+        failed: Int? = nil,
+        currentFile: String? = nil
+    ) async {
+        guard var session = processingSession else { return }
+        if let phase { session.phase = phase }
+        if let total { session.total = max(session.total, total) }
+        if let completed { session.completed = max(session.completed, completed) }
+        if let failed { session.failed = max(session.failed, failed) }
+        session.currentFile = currentFile
+        processingSession = session
+        try? await database.saveProcessingSession(session)
+    }
+
+    private func finishProcessingSession(
+        phase: ProcessingSessionPhase
+    ) async {
+        guard var session = processingSession else { return }
+        session.phase = phase
+        session.currentFile = nil
+        session.isPaused = false
+        session.finishedAt = .now
+        if phase == .completed, session.total > 0 {
+            session.completed = max(
+                session.completed,
+                max(0, session.total - session.failed)
+            )
+        }
+        processingSession = session
+        try? await database.saveProcessingSession(session)
+        let sessionID = session.id
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(6))
+            guard let self,
+                  self.processingSession?.id == sessionID,
+                  self.processingSession?.phase.isActive == false else {
+                return
+            }
+            self.processingSession = nil
+        }
+    }
+
+    private func reportCancellation(
+        taskType: String,
+        trigger: String,
+        userInitiated: Bool,
+        documentID: String? = nil,
+        pageNumber: Int? = nil,
+        strategy: String? = nil
+    ) {
+        if userInitiated {
+            maintenanceMessage = "Vorgang abgebrochen"
+        }
         Task {
             try? await fileLogger.log(
-                .error,
-                category: "Fehler",
-                message: message
+                .info,
+                category: "Abbruch",
+                message:
+                    "Task=\(taskType); Dokument-ID=\(documentID ?? "—"); "
+                    + "Seite=\(pageNumber.map(String.init) ?? "—"); "
+                    + "Strategie=\(strategy ?? "—"); Auslöser=\(trigger); "
+                    + "erwartet=true; Benutzeraktion=\(userInitiated); "
+                    + "Reset=\(trigger.localizedCaseInsensitiveContains("reset")); "
+                    + "Retry-Wechsel=\(trigger.localizedCaseInsensitiveContains("retry")); "
+                    + "App-Lifecycle=\(trigger.localizedCaseInsensitiveContains("lifecycle"))."
             )
-            try? await database.recordError(category: "Allgemein", message: message)
+        }
+    }
+
+    private func report(
+        _ error: Error,
+        taskType: String = #function,
+        userInitiatedCancellation: Bool = false
+    ) {
+        let classification = AppErrorClassifier.classify(
+            error,
+            userInitiatedCancellation: userInitiatedCancellation
+        )
+        if classification.category == .cancelled
+            || classification.category == .userCancelled {
+            reportCancellation(
+                taskType: taskType,
+                trigger: userInitiatedCancellation
+                    ? "Benutzerabbruch"
+                    : "interner Task-Abbruch",
+                userInitiated: userInitiatedCancellation
+            )
+            return
+        }
+        if classification.category == .requiresAttention
+            || classification.category == .fatal {
+            lastError = classification.userMessage
+        } else {
+            maintenanceMessage = classification.userMessage
+        }
+        Task {
+            try? await fileLogger.log(
+                classification.category == .recoverable ? .warning : .error,
+                category: "Fehlerklassifikation",
+                message:
+                    "Task=\(taskType); Kategorie=\(classification.category.rawValue); "
+                    + classification.technicalMessage
+            )
+            try? await database.recordError(
+                category: classification.category.rawValue,
+                message: classification.technicalMessage
+            )
             await refreshDatabaseState()
         }
     }
@@ -1422,7 +1883,10 @@ struct ContentView: View {
         @Bindable var state = state
         NavigationSplitView {
             List(AppSection.allCases, selection: $state.selectedSection) { section in
-                Label(section.rawValue, systemImage: section.symbol)
+                Label(
+                    LocalizedStringKey(section.rawValue),
+                    systemImage: section.symbol
+                )
                     .tag(section)
             }
             .navigationTitle("PrivateDocSearch")
@@ -1911,7 +2375,12 @@ struct StatusView: View {
                         Text(state.documentFolderPath ?? "Nicht ausgewählt")
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
-                        Label(state.folderStatus, systemImage: state.folderStatus == "Erreichbar" ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        Label(
+                            LocalizedStringKey(state.folderStatus),
+                            systemImage: state.folderStatus == "Erreichbar"
+                                ? "checkmark.circle.fill"
+                                : "exclamationmark.triangle.fill"
+                        )
                             .foregroundStyle(state.folderStatus == "Erreichbar" ? .green : .orange)
                     }
                     Spacer()
@@ -1929,40 +2398,44 @@ struct StatusView: View {
                     }
                 }
 
-                if state.isProcessing
-                    || state.statistics.processingJobs > 0
-                    || state.statistics.isPaused {
-                    GroupBox(
-                        state.statistics.isPaused
-                            ? "Verarbeitung pausiert"
-                            : state.statistics.processingJobs > 0
-                                ? "Verarbeitung läuft"
-                                : "Dokumentenverarbeitung"
-                    ) {
+                if let session = state.processingSession, session.phase.isVisible {
+                    GroupBox {
                         VStack(alignment: .leading, spacing: 8) {
-                            ProgressView(value: state.statistics.progressFraction)
+                            ProgressView(value: session.progressFraction)
                             HStack {
                                 Text(
-                                    "\(state.statistics.processedJobs) von \(state.statistics.totalJobs) PDFs verarbeitet"
+                                    "\(session.completed) von \(session.total) PDFs verarbeitet"
                                 )
                                 Spacer()
                                 Text(
-                                    state.statistics.progressFraction,
+                                    session.progressFraction,
                                     format: .percent.precision(.fractionLength(0))
                                 )
                                 .monospacedDigit()
                             }
+                            if session.failed > 0 {
+                                Text("\(session.failed) fehlgeschlagen")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
                             Text("Aktuell:")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Text(state.statistics.currentFile ?? "Ordner wird gescannt …")
-                                .font(.headline)
+                            if let currentFile =
+                                session.currentFile ?? state.statistics.currentFile {
+                                Text(currentFile).font(.headline)
+                            } else {
+                                Text(processingFallback(for: session))
+                                    .font(.headline)
+                            }
                             if let step = state.statistics.currentStep {
                                 Text(step)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                         }
+                    } label: {
+                        Text(processingTitle(for: session))
                     }
                 }
 
@@ -2059,6 +2532,36 @@ struct StatusView: View {
         }
         .navigationTitle("Dokumentenstatus")
     }
+
+    private func processingTitle(
+        for session: ProcessingSessionSnapshot
+    ) -> LocalizedStringKey {
+        if session.isPaused || session.phase == .paused {
+            return "Verarbeitung pausiert"
+        }
+        return switch session.phase {
+        case .scanning: "Dokumente werden gescannt"
+        case .ocr: "OCR läuft"
+        case .indexing: "Indexierung läuft"
+        case .rebuildingSearch: "Suchindex wird neu aufgebaut"
+        case .resettingAnalysis: "OCR und Analysen werden zurückgesetzt"
+        case .cancelling: "Verarbeitung wird beendet"
+        case .completed: "Verarbeitung abgeschlossen"
+        case .failed: "Verarbeitung mit Fehler beendet"
+        case .idle, .paused: "Dokumentenverarbeitung"
+        }
+    }
+
+    private func processingFallback(
+        for session: ProcessingSessionSnapshot
+    ) -> LocalizedStringKey {
+        switch session.phase {
+        case .scanning: "Ordner wird gescannt …"
+        case .completed: "Alle geplanten Arbeitsschritte sind abgeschlossen."
+        case .failed: "Der letzte Arbeitsschritt konnte nicht abgeschlossen werden."
+        default: "Nächstes Dokument wird vorbereitet …"
+        }
+    }
 }
 
 struct MetricCard: View {
@@ -2067,7 +2570,7 @@ struct MetricCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title).foregroundStyle(.secondary)
+            Text(LocalizedStringKey(title)).foregroundStyle(.secondary)
             Text(value.formatted()).font(.title.bold())
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2095,27 +2598,44 @@ private enum MaintenanceSort: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+private enum MaintenanceStatusFilter: String, CaseIterable, Identifiable {
+    case all = "Alle Zustände"
+    case automatic = "Automatisch erkannt"
+    case confirmed = "Manuell bestätigt"
+    case review = "Prüfung erforderlich"
+    case noResult = "Ohne OCR-Ergebnis"
+    case manuallyEdited = "Manuell bearbeitet"
+    case moved = "Verschoben"
+    case deleted = "Gelöscht"
+    case unavailable = "Nicht verfügbar"
+
+    var id: Self { self }
+}
+
 struct MaintenanceView: View {
     @Environment(AppState.self) private var state
     @State private var section: MaintenanceSection = .duplicates
     @State private var filter = ""
     @State private var sort: MaintenanceSort = .fileName
+    @State private var statusFilter: MaintenanceStatusFilter = .all
     @State private var selectedDuplicatePaths: Set<String> = []
     @State private var selectedPageIDs: Set<String> = []
     @State private var selectedOCRReviewIDs: Set<String> = []
     @State private var selectedEmptyPDFPaths: Set<String> = []
+    @State private var selectedMissingPaths: Set<String> = []
     @State private var manualOCRCandidate: OCRReviewCandidate?
     @State private var confirmsDuplicateTrash = false
     @State private var confirmsPageRemoval = false
     @State private var confirmsEmptyPDFTrash = false
     @State private var confirmsIndexReset = false
+    @State private var confirmsIndexResetFinally = false
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Picker("Wartungsbereich", selection: $section) {
                     ForEach(MaintenanceSection.allCases) {
-                        Text($0.rawValue).tag($0)
+                        Text(LocalizedStringKey($0.rawValue)).tag($0)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -2124,10 +2644,16 @@ struct MaintenanceView: View {
                     .frame(maxWidth: 240)
                 Picker("Sortierung", selection: $sort) {
                     ForEach(MaintenanceSort.allCases) {
-                        Text($0.rawValue).tag($0)
+                        Text(LocalizedStringKey($0.rawValue)).tag($0)
                     }
                 }
                 .frame(width: 150)
+                Picker("Status", selection: $statusFilter) {
+                    ForEach(availableStatusFilters) {
+                        Text(LocalizedStringKey($0.rawValue)).tag($0)
+                    }
+                }
+                .frame(width: 180)
                 Button("Aktualisieren") {
                     Task { await state.refreshMaintenance() }
                 }
@@ -2136,11 +2662,26 @@ struct MaintenanceView: View {
 
             Divider()
 
+            if section != .index {
+                selectionControls
+                Divider()
+            }
+
             if state.isMaintainingDocuments {
-                ProgressView(state.maintenanceMessage ?? "Dokumentenwartung läuft …")
+                ProgressView {
+                    Text(
+                        LocalizedStringKey(
+                            state.maintenanceMessage
+                                ?? "Dokumentenwartung läuft …"
+                        )
+                    )
+                }
                     .padding()
             } else if let message = state.maintenanceMessage {
-                Label(message, systemImage: "checkmark.shield")
+                Label(
+                    LocalizedStringKey(message),
+                    systemImage: "checkmark.shield"
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal)
@@ -2167,6 +2708,16 @@ struct MaintenanceView: View {
         }
         .navigationTitle("Dokumentenwartung")
         .task { await state.refreshMaintenance() }
+        .onChange(of: section) {
+            statusFilter = .all
+            clearCurrentSelection()
+        }
+        .onChange(of: filter) {
+            clearCurrentSelection()
+        }
+        .onChange(of: statusFilter) {
+            clearCurrentSelection()
+        }
         .sheet(item: $manualOCRCandidate) { candidate in
             ManualOCRReviewSheet(candidate: candidate)
                 .environment(state)
@@ -2215,12 +2766,23 @@ struct MaintenanceView: View {
             "Dokumentindex zurücksetzen?",
             isPresented: $confirmsIndexReset
         ) {
-            Button("Index zurücksetzen", role: .destructive) {
+            Button("Weiter …", role: .destructive) {
+                confirmsIndexResetFinally = true
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Alle Dokument-, OCR-, Analyse-, Wartungs- und Suchdaten einschließlich manueller Entscheidungen werden entfernt. PDF-Dateien und Modelle bleiben unverändert.")
+        }
+        .confirmationDialog(
+            "Letzte Bestätigung: Dokumentindex vollständig löschen?",
+            isPresented: $confirmsIndexResetFinally
+        ) {
+            Button("Endgültig aus SQLite löschen", role: .destructive) {
                 state.deleteDocumentIndex()
             }
             Button("Abbrechen", role: .cancel) {}
         } message: {
-            Text("PDF-Dateien und Modelle bleiben unverändert.")
+            Text("Die Indexdaten können nur durch erneute Verarbeitung wiederhergestellt werden.")
         }
     }
 
@@ -2300,7 +2862,7 @@ struct MaintenanceView: View {
                 }
             }
             maintenanceActionBar(
-                selectionCount: selectedDuplicatePaths.count,
+                selectionCount: selectedDuplicateLocations.count,
                 title: "Ausgewählte Duplikate in den Papierkorb",
                 enabled: duplicateSelectionIsSafe
             ) {
@@ -2387,6 +2949,13 @@ struct MaintenanceView: View {
                                     )
                                 }
                                 .disabled(!candidate.status.isEmptyCandidate)
+                                Button("Analyse neu starten") {
+                                    state.reanalyzeEmptyPage(candidate)
+                                }
+                                .disabled(
+                                    state.isMaintainingDocuments
+                                        || state.isProcessing
+                                )
                                 Button("Nicht leer") {
                                     selectedPageIDs.remove(candidate.id)
                                     state.setPageDecision(
@@ -2409,7 +2978,7 @@ struct MaintenanceView: View {
                 }
             }
             maintenanceActionBar(
-                selectionCount: selectedPageIDs.count,
+                selectionCount: selectedEmptyPages.count,
                 title: "Ausgewählte Seiten entfernen",
                 enabled: !selectedEmptyPages.isEmpty
             ) {
@@ -2469,7 +3038,7 @@ struct MaintenanceView: View {
                 }
             }
             maintenanceActionBar(
-                selectionCount: selectedEmptyPDFPaths.count,
+                selectionCount: selectedEmptyPDFs.count,
                 title: "Ausgewählte PDFs in den Papierkorb",
                 enabled: !selectedEmptyPDFs.isEmpty
             ) {
@@ -2576,7 +3145,7 @@ struct MaintenanceView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(
-                        "\(selectedOCRReviewIDs.count) ausgewählt · hohe Auflösungen werden einzeln verarbeitet"
+                        "\(selectedOCRReviewCandidates.count) ausgewählt · hohe Auflösungen werden einzeln verarbeitet"
                     )
                     Text(
                         "Gemeinsame Strategie: 300 dpi + Kontrast · geschätzt bis ca. 45 MB Arbeitspeicher je Seite"
@@ -2619,18 +3188,64 @@ struct MaintenanceView: View {
     }
 
     private var missingFilesView: some View {
-        ContentUnavailableView {
-            Label("Fehlende Dateien", systemImage: "questionmark.folder")
-        } description: {
-            Text(
-                "\(state.statistics.missingOrMovedFiles) Datei(en) fehlen oder wurden verschoben. Ein Scan gleicht Pfade und Suchindex gezielt ab."
-            )
-        } actions: {
-            Button("Jetzt prüfen") {
-                Task { await state.scanNow() }
+        VStack(spacing: 0) {
+            List {
+                if filteredMissingFiles.isEmpty {
+                    ContentUnavailableView {
+                        Label("Keine fehlenden Dateien", systemImage: "checkmark.circle")
+                    } description: {
+                        Text("Der gespeicherte Dokumentbestand ist erreichbar.")
+                    }
+                }
+                ForEach(filteredMissingFiles) { candidate in
+                    HStack(alignment: .top, spacing: 12) {
+                        Toggle(
+                            "Auswählen",
+                            isOn: selectionBinding(
+                                candidate.absolutePath,
+                                in: $selectedMissingPaths
+                            )
+                        )
+                        .labelsHidden()
+                        Image(systemName: missingFileSymbol(candidate.reason))
+                            .font(.title2)
+                            .foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(candidate.fileName).font(.headline)
+                            Text(candidate.relativePath)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(candidate.absolutePath)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                            Text(missingFileReason(candidate.reason))
+                                .font(.caption)
+                            if let message = candidate.message, !message.isEmpty {
+                                Text(message)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(state.documentFolderPath == nil || state.isProcessing)
+            HStack {
+                Text("\(selectedMissingCount) ausgewählt")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("Ein Scan gleicht Pfade und Suchindex gezielt ab.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Jetzt prüfen") {
+                    Task { await state.scanNow() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(state.documentFolderPath == nil || state.isProcessing)
+            }
+            .padding()
+            .background(.bar)
         }
     }
 
@@ -2692,6 +3307,132 @@ struct MaintenanceView: View {
         .background(.bar)
     }
 
+    private var selectionControls: some View {
+        HStack {
+            Text("Sichtbare Einträge")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Alle auswählen") { selectAllVisible() }
+            Button("Keine auswählen") { clearCurrentSelection() }
+            Button("Auswahl umkehren") { invertVisibleSelection() }
+            Spacer()
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+
+    private var availableStatusFilters: [MaintenanceStatusFilter] {
+        switch section {
+        case .duplicates, .emptyPDFs:
+            [.all, .confirmed]
+        case .emptyPages:
+            [.all, .automatic, .confirmed]
+        case .ocrReview:
+            [.all, .review, .noResult, .manuallyEdited]
+        case .missingFiles:
+            [.all, .moved, .deleted, .unavailable]
+        case .index:
+            [.all]
+        }
+    }
+
+    private func selectAllVisible() {
+        switch section {
+        case .duplicates:
+            for group in filteredDuplicateGroups {
+                let keeper = group.recommendedLocation ?? group.locations.first
+                selectedDuplicatePaths.formUnion(
+                    group.locations
+                        .filter { $0 != keeper }
+                        .map(\.absolutePath)
+                )
+            }
+        case .emptyPages:
+            selectedPageIDs.formUnion(
+                filteredEmptyPages
+                    .filter {
+                        $0.decision == .confirmedEmpty
+                            && $0.status.isEmptyCandidate
+                    }
+                    .map(\.id)
+            )
+        case .ocrReview:
+            selectedOCRReviewIDs = VisibleSelection.selectAll(
+                current: selectedOCRReviewIDs,
+                visible: filteredOCRReviewCandidates.map(\.id)
+            )
+        case .emptyPDFs:
+            selectedEmptyPDFPaths = VisibleSelection.selectAll(
+                current: selectedEmptyPDFPaths,
+                visible: filteredEmptyPDFs.map(\.absolutePath)
+            )
+        case .missingFiles:
+            selectedMissingPaths = VisibleSelection.selectAll(
+                current: selectedMissingPaths,
+                visible: filteredMissingFiles.map(\.absolutePath)
+            )
+        case .index:
+            break
+        }
+    }
+
+    private func clearCurrentSelection() {
+        switch section {
+        case .duplicates: selectedDuplicatePaths.removeAll()
+        case .emptyPages: selectedPageIDs.removeAll()
+        case .ocrReview: selectedOCRReviewIDs.removeAll()
+        case .emptyPDFs: selectedEmptyPDFPaths.removeAll()
+        case .missingFiles: selectedMissingPaths.removeAll()
+        case .index: break
+        }
+    }
+
+    private func invertVisibleSelection() {
+        switch section {
+        case .duplicates:
+            let visible = Set(
+                filteredDuplicateGroups.flatMap {
+                    $0.locations.map(\.absolutePath)
+                }
+            )
+            selectedDuplicatePaths.formSymmetricDifference(visible)
+            for group in filteredDuplicateGroups
+            where group.locations.allSatisfy({
+                selectedDuplicatePaths.contains($0.absolutePath)
+            }) {
+                if let keeper = group.recommendedLocation ?? group.locations.first {
+                    selectedDuplicatePaths.remove(keeper.absolutePath)
+                }
+            }
+        case .emptyPages:
+            let visible = Set(
+                filteredEmptyPages.filter {
+                    $0.decision == .confirmedEmpty
+                        && $0.status.isEmptyCandidate
+                }.map(\.id)
+            )
+            selectedPageIDs.formSymmetricDifference(visible)
+        case .ocrReview:
+            selectedOCRReviewIDs = VisibleSelection.invert(
+                current: selectedOCRReviewIDs,
+                visible: filteredOCRReviewCandidates.map(\.id)
+            )
+        case .emptyPDFs:
+            selectedEmptyPDFPaths = VisibleSelection.invert(
+                current: selectedEmptyPDFPaths,
+                visible: filteredEmptyPDFs.map(\.absolutePath)
+            )
+        case .missingFiles:
+            selectedMissingPaths = VisibleSelection.invert(
+                current: selectedMissingPaths,
+                visible: filteredMissingFiles.map(\.absolutePath)
+            )
+        case .index:
+            break
+        }
+    }
+
     private var filteredDuplicateGroups: [DuplicateGroup] {
         let query = normalizedFilter
         let values = query.isEmpty ? state.duplicateGroups : state.duplicateGroups.filter {
@@ -2710,7 +3451,16 @@ struct MaintenanceView: View {
     }
 
     private var filteredEmptyPages: [EmptyPageCandidate] {
-        let values = state.emptyPageCandidates.filter(matchesFilter)
+        let values = state.emptyPageCandidates.filter {
+            let matchesStatus: Bool = switch statusFilter {
+            case .all: true
+            case .automatic: $0.decision == PageReviewDecision.undecided
+            case .confirmed:
+                $0.decision == PageReviewDecision.confirmedEmpty
+            default: true
+            }
+            return matchesFilter($0) && matchesStatus
+        }
         switch sort {
         case .fileName:
             return values.sorted {
@@ -2727,9 +3477,10 @@ struct MaintenanceView: View {
 
     private var filteredEmptyPDFs: [EmptyPDFCandidate] {
         let values = state.emptyPDFCandidates.filter {
-            normalizedFilter.isEmpty
+            (normalizedFilter.isEmpty
                 || $0.fileName.localizedCaseInsensitiveContains(normalizedFilter)
-                || $0.relativePath.localizedCaseInsensitiveContains(normalizedFilter)
+                || $0.relativePath.localizedCaseInsensitiveContains(normalizedFilter))
+                && (statusFilter == .all || statusFilter == .confirmed)
         }
         switch sort {
         case .fileName:
@@ -2747,10 +3498,21 @@ struct MaintenanceView: View {
 
     private var filteredOCRReviewCandidates: [OCRReviewCandidate] {
         let values = state.ocrReviewCandidates.filter {
-            normalizedFilter.isEmpty
+            let matchesText = normalizedFilter.isEmpty
                 || $0.fileName.localizedCaseInsensitiveContains(normalizedFilter)
                 || $0.relativePath.localizedCaseInsensitiveContains(normalizedFilter)
                 || $0.status.displayName.localizedCaseInsensitiveContains(normalizedFilter)
+            let matchesStatus: Bool = switch statusFilter {
+            case .all: true
+            case .review:
+                $0.status == .needsOCRReview
+                    || $0.status == .technicalReviewError
+                    || $0.status == .imageWithoutRecognizedText
+            case .noResult: $0.status == .ocrNoResult
+            case .manuallyEdited: $0.textKind != .automatic
+            default: true
+            }
+            return matchesText && matchesStatus
         }
         switch sort {
         case .fileName:
@@ -2769,8 +3531,51 @@ struct MaintenanceView: View {
         }
     }
 
+    private var filteredMissingFiles: [MissingFileCandidate] {
+        state.missingFileCandidates.filter {
+            let matchesText = normalizedFilter.isEmpty
+                || $0.fileName.localizedCaseInsensitiveContains(normalizedFilter)
+                || $0.relativePath.localizedCaseInsensitiveContains(normalizedFilter)
+                || $0.absolutePath.localizedCaseInsensitiveContains(normalizedFilter)
+            let matchesStatus: Bool = switch statusFilter {
+            case .all: true
+            case .moved: $0.reason == .moved
+            case .deleted: $0.reason == .deleted
+            case .unavailable:
+                $0.reason == .cloudUnavailable || $0.reason == .accessDenied
+            default: true
+            }
+            return matchesText && matchesStatus
+        }.sorted {
+            switch sort {
+            case .fileName:
+                $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending
+            case .path, .confidence:
+                $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+            }
+        }
+    }
+
+    private func missingFileReason(_ reason: MissingFileReason) -> String {
+        switch reason {
+        case .moved: "Datei wurde vermutlich verschoben"
+        case .deleted: "Datei ist nicht mehr vorhanden"
+        case .cloudUnavailable: "Cloud-Datei ist derzeit nicht lokal verfügbar"
+        case .accessDenied: "Zugriff auf die Datei wurde verweigert"
+        }
+    }
+
+    private func missingFileSymbol(_ reason: MissingFileReason) -> String {
+        switch reason {
+        case .moved: "arrow.right.doc.on.clipboard"
+        case .deleted: "trash"
+        case .cloudUnavailable: "icloud.slash"
+        case .accessDenied: "lock.trianglebadge.exclamationmark"
+        }
+    }
+
     private var selectedDuplicateLocations: [DuplicateLocation] {
-        state.duplicateGroups.flatMap(\.locations).filter {
+        filteredDuplicateGroups.flatMap(\.locations).filter {
             selectedDuplicatePaths.contains($0.absolutePath)
         }
     }
@@ -2786,7 +3591,7 @@ struct MaintenanceView: View {
     }
 
     private var selectedEmptyPages: [EmptyPageCandidate] {
-        state.emptyPageCandidates.filter {
+        filteredEmptyPages.filter {
             selectedPageIDs.contains($0.id)
                 && $0.decision == .confirmedEmpty
                 && $0.status.isEmptyCandidate
@@ -2794,15 +3599,21 @@ struct MaintenanceView: View {
     }
 
     private var selectedOCRReviewCandidates: [OCRReviewCandidate] {
-        state.ocrReviewCandidates.filter {
+        filteredOCRReviewCandidates.filter {
             selectedOCRReviewIDs.contains($0.id)
         }
     }
 
     private var selectedEmptyPDFs: [EmptyPDFCandidate] {
-        state.emptyPDFCandidates.filter {
+        filteredEmptyPDFs.filter {
             selectedEmptyPDFPaths.contains($0.absolutePath)
         }
+    }
+
+    private var selectedMissingCount: Int {
+        filteredMissingFiles.filter {
+            selectedMissingPaths.contains($0.absolutePath)
+        }.count
     }
 
     private var sharedBulkOCRConfiguration: OCRConfiguration {
@@ -3301,7 +4112,8 @@ struct OCRView: View {
                         }
                     }
                     if let message = state.ocrInstallationMessage {
-                        Text(message).foregroundStyle(.secondary)
+                        Text(LocalizedStringKey(message))
+                            .foregroundStyle(.secondary)
                     }
                     Button("Erneut prüfen") {
                         Task { await state.refreshOCRComponents() }
@@ -3420,6 +4232,7 @@ struct ModelsView: View {
     @Environment(AppState.self) private var state
     @State private var pendingEmbeddingActivation: InstalledModel?
     @State private var pendingEmbeddingUpdate: InstalledModel?
+    @State private var pendingRemoval: InstalledModel?
 
     var body: some View {
         ScrollView {
@@ -3449,7 +4262,10 @@ struct ModelsView: View {
                 }
 
                 if let message = state.modelMessage {
-                    Label(message, systemImage: "checkmark.circle")
+                    Label(
+                        LocalizedStringKey(message),
+                        systemImage: "checkmark.circle"
+                    )
                         .foregroundStyle(.green)
                 }
 
@@ -3527,6 +4343,26 @@ struct ModelsView: View {
         } message: { model in
             Text("Die neue Version wird vollständig geladen und geprüft. Erst danach wird der Index aus gespeichertem Text neu aufgebaut; bei Fehler bleibt die alte Version erhalten.")
         }
+        .confirmationDialog(
+            "Modell wirklich entfernen?",
+            isPresented: Binding(
+                get: { pendingRemoval != nil },
+                set: { if !$0 { pendingRemoval = nil } }
+            ),
+            presenting: pendingRemoval
+        ) { model in
+            Button("Modell in den Papierkorb", role: .destructive) {
+                state.removeModel(model)
+                pendingRemoval = nil
+            }
+            Button("Abbrechen", role: .cancel) { pendingRemoval = nil }
+        } message: { model in
+            Text(
+                model.descriptor.kind == .embedding
+                    ? "Nur die Modelldateien werden verschoben. Gespeicherte Dokumenttexte und Embeddings bleiben erhalten; die Volltextsuche funktioniert weiter."
+                    : "Nur die Modelldateien werden verschoben. Dokumentindex und Suche bleiben erhalten; KI-Antworten sind danach deaktiviert."
+            )
+        }
     }
 
     private func visibleModels(kind: ModelKind) -> [InstalledModel] {
@@ -3548,11 +4384,16 @@ struct ModelsView: View {
                     }
                     Spacer()
                     compatibilityBadge(model.compatibility)
-                    if model.isActive {
-                        Text("Aktiv")
+                    if model.isInstalled {
+                        Text(modelStatus(model))
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
-                            .background(.green.opacity(0.18), in: Capsule())
+                            .background(
+                                model.isActive
+                                    ? Color.green.opacity(0.18)
+                                    : Color.secondary.opacity(0.12),
+                                in: Capsule()
+                            )
                     }
                 }
 
@@ -3604,17 +4445,22 @@ struct ModelsView: View {
                         )
                     } else if model.isInstalled {
                         Button("Testen") { state.testModel(model) }
-                        Button(model.isActive ? "Aktiv" : "Aktivieren") {
-                            if model.descriptor.kind == .embedding {
-                                pendingEmbeddingActivation = model
-                            } else {
-                                state.activateModel(model)
+                        if model.isActive {
+                            Button("Deaktivieren") {
+                                state.deactivateModel(model)
                             }
+                        } else {
+                            Button("Aktivieren") {
+                                if model.descriptor.kind == .embedding {
+                                    pendingEmbeddingActivation = model
+                                } else {
+                                    state.activateModel(model)
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
                         }
-                        .disabled(model.isActive)
-                        .buttonStyle(.borderedProminent)
                         Button("Entfernen", role: .destructive) {
-                            state.removeModel(model)
+                            pendingRemoval = model
                         }
                     } else {
                         if state.pausedModelID == model.id {
@@ -3635,6 +4481,20 @@ struct ModelsView: View {
                 }
             }
             .padding(.vertical, 4)
+        }
+    }
+
+    private func modelStatus(_ model: InstalledModel) -> String {
+        guard model.isActive else { return "Installiert · deaktiviert" }
+        switch model.descriptor.kind {
+        case .embedding:
+            return state.isEmbeddingModelLoaded
+                ? "Aktiv · geladen"
+                : "Aktiv"
+        case .answer:
+            return state.isAnswerModelLoaded
+                ? "Aktiv · geladen"
+                : "Aktiv · bei Bedarf laden"
         }
     }
 
@@ -3660,10 +4520,26 @@ struct SettingsView: View {
     @State private var confirmsRebuild = false
     @State private var confirmsOCRReset = false
     @State private var confirmsIndexDeletion = false
+    @State private var confirmsIndexDeletionFinally = false
 
     var body: some View {
         @Bindable var state = state
         Form {
+            Section("Darstellung") {
+                Picker("Sprache", selection: $state.interfaceLanguage) {
+                    ForEach(InterfaceLanguage.allCases) {
+                        Text($0.displayName).tag($0)
+                    }
+                }
+                Picker("Erscheinungsbild", selection: $state.interfaceAppearance) {
+                    ForEach(InterfaceAppearance.allCases) {
+                        Text($0.displayName).tag($0)
+                    }
+                }
+                Text("Sprache und Erscheinungsbild werden nach dem Speichern sofort auf alle Hauptansichten angewendet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Dokumente") {
                 LabeledContent("Ordner", value: state.documentFolderPath ?? "Nicht ausgewählt")
                 Button("Dokumentenordner auswählen …") { state.chooseFolder() }
@@ -3681,7 +4557,9 @@ struct SettingsView: View {
                         set: { state.setLaunchAtLogin($0) }
                     )
                 )
-                LabeledContent("Speicherdruck", value: state.memoryPressure)
+                LabeledContent("Speicherdruck") {
+                    Text(LocalizedStringKey(state.memoryPressure))
+                }
             }
             Section("Datenschutz") {
                 Text("Dokumente, Suchanfragen, Embeddings und Antworten bleiben lokal. Telemetrie ist deaktiviert.")
@@ -3691,13 +4569,15 @@ struct SettingsView: View {
                 Button("Suchindex neu aufbauen …") { confirmsRebuild = true }
                 Text("Löscht Chunks, Volltextindex und Embeddings und baut sie ausschließlich aus dem bereits gespeicherten Seitentext neu auf.")
                     .font(.caption).foregroundStyle(.secondary)
-                Button("OCR zurücksetzen …") { confirmsOCRReset = true }
-                Text("Löscht OCR-Text, Qualitätswerte und davon abhängige Indexdaten. Original-PDFs bleiben erhalten und OCR wird erneut eingeplant.")
+                Button("OCR- und Analysewerte neu prüfen …") {
+                    confirmsOCRReset = true
+                }
+                Text("Setzt automatische OCR- und Leerseitenbewertungen zurück und analysiert die Dokumente erneut. Manuelle Bewertungen und manuell bearbeiteter Text bleiben erhalten.")
                     .font(.caption).foregroundStyle(.secondary)
                 Button("Inkonsistenzen reparieren") { state.repairIndex() }
                 Text("Prüft SQLite und Fremdschlüssel, gleicht Jobzustände ab und baut den Volltextindex aus vorhandenen Chunks neu auf.")
                     .font(.caption).foregroundStyle(.secondary)
-                Button("Vollständigen Dokumentindex löschen …", role: .destructive) {
+                Button("Kompletten Dokumentenindex löschen …", role: .destructive) {
                     confirmsIndexDeletion = true
                 }
                 Text("Löscht Dokumente, Seiten, OCR-Daten, Chunks, Embeddings und Suchverlauf. PDFs, Modelle und Einstellungen bleiben erhalten.")
@@ -3718,17 +4598,32 @@ struct SettingsView: View {
         } message: {
             Text("Gespeicherter Seiten- und OCR-Text bleibt erhalten.")
         }
-        .confirmationDialog("OCR-Daten wirklich zurücksetzen?", isPresented: $confirmsOCRReset) {
-            Button("OCR zurücksetzen", role: .destructive) { state.resetOCRData() }
+        .confirmationDialog("OCR- und Analysewerte neu prüfen?", isPresented: $confirmsOCRReset) {
+            Button("Werte zurücksetzen und neu prüfen", role: .destructive) {
+                state.resetOCRData()
+            }
             Button("Abbrechen", role: .cancel) {}
         } message: {
             Text("Original-PDFs werden nicht gelöscht oder verschoben.")
         }
         .confirmationDialog("Dokumentindex vollständig löschen?", isPresented: $confirmsIndexDeletion) {
-            Button("Dokumentindex löschen", role: .destructive) { state.deleteDocumentIndex() }
+            Button("Weiter …", role: .destructive) {
+                confirmsIndexDeletionFinally = true
+            }
             Button("Abbrechen", role: .cancel) {}
         } message: {
-            Text("Die Verarbeitung wird danach pausiert. PDFs, Modelle und Einstellungen bleiben erhalten.")
+            Text("Dies entfernt sämtliche Dokument-, OCR-, Analyse-, Wartungs- und Suchdaten einschließlich manueller Entscheidungen. PDFs, Modelle und Einstellungen bleiben erhalten.")
+        }
+        .confirmationDialog(
+            "Letzte Bestätigung: vollständigen Dokumentindex löschen?",
+            isPresented: $confirmsIndexDeletionFinally
+        ) {
+            Button("Endgültig aus SQLite löschen", role: .destructive) {
+                state.deleteDocumentIndex()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Die Indexdaten können nur durch einen erneuten Scan und erneute Verarbeitung wiederhergestellt werden.")
         }
     }
 }

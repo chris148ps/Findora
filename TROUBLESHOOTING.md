@@ -103,3 +103,14 @@ technische Fehler stehen zeilenweise unter:
 ```
 
 Dokumentinhalte werden dort nicht protokolliert.
+
+Erwartete interne Abbrüche, etwa beim Ersetzen eines Tasks, beim Reset oder
+beim App-Lifecycle, werden als Kategorie `cancelled` protokolliert und erzeugen
+keinen Fehlerdialog. Ein bewusster Benutzerabbruch darf nur eine kurze
+Statusmeldung auslösen. `recoverable`, `requiresAttention` und `fatal` bleiben
+getrennt; rohe Swift-/NSError-Texte werden nicht direkt angezeigt.
+
+Bleibt eine Wartungsliste nach einem Reset unerwartet gefüllt, zuerst
+**Aktualisieren** wählen. Listen berücksichtigen nur Analysezeilen, deren Pfad
+und SHA-256 zum aktuellen Job passen. **Inkonsistenzen reparieren** prüft
+SQLite/Fremdschlüssel, verändert aber keine PDF-Datei.

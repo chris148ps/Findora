@@ -69,6 +69,30 @@ public actor DocumentMaintenanceService {
         return completed
     }
 
+    public func reanalyzePage(
+        path: String,
+        expectedHash: String,
+        pageNumber: Int
+    ) async throws -> PageContentAnalysis {
+        try Task.checkCancellation()
+        let url = URL(filePath: path)
+        try verifyHash(of: url, expected: expectedHash)
+        let analyses = try PageContentAnalyzer().analyze(fileAt: url)
+        guard let requested = analyses.first(where: {
+            $0.pageNumber == pageNumber
+        }) else {
+            throw PrivateDocSearchError.invalidPDF(
+                "Die ausgewählte Seite ist in der aktuellen PDF nicht mehr vorhanden."
+            )
+        }
+        try await database.replacePageContentAnalyses(
+            path: path,
+            originalHash: expectedHash,
+            analyses: analyses
+        )
+        return requested
+    }
+
     @discardableResult
     public func trashDuplicateLocations(
         expectedHashesByPath: [String: String]

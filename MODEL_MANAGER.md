@@ -59,3 +59,19 @@ Modellkatalog noch Download. Es bleibt vollständig von Embedding- und
 Antwortmodellen getrennt. Weitere OCR-Engines können dieselbe
 Provider-Schnittstelle implementieren, ohne Modellverwaltung, Datenbank,
 Indexierung oder Suche anzupassen.
+
+## Installiert, aktiviert und geladen
+
+Diese Zustände sind getrennt. `model_states` speichert installierte Version,
+Pfad, letzte Integritätsprüfung und genau ein aktiviertes Modell je Rolle.
+„Deaktivieren“ löscht keine Modelldateien:
+
+- ohne Embedding-Modell bleibt FTS aktiv, semantische Suche ist aus und
+  vorhandene Embeddings bleiben gespeichert;
+- ohne Antwortmodell bleiben Suche und regelbasierte Suchplanung aktiv, nur
+  die lokale KI-Antwort entfällt.
+
+„Entfernen“ ist eine eigene, bestätigungspflichtige Aktion und verschiebt nur
+die Modelldateien in den Papierkorb. Nach einem Neustart werden aktivierte
+Modelle aus SQLite wiederhergestellt; der geladene RAM-Zustand entsteht erst
+bei tatsächlicher Nutzung.

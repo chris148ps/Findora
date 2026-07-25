@@ -86,6 +86,12 @@ public actor SQLiteDatabase {
                             THEN processing_jobs.state
                             ELSE 'discovered'
                         END,
+                        content_hash = CASE
+                            WHEN processing_jobs.discovered_size = excluded.discovered_size
+                                 AND processing_jobs.discovered_modified_at = excluded.discovered_modified_at
+                            THEN processing_jobs.content_hash
+                            ELSE NULL
+                        END,
                         ocr_engine = CASE
                             WHEN processing_jobs.discovered_size = excluded.discovered_size
                                  AND processing_jobs.discovered_modified_at = excluded.discovered_modified_at
@@ -167,6 +173,36 @@ public actor SQLiteDatabase {
                     .text(rootPrefix),
                     .text(rootPrefix)
                 ]
+            )
+            try execute(
+                """
+                DELETE FROM ocr_page_attempts
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM processing_jobs j
+                    WHERE j.job_key = ocr_page_attempts.absolute_path
+                      AND j.state NOT IN ('retired', 'unavailable')
+                      AND (
+                          j.content_hash IS NULL
+                          OR j.content_hash = ocr_page_attempts.original_hash
+                      )
+                )
+                """
+            )
+            try execute(
+                """
+                DELETE FROM page_content_analysis
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM processing_jobs j
+                    WHERE j.job_key = page_content_analysis.absolute_path
+                      AND j.state NOT IN ('retired', 'unavailable')
+                      AND (
+                          j.content_hash IS NULL
+                          OR j.content_hash = page_content_analysis.original_hash
+                      )
+                )
+                """
             )
 
             try setSetting(key: "documentRootPath", value: root.path)
@@ -399,18 +435,34 @@ public actor SQLiteDatabase {
     }
 
     public func updateObservedHash(path: String, hash: String) throws {
-        try execute(
-            """
-            UPDATE processing_jobs
-            SET content_hash = ?, updated_at = ?
-            WHERE job_key = ?
-            """,
-            bindings: [
-                .text(hash),
-                .real(Date().timeIntervalSince1970),
-                .text(path)
-            ]
-        )
+        try transaction {
+            try execute(
+                """
+                UPDATE processing_jobs
+                SET content_hash = ?, updated_at = ?
+                WHERE job_key = ?
+                """,
+                bindings: [
+                    .text(hash),
+                    .real(Date().timeIntervalSince1970),
+                    .text(path)
+                ]
+            )
+            try execute(
+                """
+                DELETE FROM ocr_page_attempts
+                WHERE absolute_path = ? AND original_hash != ?
+                """,
+                bindings: [.text(path), .text(hash)]
+            )
+            try execute(
+                """
+                DELETE FROM page_content_analysis
+                WHERE absolute_path = ? AND original_hash != ?
+                """,
+                bindings: [.text(path), .text(hash)]
+            )
+        }
         publishStatusChange(.jobChanged)
     }
 
@@ -600,6 +652,7 @@ public actor SQLiteDatabase {
             FROM page_content_analysis a
             JOIN processing_jobs j ON j.job_key = a.absolute_path
             WHERE j.state NOT IN ('retired', 'unavailable')
+              AND j.content_hash = a.original_hash
               AND a.status IN ('unreviewed', 'safelyEmpty', 'probablyEmpty')
               AND a.user_decision NOT IN ('notEmpty', 'excluded')
             ORDER BY j.file_name, a.page_number
@@ -621,6 +674,7 @@ public actor SQLiteDatabase {
             FROM page_content_analysis a
             JOIN processing_jobs j ON j.job_key = a.absolute_path
             WHERE j.state NOT IN ('retired', 'unavailable')
+              AND j.content_hash = a.original_hash
             GROUP BY a.absolute_path, j.relative_path, j.file_name, a.original_hash
             HAVING analyzed_pages = page_count AND empty_pages = page_count
             ORDER BY j.file_name
@@ -659,6 +713,7 @@ public actor SQLiteDatabase {
             LEFT JOIN pages p
               ON p.document_id = d.id AND p.page_number = a.page_number
             WHERE j.state NOT IN ('retired', 'unavailable')
+              AND j.content_hash = a.original_hash
               AND (
                   a.status IN (
                       'imageWithoutRecognizedText', 'needsOCRReview',
@@ -746,6 +801,69 @@ public actor SQLiteDatabase {
                 originalOCRText: row.string("original_ocr_text"),
                 textKind: kind,
                 variants: attempts["\(path)#\(hash)#\(page)"] ?? []
+            )
+        }
+    }
+
+    public func missingFileCandidates() throws -> [MissingFileCandidate] {
+        let rows = try query(
+            """
+            SELECT absolute_path, relative_path, file_name, state, last_error
+            FROM processing_jobs
+            WHERE state IN ('unavailable', 'retired')
+            ORDER BY file_name, absolute_path
+            """
+        )
+        return rows.compactMap { row in
+            guard let path = row.string("absolute_path"),
+                  let relative = row.string("relative_path"),
+                  let name = row.string("file_name"),
+                  let state = row.string("state") else { return nil }
+            let message = row.string("last_error")
+            let normalized = (message ?? "").lowercased()
+            let reason: MissingFileReason
+            if normalized.contains("icloud") || normalized.contains("nicht lokal") {
+                reason = .cloudUnavailable
+            } else if normalized.contains("berechtigung")
+                        || normalized.contains("zugriff")
+                        || normalized.contains("permission") {
+                reason = .accessDenied
+            } else if state == "retired" {
+                reason = .deleted
+            } else {
+                reason = .moved
+            }
+            return MissingFileCandidate(
+                absolutePath: path,
+                relativePath: relative,
+                fileName: name,
+                reason: reason,
+                message: message
+            )
+        }
+    }
+
+    public func manualPageTexts(path: String) throws -> [StoredManualPageText] {
+        try query(
+            """
+            SELECT p.page_number, p.text, p.text_kind, p.original_ocr_text
+            FROM pages p
+            JOIN document_locations l ON l.document_id = p.document_id
+            WHERE l.absolute_path = ? AND l.deleted_at IS NULL
+              AND p.text_kind IN ('manuallyCorrected', 'manuallyEntered')
+            ORDER BY p.page_number
+            """,
+            bindings: [.text(path)]
+        ).compactMap { row in
+            guard let page = row.int64("page_number"),
+                  let text = row.string("text"),
+                  let rawKind = row.string("text_kind"),
+                  let kind = PageTextKind(rawValue: rawKind) else { return nil }
+            return StoredManualPageText(
+                pageNumber: Int(page),
+                text: text,
+                kind: kind,
+                originalOCRText: row.string("original_ocr_text")
             )
         }
     }
@@ -1072,7 +1190,8 @@ public actor SQLiteDatabase {
         embeddingModelVersion: String,
         ocrPerformed: Bool,
         pageQualities: [OCRPageQuality] = [],
-        textLayerPresent: Bool = true
+        textLayerPresent: Bool = true,
+        manualPageTexts: [Int: StoredManualPageText] = [:]
     ) throws -> Int64 {
         guard chunks.count == embeddings.count else {
             throw PrivateDocSearchError.database("Chunk- und Embedding-Anzahl stimmen nicht überein.")
@@ -1144,13 +1263,23 @@ public actor SQLiteDatabase {
             if existingChunkCount == 0 {
                 try execute("DELETE FROM pages WHERE document_id = ?", bindings: [.integer(documentID)])
                 for page in pages {
+                    let manual = manualPageTexts[page.pageNumber]
                     try execute(
-                        "INSERT INTO pages (document_id, page_number, text, text_source) VALUES (?, ?, ?, ?)",
+                        """
+                        INSERT INTO pages (
+                            document_id, page_number, text, text_source,
+                            original_ocr_text, text_kind
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
                         bindings: [
                             .integer(documentID),
                             .integer(Int64(page.pageNumber)),
                             .text(page.text),
-                            .text(ocrPerformed ? "ocr" : "extracted")
+                            .text(manual == nil
+                                ? ocrPerformed ? "ocr" : "extracted"
+                                : "manual"),
+                            manual?.originalOCRText.map(SQLiteValue.text) ?? .null,
+                            .text(manual?.kind.rawValue ?? PageTextKind.automatic.rawValue)
                         ]
                     )
                 }
@@ -1242,6 +1371,26 @@ public actor SQLiteDatabase {
                         .text(embeddingModelVersion),
                         .integer(Int64(embeddings[index].count)),
                         .blob(Self.encode(vector: embeddings[index]))
+                    ]
+                )
+            }
+
+            for manual in manualPageTexts.values {
+                let status: PageContentStatus = manual.kind == .manuallyCorrected
+                    ? .manuallyCorrectedText
+                    : .manuallyEnteredText
+                try execute(
+                    """
+                    UPDATE page_content_analysis
+                    SET status = ?, user_decision = 'notEmpty', updated_at = ?
+                    WHERE absolute_path = ? AND original_hash = ? AND page_number = ?
+                    """,
+                    bindings: [
+                        .text(status.rawValue),
+                        .real(now),
+                        .text(file.url.path),
+                        .text(hash),
+                        .integer(Int64(manual.pageNumber))
                     ]
                 )
             }
@@ -1530,6 +1679,13 @@ public actor SQLiteDatabase {
                 SELECT c.*
                 FROM chunks c
                 JOIN active_documents d ON d.document_id = c.document_id
+            ),
+            current_page_analysis AS (
+                SELECT a.*
+                FROM page_content_analysis a
+                JOIN processing_jobs j ON j.job_key = a.absolute_path
+                WHERE j.state NOT IN ('retired', 'unavailable')
+                  AND j.content_hash = a.original_hash
             )
             SELECT
                 MAX(
@@ -1606,6 +1762,7 @@ public actor SQLiteDatabase {
                  FROM page_content_analysis a
                  JOIN processing_jobs j ON j.job_key = a.absolute_path
                  WHERE j.state NOT IN ('retired', 'unavailable')
+                   AND j.content_hash = a.original_hash
                    AND a.status IN ('unreviewed', 'safelyEmpty', 'probablyEmpty')
                    AND a.user_decision NOT IN ('notEmpty', 'excluded'))
                     AS empty_page_candidates,
@@ -1615,6 +1772,7 @@ public actor SQLiteDatabase {
                      FROM page_content_analysis a
                      JOIN processing_jobs j ON j.job_key = a.absolute_path
                      WHERE j.state NOT IN ('retired', 'unavailable')
+                       AND j.content_hash = a.original_hash
                      GROUP BY a.absolute_path
                      HAVING COUNT(*) = MAX(a.page_count)
                         AND SUM(
@@ -1623,33 +1781,33 @@ public actor SQLiteDatabase {
                                  THEN 1 ELSE 0 END
                         ) = MAX(a.page_count)
                  )) AS fully_empty_pdfs,
-                (SELECT COUNT(*) FROM page_content_analysis
+                (SELECT COUNT(*) FROM current_page_analysis
                  WHERE status = 'safelyEmpty'
                    AND user_decision NOT IN ('notEmpty', 'excluded'))
                     AS safely_empty_pages,
-                (SELECT COUNT(*) FROM page_content_analysis
+                (SELECT COUNT(*) FROM current_page_analysis
                  WHERE status = 'probablyEmpty'
                    AND user_decision NOT IN ('notEmpty', 'excluded'))
                     AS probably_empty_pages,
                 (SELECT COUNT(*) FROM processing_jobs
                  WHERE state = 'ocrRunning' AND ocr_attempt_current > 0)
                     AS ocr_retrying_pages,
-                (SELECT COUNT(*) FROM page_content_analysis
+                (SELECT COUNT(*) FROM current_page_analysis
                  WHERE status IN (
                      'needsOCRReview', 'imageWithoutRecognizedText',
                      'ocrNoResult', 'technicalReviewError'
                  ) AND user_decision != 'excluded')
                     AS ocr_review_pages,
-                (SELECT COUNT(*) FROM page_content_analysis
+                (SELECT COUNT(*) FROM current_page_analysis
                  WHERE user_decision = 'notEmpty')
                     AS manually_not_empty_pages,
-                (SELECT COUNT(*) FROM page_content_analysis
+                (SELECT COUNT(*) FROM current_page_analysis
                  WHERE status = 'ocrNoResult')
                     AS ocr_no_result_pages,
-                (SELECT COUNT(*) FROM page_content_analysis
+                (SELECT COUNT(*) FROM current_page_analysis
                  WHERE status = 'manuallyCorrectedText')
                     AS manually_corrected_pages,
-                (SELECT COUNT(*) FROM page_content_analysis
+                (SELECT COUNT(*) FROM current_page_analysis
                  WHERE status = 'manuallyEnteredText')
                     AS manually_entered_pages,
                 (SELECT COUNT(*) FROM processing_jobs
@@ -1901,34 +2059,22 @@ public actor SQLiteDatabase {
         publishStatusChange(.embeddingsChanged)
     }
 
-    public func resetOCRData() throws {
+    public func resetAutomaticOCRAndAnalysis() throws {
         try transaction {
             let now = Date().timeIntervalSince1970
+            try execute("DELETE FROM chunks_fts")
+            try execute("DELETE FROM chunk_embeddings")
+            try execute("DELETE FROM chunks")
+            try execute("DELETE FROM ocr_page_quality")
+            try execute("DELETE FROM ocr_page_attempts")
             try execute(
-                """
-                DELETE FROM chunks_fts
-                WHERE chunk_id IN (
-                    SELECT c.id FROM chunks c
-                    JOIN documents d ON d.id = c.document_id
-                    WHERE d.ocr_status = 'completed'
-                )
-                """
-            )
-            try execute(
-                "DELETE FROM chunks WHERE document_id IN (SELECT id FROM documents WHERE ocr_status = 'completed')"
-            )
-            try execute(
-                "DELETE FROM pages WHERE document_id IN (SELECT id FROM documents WHERE ocr_status = 'completed')"
-            )
-            try execute(
-                "DELETE FROM ocr_page_quality WHERE document_id IN (SELECT id FROM documents WHERE ocr_status = 'completed')"
+                "DELETE FROM page_content_analysis WHERE user_decision = 'undecided'"
             )
             try execute(
                 """
                 UPDATE documents
-                SET ocr_status = 'pending', text_layer_present = 0,
+                SET ocr_status = 'pending',
                     last_successful_processing = NULL, last_indexed_at = NULL
-                WHERE ocr_status = 'completed'
                 """
             )
             try execute(
@@ -1939,9 +2085,6 @@ public actor SQLiteDatabase {
                 WHERE absolute_path IN (
                     SELECT absolute_path FROM document_locations WHERE deleted_at IS NULL
                 )
-                  AND content_hash IN (
-                    SELECT content_hash FROM documents WHERE ocr_status = 'pending'
-                )
                 """,
                 bindings: [.real(now)]
             )
@@ -1949,14 +2092,21 @@ public actor SQLiteDatabase {
         publishStatusChange(.maintenanceCompleted)
     }
 
+    public func resetOCRData() throws {
+        try resetAutomaticOCRAndAnalysis()
+    }
+
     public func deleteDocumentIndex() throws {
         try transaction {
             try execute("DELETE FROM chunks_fts")
+            try execute("DELETE FROM ocr_page_attempts")
+            try execute("DELETE FROM page_content_analysis")
             try execute("DELETE FROM processing_jobs")
             try execute("DELETE FROM document_locations")
             try execute("DELETE FROM documents")
             try execute("DELETE FROM errors")
             try execute("DELETE FROM search_history")
+            try execute("DELETE FROM processing_sessions")
         }
         publishStatusChange(.maintenanceCompleted)
     }
@@ -2051,6 +2201,171 @@ public actor SQLiteDatabase {
                   let message = row.string("message") else { return nil }
             return (Date(timeIntervalSince1970: timestamp), category, message, row.string("path"))
         }
+    }
+
+    public func saveProcessingSession(
+        _ session: ProcessingSessionSnapshot
+    ) throws {
+        try execute(
+            """
+            INSERT INTO processing_sessions (
+                id, phase, started_at, total_count, completed_count,
+                failed_count, current_file, is_paused, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                phase = excluded.phase,
+                total_count = excluded.total_count,
+                completed_count = excluded.completed_count,
+                failed_count = excluded.failed_count,
+                current_file = excluded.current_file,
+                is_paused = excluded.is_paused,
+                finished_at = excluded.finished_at,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .text(session.id),
+                .text(session.phase.rawValue),
+                .real(session.startedAt.timeIntervalSince1970),
+                .integer(Int64(session.total)),
+                .integer(Int64(session.completed)),
+                .integer(Int64(session.failed)),
+                session.currentFile.map(SQLiteValue.text) ?? .null,
+                .integer(session.isPaused ? 1 : 0),
+                session.finishedAt.map {
+                    .real($0.timeIntervalSince1970)
+                } ?? .null,
+                .real(Date().timeIntervalSince1970)
+            ]
+        )
+        publishStatusChange(.jobChanged)
+    }
+
+    public func latestProcessingSession() throws -> ProcessingSessionSnapshot? {
+        guard let row = try query(
+            """
+            SELECT * FROM processing_sessions
+            ORDER BY updated_at DESC LIMIT 1
+            """
+        ).first,
+        let id = row.string("id"),
+        let phaseRaw = row.string("phase"),
+        let phase = ProcessingSessionPhase(rawValue: phaseRaw),
+        let started = row.double("started_at"),
+        let total = row.int64("total_count"),
+        let completed = row.int64("completed_count"),
+        let failed = row.int64("failed_count"),
+        let paused = row.int64("is_paused") else { return nil }
+        return ProcessingSessionSnapshot(
+            id: id,
+            phase: phase,
+            startedAt: Date(timeIntervalSince1970: started),
+            total: Int(total),
+            completed: Int(completed),
+            failed: Int(failed),
+            currentFile: row.string("current_file"),
+            isPaused: paused == 1,
+            finishedAt: row.double("finished_at").map {
+                Date(timeIntervalSince1970: $0)
+            }
+        )
+    }
+
+    public func registerInstalledModel(
+        modelID: String,
+        modelVersion: String,
+        kind: ModelKind,
+        installedPath: String,
+        integrityCheckedAt: Date
+    ) throws {
+        try execute(
+            """
+            INSERT INTO model_states (
+                model_id, model_version, kind, installed_path, enabled,
+                integrity_checked_at, updated_at
+            ) VALUES (?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(model_id, model_version) DO UPDATE SET
+                kind = excluded.kind,
+                installed_path = excluded.installed_path,
+                integrity_checked_at = excluded.integrity_checked_at,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .text(modelID),
+                .text(modelVersion),
+                .text(kind.rawValue),
+                .text(installedPath),
+                .real(integrityCheckedAt.timeIntervalSince1970),
+                .real(Date().timeIntervalSince1970)
+            ]
+        )
+    }
+
+    public func setModelEnabled(
+        modelID: String?,
+        modelVersion: String?,
+        kind: ModelKind
+    ) throws {
+        try transaction {
+            try execute(
+                "UPDATE model_states SET enabled = 0, updated_at = ? WHERE kind = ?",
+                bindings: [
+                    .real(Date().timeIntervalSince1970),
+                    .text(kind.rawValue)
+                ]
+            )
+            if let modelID, let modelVersion {
+                try execute(
+                    """
+                    UPDATE model_states
+                    SET enabled = 1, updated_at = ?
+                    WHERE model_id = ? AND model_version = ? AND kind = ?
+                    """,
+                    bindings: [
+                        .real(Date().timeIntervalSince1970),
+                        .text(modelID),
+                        .text(modelVersion),
+                        .text(kind.rawValue)
+                    ]
+                )
+            }
+        }
+        publishStatusChange(.settingsChanged)
+    }
+
+    public func modelStates() throws -> [StoredModelState] {
+        try query(
+            """
+            SELECT model_id, model_version, kind, installed_path, enabled,
+                   integrity_checked_at
+            FROM model_states
+            ORDER BY kind, model_id, model_version
+            """
+        ).compactMap { row in
+            guard let id = row.string("model_id"),
+                  let version = row.string("model_version"),
+                  let kindRaw = row.string("kind"),
+                  let kind = ModelKind(rawValue: kindRaw),
+                  let path = row.string("installed_path"),
+                  let enabled = row.int64("enabled") else { return nil }
+            return StoredModelState(
+                modelID: id,
+                modelVersion: version,
+                kind: kind,
+                installedPath: path,
+                enabled: enabled == 1,
+                integrityCheckedAt: row.double("integrity_checked_at").map {
+                    Date(timeIntervalSince1970: $0)
+                }
+            )
+        }
+    }
+
+    public func removeModelState(modelID: String, modelVersion: String) throws {
+        try execute(
+            "DELETE FROM model_states WHERE model_id = ? AND model_version = ?",
+            bindings: [.text(modelID), .text(modelVersion)]
+        )
+        publishStatusChange(.settingsChanged)
     }
 
     public func setting(key: String) throws -> String? {
@@ -2170,6 +2485,17 @@ public actor SQLiteDatabase {
                 }
                 try execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (8, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 9 {
+            try transaction {
+                for statement in Self.migration9 {
+                    try execute(statement)
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (9, ?)",
                     bindings: [.real(Date().timeIntervalSince1970)]
                 )
             }
@@ -2731,6 +3057,37 @@ public actor SQLiteDatabase {
         END
         WHERE user_decision = 'undecided'
         """
+    ]
+
+    private static let migration9 = [
+        """
+        CREATE TABLE model_states (
+            model_id TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            installed_path TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            integrity_checked_at REAL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(model_id, model_version)
+        )
+        """,
+        "CREATE UNIQUE INDEX idx_model_state_enabled_kind ON model_states(kind) WHERE enabled = 1",
+        """
+        CREATE TABLE processing_sessions (
+            id TEXT PRIMARY KEY,
+            phase TEXT NOT NULL,
+            started_at REAL NOT NULL,
+            total_count INTEGER NOT NULL DEFAULT 0,
+            completed_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            current_file TEXT,
+            is_paused INTEGER NOT NULL DEFAULT 0,
+            finished_at REAL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_processing_sessions_updated ON processing_sessions(updated_at DESC)"
     ]
 }
 

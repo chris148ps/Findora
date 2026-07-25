@@ -114,6 +114,59 @@ func fullyEmptyPDFAndSingleEmptyPageArePersistedSeparately() async throws {
 }
 
 @Test
+func individualBlankPageAnalysisCanBeRestartedWithoutChangingPDF() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let pdf = root.appending(path: "Einzelseite neu prüfen.pdf")
+    try createMaintenancePDF(
+        at: pdf,
+        pages: [.text("Inhalt"), .blank]
+    )
+    let hash = try SHA256Hasher().hash(fileAt: pdf)
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(
+        files: try await scanner.scan(root: root),
+        root: root
+    )
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    _ = try #require(
+        try await database.emptyPageCandidates().first {
+            $0.absolutePath == pdf.path && $0.pageNumber == 2
+        }
+    )
+    try await database.setPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 2,
+        decision: .confirmedEmpty
+    )
+
+    let result = try await DocumentMaintenanceService(
+        database: database
+    ).reanalyzePage(
+        path: pdf.path,
+        expectedHash: hash,
+        pageNumber: 2
+    )
+
+    #expect(result.status.isEmptyCandidate)
+    let refreshed = try #require(
+        try await database.emptyPageCandidates().first {
+            $0.absolutePath == pdf.path && $0.pageNumber == 2
+        }
+    )
+    #expect(refreshed.decision == .confirmedEmpty)
+    #expect(try SHA256Hasher().hash(fileAt: pdf) == hash)
+}
+
+@Test
 func confirmedEmptyPageRemovalKeepsPDFValidAndQueuesTargetedReindex() async throws {
     let root = maintenanceTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -249,7 +302,7 @@ func manualNotEmptyDecisionSurvivesReanalysisAndResetsForChangedHash() async thr
         originalHash: "synthetic-changed-hash",
         analyses: PageContentAnalyzer().analyze(fileAt: pdf)
     )
-    #expect(try await database.emptyPageCandidates().first?.decision == .undecided)
+    #expect(try await database.emptyPageCandidates().isEmpty)
 }
 
 @Test

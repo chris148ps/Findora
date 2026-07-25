@@ -10,11 +10,17 @@ public actor HybridSearchService {
 
     private let database: SQLiteDatabase
     private let embedder: any EmbeddingProviding
+    private let semanticEnabled: Bool
     private let rulePlanner = RuleBasedSearchPlanner()
 
-    public init(database: SQLiteDatabase, embedder: any EmbeddingProviding) {
+    public init(
+        database: SQLiteDatabase,
+        embedder: any EmbeddingProviding,
+        semanticEnabled: Bool = true
+    ) {
         self.database = database
         self.embedder = embedder
+        self.semanticEnabled = semanticEnabled
     }
 
     public func search(_ query: String, limit: Int = 12) async throws -> [SearchSource] {
@@ -40,24 +46,26 @@ public actor HybridSearchService {
             terms: plan.hardTerms + plan.documentTypes + [trimmed],
             limit: 40
         )
-        async let queryVector = embedder.embed(query: semanticQuery(query: trimmed, plan: plan))
-        let (lexicalResults, fileNameResults, vector) = try await (
-            lexical,
-            fileNames,
-            queryVector
-        )
-        let stored = try await database.vectorRows(
-            modelID: embedder.modelID,
-            modelVersion: embedder.modelVersion
-        )
-
-        let semantic = stored
-            .map { source, candidate in
-                (source, Self.cosine(vector, candidate))
-            }
-            .filter { $0.1 >= 0.05 }
-            .sorted { $0.1 > $1.1 }
-            .prefix(80)
+        let (lexicalResults, fileNameResults) = try await (lexical, fileNames)
+        var semantic: [(SearchSource, Double)] = []
+        if semanticEnabled {
+            let vector = try await embedder.embed(
+                query: semanticQuery(query: trimmed, plan: plan)
+            )
+            let stored = try await database.vectorRows(
+                modelID: embedder.modelID,
+                modelVersion: embedder.modelVersion
+            )
+            semantic = Array(
+                stored
+                    .map { source, candidate in
+                        (source, Self.cosine(vector, candidate))
+                    }
+                    .filter { $0.1 >= 0.05 }
+                    .sorted { $0.1 > $1.1 }
+                    .prefix(80)
+            )
+        }
 
         var candidates: [String: Candidate] = [:]
         for (rank, source) in lexicalResults.enumerated() {

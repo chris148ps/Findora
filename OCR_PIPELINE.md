@@ -195,3 +195,9 @@ Auf 8 GB ist die Standardeinstellung ein OCR-Prozess. CPU-Modi:
 
 Der Nutzer kann Verarbeitung pausieren. Jobs verbleiben persistent in
 `processing_jobs`.
+
+Ein Reset von **OCR und automatischen Analysen** entfernt nur automatisch
+erzeugte OCR-/Qualitäts-/Retry-Daten. Manuelle Entscheidungen und manuell
+korrigierter oder erfasster Seitentext werden beim erneuten Lauf wieder in die
+einheitliche Seitenstruktur eingesetzt. Der normale Vision-Pfad prüft oder
+installiert weiterhin keine externen OCR-Werkzeuge.

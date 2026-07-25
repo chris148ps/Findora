@@ -187,6 +187,18 @@ Version erhalten. Für Embedding-Updates wird der Index aus dem gespeicherten
 Seitentext neu aufgebaut; Antwortmodell-Updates benötigen keine
 Neuindexierung.
 
+## Oberfläche, Sprache und Erscheinungsbild
+
+Unter **Einstellungen → Darstellung** stehen Deutsch, Englisch und die
+unterstützte Systemsprache sowie System, Hell und Dunkel zur Auswahl. Beide
+Entscheidungen werden in SQLite gespeichert und auf Hauptfenster,
+Menüleistenfenster und Einstellungen angewendet. Deutsch bleibt für bestehende
+Installationen ohne gespeicherte Wahl der Standard.
+
+Die Fortschrittsanzeige wird aus einer persistenten Verarbeitungssitzung
+gespeist. Sie bleibt deshalb zwischen Scan, OCR und Indexierung stabil,
+überlebt einen App-Neustart und zeigt den Abschluss noch kurz an.
+
 ## Fehlerbehebung
 
 Die wichtigsten Prüfungen:
@@ -231,3 +243,4 @@ nicht gelöscht.
 - [`PRIVACY.md`](PRIVACY.md)
 - [`SECURITY.md`](SECURITY.md)
 - [`TESTING.md`](TESTING.md)
+- [`UI_LOCALIZATION.md`](UI_LOCALIZATION.md)

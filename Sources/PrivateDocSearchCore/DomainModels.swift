@@ -37,6 +37,7 @@ public enum DocumentStatusChange: String, Sendable {
     case processingPaused
     case maintenanceCompleted
     case errorRecorded
+    case settingsChanged
 }
 
 public struct DiscoveredPDF: Identifiable, Hashable, Sendable {
@@ -282,6 +283,251 @@ public struct DocumentStatistics: Equatable, Sendable {
     }
 
     public init() {}
+}
+
+public enum ProcessingSessionPhase: String, Codable, CaseIterable, Sendable {
+    case idle
+    case scanning
+    case ocr
+    case indexing
+    case rebuildingSearch
+    case resettingAnalysis
+    case paused
+    case cancelling
+    case completed
+    case failed
+
+    public var isVisible: Bool {
+        self != .idle
+    }
+
+    public var isActive: Bool {
+        switch self {
+        case .scanning, .ocr, .indexing, .rebuildingSearch,
+             .resettingAnalysis, .paused, .cancelling:
+            true
+        case .idle, .completed, .failed:
+            false
+        }
+    }
+}
+
+public struct ProcessingSessionSnapshot: Equatable, Sendable {
+    public let id: String
+    public var phase: ProcessingSessionPhase
+    public let startedAt: Date
+    public var total: Int
+    public var completed: Int
+    public var failed: Int
+    public var currentFile: String?
+    public var isPaused: Bool
+    public var finishedAt: Date?
+
+    public init(
+        id: String = UUID().uuidString,
+        phase: ProcessingSessionPhase,
+        startedAt: Date = .now,
+        total: Int = 0,
+        completed: Int = 0,
+        failed: Int = 0,
+        currentFile: String? = nil,
+        isPaused: Bool = false,
+        finishedAt: Date? = nil
+    ) {
+        self.id = id
+        self.phase = phase
+        self.startedAt = startedAt
+        self.total = total
+        self.completed = completed
+        self.failed = failed
+        self.currentFile = currentFile
+        self.isPaused = isPaused
+        self.finishedAt = finishedAt
+    }
+
+    public var progressFraction: Double {
+        guard total > 0 else { return 0 }
+        return min(1, max(0, Double(completed) / Double(total)))
+    }
+}
+
+public enum AppErrorCategory: String, Codable, CaseIterable, Sendable {
+    case cancelled
+    case userCancelled
+    case recoverable
+    case requiresAttention
+    case fatal
+}
+
+public struct AppErrorClassification: Equatable, Sendable {
+    public let category: AppErrorCategory
+    public let userMessage: String?
+    public let technicalMessage: String
+
+    public init(
+        category: AppErrorCategory,
+        userMessage: String?,
+        technicalMessage: String
+    ) {
+        self.category = category
+        self.userMessage = userMessage
+        self.technicalMessage = technicalMessage
+    }
+}
+
+public enum AppErrorClassifier {
+    public static func classify(
+        _ error: Error,
+        userInitiatedCancellation: Bool = false
+    ) -> AppErrorClassification {
+        let nsError = error as NSError
+        let privateError = error as? PrivateDocSearchError
+        let privateCancellation: Bool
+        if let privateError, case .cancelled = privateError {
+            privateCancellation = true
+        } else {
+            privateCancellation = false
+        }
+        let isCancellation = error is CancellationError
+            || (nsError.domain == NSURLErrorDomain
+                && nsError.code == NSURLErrorCancelled)
+            || (nsError.domain == NSCocoaErrorDomain
+                && nsError.code == NSUserCancelledError)
+            || privateCancellation
+        if isCancellation {
+            return AppErrorClassification(
+                category: userInitiatedCancellation ? .userCancelled : .cancelled,
+                userMessage: userInitiatedCancellation ? "Vorgang abgebrochen" : nil,
+                technicalMessage: error.localizedDescription
+            )
+        }
+        if let privateError {
+            switch privateError {
+            case .database:
+                return AppErrorClassification(
+                    category: .fatal,
+                    userMessage: "Die lokale Datenbank konnte nicht sicher aktualisiert werden.",
+                    technicalMessage: error.localizedDescription
+                )
+            case .invalidPDF:
+                return AppErrorClassification(
+                    category: .requiresAttention,
+                    userMessage: "Eine PDF konnte nicht sicher verarbeitet werden.",
+                    technicalMessage: error.localizedDescription
+                )
+            case .unstableFile:
+                return AppErrorClassification(
+                    category: .recoverable,
+                    userMessage: nil,
+                    technicalMessage: error.localizedDescription
+                )
+            default:
+                break
+            }
+        }
+        return AppErrorClassification(
+            category: .requiresAttention,
+            userMessage: "Der Vorgang konnte nicht abgeschlossen werden. Details stehen im Protokoll.",
+            technicalMessage: error.localizedDescription
+        )
+    }
+}
+
+public enum MissingFileReason: String, Codable, CaseIterable, Sendable {
+    case moved
+    case deleted
+    case cloudUnavailable
+    case accessDenied
+}
+
+public struct MissingFileCandidate: Identifiable, Equatable, Hashable, Sendable {
+    public var id: String { absolutePath }
+    public let absolutePath: String
+    public let relativePath: String
+    public let fileName: String
+    public let reason: MissingFileReason
+    public let message: String?
+
+    public init(
+        absolutePath: String,
+        relativePath: String,
+        fileName: String,
+        reason: MissingFileReason,
+        message: String?
+    ) {
+        self.absolutePath = absolutePath
+        self.relativePath = relativePath
+        self.fileName = fileName
+        self.reason = reason
+        self.message = message
+    }
+}
+
+public enum VisibleSelection {
+    public static func selectAll<ID: Hashable>(
+        current: Set<ID>,
+        visible: some Sequence<ID>
+    ) -> Set<ID> {
+        current.union(visible)
+    }
+
+    public static func invert<ID: Hashable>(
+        current: Set<ID>,
+        visible: some Sequence<ID>
+    ) -> Set<ID> {
+        current.symmetricDifference(Set(visible))
+    }
+
+    public static func selectedVisible<ID: Hashable>(
+        current: Set<ID>,
+        visible: some Sequence<ID>
+    ) -> Set<ID> {
+        current.intersection(visible)
+    }
+}
+
+public struct StoredManualPageText: Equatable, Sendable {
+    public let pageNumber: Int
+    public let text: String
+    public let kind: PageTextKind
+    public let originalOCRText: String?
+
+    public init(
+        pageNumber: Int,
+        text: String,
+        kind: PageTextKind,
+        originalOCRText: String?
+    ) {
+        self.pageNumber = pageNumber
+        self.text = text
+        self.kind = kind
+        self.originalOCRText = originalOCRText
+    }
+}
+
+public struct StoredModelState: Equatable, Sendable {
+    public let modelID: String
+    public let modelVersion: String
+    public let kind: ModelKind
+    public let installedPath: String
+    public let enabled: Bool
+    public let integrityCheckedAt: Date?
+
+    public init(
+        modelID: String,
+        modelVersion: String,
+        kind: ModelKind,
+        installedPath: String,
+        enabled: Bool,
+        integrityCheckedAt: Date?
+    ) {
+        self.modelID = modelID
+        self.modelVersion = modelVersion
+        self.kind = kind
+        self.installedPath = installedPath
+        self.enabled = enabled
+        self.integrityCheckedAt = integrityCheckedAt
+    }
 }
 
 public enum DocumentStatusPrimaryMetric: String, CaseIterable, Identifiable, Sendable {

@@ -312,6 +312,11 @@ public actor DocumentProcessor {
         try await database.updateJob(path: file.id, state: .waitingForStability)
         var stable = try await stabilityChecker.waitUntilStable(file)
         let inputHash = try hasher.hash(fileAt: stable.url)
+        let manualPageTexts = Dictionary(
+            uniqueKeysWithValues: try await database.manualPageTexts(
+                path: stable.url.path
+            ).map { ($0.pageNumber, $0) }
+        )
         try await database.updateObservedHash(path: file.id, hash: inputHash)
         if try await database.reuseIndexedDocument(file: stable, observedHash: inputHash) {
             try await database.copyPageContentAnalyses(
@@ -538,6 +543,24 @@ public actor DocumentProcessor {
         }
 
         try await database.updateJob(path: file.id, state: .indexing)
+        if !manualPageTexts.isEmpty {
+            let automaticPages = Dictionary(
+                uniqueKeysWithValues: pages.map { ($0.pageNumber, $0) }
+            )
+            pages = (1...max(
+                pages.map(\.pageNumber).max() ?? 0,
+                manualPageTexts.keys.max() ?? 0
+            )).map { pageNumber in
+                if let manual = manualPageTexts[pageNumber] {
+                    return ExtractedPage(
+                        pageNumber: pageNumber,
+                        text: manual.text
+                    )
+                }
+                return automaticPages[pageNumber]
+                    ?? ExtractedPage(pageNumber: pageNumber, text: "")
+            }
+        }
         let unchangedIdentityHash = inputHash
         let chunks = chunker.chunks(for: pages, documentHash: unchangedIdentityHash)
         let embeddings = try await embedder.embed(documents: chunks.map(\.text))
@@ -552,7 +575,8 @@ public actor DocumentProcessor {
             embeddingModelVersion: embedder.modelVersion,
             ocrPerformed: ocrPerformed,
             pageQualities: pageQualities,
-            textLayerPresent: extractor.hasUsableTextLayer(pages)
+            textLayerPresent: extractor.hasUsableTextLayer(pages),
+            manualPageTexts: manualPageTexts
         )
     }
 

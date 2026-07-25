@@ -83,6 +83,13 @@ erzeugt mit Qwen3 1.7B 4 Bit eine kurze Antwort:
 ./scripts/test-llm.sh
 ```
 
+Die statischen SwiftUI-Schlüssel und die englische Ressource werden zusätzlich
+geprüft mit:
+
+```bash
+./scripts/check-localization.sh
+```
+
 ## App-Build prüfen
 
 ```bash
@@ -118,6 +125,17 @@ Danach manuell:
 20. OCR-Text korrigieren und vollständig manuell erfassen; FTS-Suche,
     Seitenchunks, Embeddings, Original-OCR-Rücksetzung und unveränderten
     PDF-Hash prüfen.
+21. Alle drei Reset-Arten mit synthetischen PDFs prüfen; insbesondere
+    manuelle Texte/Entscheidungen beim automatischen Reset und vollständige
+    leere Wartungslisten beim Vollreset.
+22. In jeder Wartungsliste Alle, Keine und Auswahl umkehren mit aktivem Filter
+    prüfen; bei Duplikaten muss je Gruppe ein Speicherort erhalten bleiben.
+23. Erwartete interne und bewusste Abbrüche auslösen; es darf kein Dialog mit
+    rohem `CancellationError` erscheinen.
+24. Antwort- und Embedding-Modell getrennt deaktivieren, App neu starten und
+    FTS-Suche sowie persistierte Modellzustände prüfen.
+25. Deutsch, Englisch, Systemsprache sowie System, Hell und Dunkel in allen
+    Hauptansichten auf Lesbarkeit und Persistenz prüfen.
 
 Der Memory-Pressure-Pfad lässt sich ohne echten Speichermangel kontrolliert
 beim App-Start auslösen:

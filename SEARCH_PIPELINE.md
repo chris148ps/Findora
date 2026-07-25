@@ -121,3 +121,11 @@ bleiben regelbasierte Pflichtbedingungen unveränderlich, Modellpläne streng
 validiert und alle finalen Treffer belegpflichtig. Die kalibrierten Schwellen
 sind konservativ: wenige gute Treffer sind ausdrücklich besser als eine
 aufgefüllte Liste schwacher Ergebnisse.
+
+## Deaktivierte Modelle
+
+Ohne aktiviertes Embedding-Modell führt die Suche weiterhin FTS- und
+Dateinamensuche aus; semantische Vektorsuche wird nicht aufgerufen und
+gespeicherte Embeddings bleiben unverändert. Ohne aktiviertes Antwortmodell
+bleiben Retrieval und regelbasierte Suchplanung verfügbar. Die Treffer werden
+angezeigt, aber es wird keine lokale KI-Antwort erzeugt.
