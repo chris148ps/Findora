@@ -15,6 +15,14 @@ Abgedeckt sind:
 - temporäre OCR-Namen;
 - Seitenextraktion und seitengebundenes Chunking;
 - deterministischer Fallback-Embedder;
+- regelbasierte Suchplanung für Pflichtentität, Thema und UND-Verknüpfung;
+- strikte Modellplanvalidierung einschließlich Fallback und SQL-Abweisung;
+- Pflichtfilter für Name in digitalem Text, OCR-Text und Dateiname;
+- Re-Ranking für selben Chunk und getrennte Chunks desselben Dokuments;
+- Ausschluss von Dokumenten ohne Pflichtperson oder Themenbeleg ohne
+  künstliches Auffüllen;
+- Quellen-ID-Validierung und begrenzter Sitzungskontext;
+- Erkennung eines gemischten E5-/Fallback-Embeddingindex;
 - SQLite-Migration, Indexierung, hybride Suche, Umbenennen, Verschieben,
   identische Kopie, Metadatenänderung, Inhaltsänderung und Löschen;
 - unverändertes Original bei korrupter OCR-Eingabe;

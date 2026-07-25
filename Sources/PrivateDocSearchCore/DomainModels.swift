@@ -99,6 +99,38 @@ public struct TextChunk: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum SearchRelevance: String, Codable, CaseIterable, Hashable, Sendable {
+    case veryRelevant
+    case relevant
+    case possiblyRelevant
+
+    public var displayName: String {
+        switch self {
+        case .veryRelevant: "Sehr passend"
+        case .relevant: "Passend"
+        case .possiblyRelevant: "Möglicherweise passend"
+        }
+    }
+}
+
+public enum SearchMatchKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case exact
+    case semantic
+    case fileName
+    case sameChunk
+    case sameDocument
+
+    public var displayName: String {
+        switch self {
+        case .exact: "Exakter Treffer"
+        case .semantic: "Semantischer Treffer"
+        case .fileName: "Dateiname"
+        case .sameChunk: "Im selben Textabschnitt"
+        case .sameDocument: "Im selben Dokument"
+        }
+    }
+}
+
 public struct SearchSource: Identifiable, Hashable, Sendable {
     public let id: String
     public let documentID: Int64
@@ -109,6 +141,13 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
     public let pageNumber: Int
     public let excerpt: String
     public let score: Double
+    public let relevance: SearchRelevance
+    public let matchedEntities: [String]
+    public let matchedTopics: [String]
+    public let reason: String
+    public let ocrQuality: String?
+    public let textSource: String
+    public let matchKinds: [SearchMatchKind]
 
     public init(
         id: String,
@@ -119,7 +158,14 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
         relativePath: String,
         pageNumber: Int,
         excerpt: String,
-        score: Double
+        score: Double,
+        relevance: SearchRelevance = .relevant,
+        matchedEntities: [String] = [],
+        matchedTopics: [String] = [],
+        reason: String = "",
+        ocrQuality: String? = nil,
+        textSource: String = "extracted",
+        matchKinds: [SearchMatchKind] = []
     ) {
         self.id = id
         self.documentID = documentID
@@ -130,6 +176,61 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
         self.pageNumber = pageNumber
         self.excerpt = excerpt
         self.score = score
+        self.relevance = relevance
+        self.matchedEntities = matchedEntities
+        self.matchedTopics = matchedTopics
+        self.reason = reason
+        self.ocrQuality = ocrQuality
+        self.textSource = textSource
+        self.matchKinds = matchKinds
+    }
+}
+
+public struct SearchOutcome: Equatable, Sendable {
+    public let plan: SearchPlan
+    public let directMatches: [SearchSource]
+    public let possibleMatches: [SearchSource]
+
+    public init(
+        plan: SearchPlan,
+        directMatches: [SearchSource],
+        possibleMatches: [SearchSource]
+    ) {
+        self.plan = plan
+        self.directMatches = directMatches
+        self.possibleMatches = possibleMatches
+    }
+}
+
+public struct DocumentSearchEvidence: Sendable {
+    public let documentID: Int64
+    public let chunks: [SearchEvidenceChunk]
+
+    public init(documentID: Int64, chunks: [SearchEvidenceChunk]) {
+        self.documentID = documentID
+        self.chunks = chunks
+    }
+}
+
+public struct SearchEvidenceChunk: Sendable {
+    public let chunkID: String
+    public let pageNumber: Int
+    public let text: String
+    public let textSource: String
+    public let ocrQuality: String?
+
+    public init(
+        chunkID: String,
+        pageNumber: Int,
+        text: String,
+        textSource: String,
+        ocrQuality: String?
+    ) {
+        self.chunkID = chunkID
+        self.pageNumber = pageNumber
+        self.text = text
+        self.textSource = textSource
+        self.ocrQuality = ocrQuality
     }
 }
 

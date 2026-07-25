@@ -17,6 +17,10 @@ Es erfolgt keine Übertragung von Dokumentinhalten, Suchanfragen oder Antworten
 an OpenAI oder andere KI-Anbieter. Es gibt standardmäßig keine Telemetrie,
 Analyse-, Crash-Upload- oder Tracking-Funktion.
 
+Suchpläne und Folgefragen werden nur im Arbeitsspeicher der laufenden Sitzung
+gehalten. Der Chatverlauf ist auf sechs Schritte begrenzt, wird nicht
+persistiert und nicht automatisch exportiert.
+
 ## Netzwerkzugriff
 
 Netzwerkzugriff wird nur für eine vom Nutzer gestartete Modellinstallation
@@ -36,13 +40,13 @@ Suchanfragen werden dabei nicht übertragen.
 ```
 
 Logs enthalten keine extrahierten Dokumenttexte, Suchauszüge, Prompts oder
-Antworten. Sie dürfen Dateiname, Pfad, Status und technische Fehlermeldungen
-enthalten. Pfade können private Informationen verraten; Logdateien sollten
-daher wie andere lokale Anwendungsdaten behandelt werden.
+Antworten. Sie enthalten auch keine Suchanfragen, erkannten Personen,
+Vertragsdaten oder Suchpläne. Sie dürfen Dateiname, Pfad, Status und technische
+Fehlermeldungen enthalten. Pfade können private Informationen verraten;
+Logdateien sollten daher wie andere lokale Anwendungsdaten behandelt werden.
 
 ## Löschen
 
 Index, Modelle, Einstellungen und Logs können durch Löschen der oben genannten
 App-Verzeichnisse entfernt werden. Die privaten Original-PDFs werden dadurch
 nicht verändert oder gelöscht.
-

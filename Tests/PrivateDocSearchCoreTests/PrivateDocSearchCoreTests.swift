@@ -508,6 +508,289 @@ func unavailableCloudPlaceholderRemainsVisibleWithoutProcessing() async throws {
 }
 
 @Test
+func ruleBasedSearchPlanRecognizesNicoAndTrainingAsMandatoryContext() throws {
+    let planner = RuleBasedSearchPlanner()
+    let plan = planner.plan(
+        query: "Suche mir Dokumente heraus, die mit Nicos Ausbildung zu tun haben."
+    )
+
+    #expect(plan.requiredEntities == ["Nico"])
+    #expect(plan.topics == ["Ausbildung"])
+    #expect(plan.mustMatchAll)
+    #expect(plan.optionalTerms.contains("ausbildungsvertrag"))
+    #expect(planner.needsModelPlanning(
+        "Suche mir Dokumente heraus, die mit Nicos Ausbildung zu tun haben."
+    ))
+
+    let followUp = planner.plan(
+        query: "Welche davon betreffen die Probezeit?",
+        previousPlan: plan
+    )
+    #expect(followUp.requiredEntities == ["Nico"])
+    #expect(followUp.topics.contains("Ausbildung"))
+
+    let independent = planner.plan(
+        query: "Zeige Rechnungen aus 2025",
+        previousPlan: plan
+    )
+    #expect(!independent.requiredEntities.contains("Nico"))
+    #expect(independent.topics.contains("Rechnung"))
+}
+
+@Test
+func invalidOrUnsafeModelPlanFallsBackToRuleBasedPlan() throws {
+    let query = "Suche mir Dokumente heraus, die mit Nicos Ausbildung zu tun haben."
+    let fallback = RuleBasedSearchPlanner().plan(query: query)
+    let invalid = """
+    {"intent":"find_documents","required_entities":["Nico"],"sql":"DELETE FROM documents"}
+    """
+    let resolved = (try? SearchPlanValidator().decode(invalid)) ?? fallback
+    #expect(resolved == fallback)
+
+    let unsafe = """
+    {
+      "intent":"find_documents",
+      "required_entities":["Nico"],
+      "organizations":[],
+      "locations":[],
+      "time_ranges":[],
+      "amounts":[],
+      "document_types":[],
+      "topics":["SELECT * FROM chunks"],
+      "must_match_all":true,
+      "optional_terms":[]
+    }
+    """
+    #expect(throws: SearchPlanValidationError.self) {
+        try SearchPlanValidator().decode(unsafe)
+    }
+}
+
+@Test
+func mandatoryEntityFilteringAndRerankingExcludeUnrelatedDocuments() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let documents: [(String, [String])] = [
+        (
+            "Ausbildungsvertrag Nico.pdf",
+            ["Nico beginnt seine Ausbildung im Ausbildungsbetrieb. Der Ausbildungsvertrag gilt ab September."]
+        ),
+        ("Nico Freizeit.pdf", ["Nico spielt am Wochenende Fußball im Verein."]),
+        ("Ausbildung Laura.pdf", ["Laura beginnt eine Ausbildung und besucht die Berufsschule."]),
+        ("Unpassend.pdf", ["Allgemeine Hinweise zum Sommerfest und zur Kantine."]),
+        (
+            "Nico-Unterlagen.pdf",
+            ["Der Ausbildungsbetrieb bestätigt die Berufsausbildung und die Probezeit."]
+        ),
+        (
+            "Getrennte Seiten.pdf",
+            [
+                "Nico wurde als Ansprechpartner genannt.",
+                "Der Ausbildungsvertrag regelt Berufsschule und Probezeit."
+            ]
+        ),
+        (
+            "Mehrere Personen.pdf",
+            ["Nico und Laura beginnen ihre Ausbildung."]
+        )
+    ]
+    for document in documents {
+        try createTextPDF(at: root.appending(path: document.0), pages: document.1)
+    }
+
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    let embedder = TokenHashEmbedding(dimensions: 64)
+    await DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: embedder
+    ).processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+
+    let query = "Suche mir Dokumente heraus, die mit Nicos Ausbildung zu tun haben."
+    let plan = RuleBasedSearchPlanner().plan(query: query)
+    let outcome = try await HybridSearchService(database: database, embedder: embedder)
+        .search(query, plan: plan, limit: 10)
+    let directNames = Set(outcome.directMatches.map(\.fileName))
+
+    #expect(directNames.contains("Ausbildungsvertrag Nico.pdf"))
+    #expect(directNames.contains("Nico-Unterlagen.pdf"))
+    #expect(directNames.contains("Getrennte Seiten.pdf"))
+    #expect(directNames.contains("Mehrere Personen.pdf"))
+    #expect(!directNames.contains("Nico Freizeit.pdf"))
+    #expect(!directNames.contains("Ausbildung Laura.pdf"))
+    #expect(!directNames.contains("Unpassend.pdf"))
+    #expect(outcome.directMatches.count < 10)
+    #expect(outcome.directMatches.allSatisfy { $0.matchedEntities.contains("Nico") })
+    #expect(outcome.directMatches.allSatisfy { !$0.reason.isEmpty })
+    #expect(outcome.directMatches.allSatisfy { $0.textSource == "extracted" })
+
+    let sameChunk = try #require(outcome.directMatches.first {
+        $0.fileName == "Ausbildungsvertrag Nico.pdf"
+    })
+    #expect(sameChunk.relevance == .veryRelevant)
+    #expect(sameChunk.matchKinds.contains(.sameChunk))
+
+    let sameDocument = try #require(outcome.directMatches.first {
+        $0.fileName == "Getrennte Seiten.pdf"
+    })
+    #expect(sameDocument.relevance == .relevant)
+    #expect(sameDocument.matchKinds.contains(.sameDocument))
+
+    let fileNameMatch = try #require(outcome.directMatches.first {
+        $0.fileName == "Nico-Unterlagen.pdf"
+    })
+    #expect(fileNameMatch.matchKinds.contains(.fileName))
+    #expect(!outcome.possibleMatches.contains { $0.fileName == "Ausbildung Laura.pdf" })
+
+    let fileNameQuery = "Nico-Unterlagen.pdf"
+    let fileNamePlan = RuleBasedSearchPlanner().plan(query: fileNameQuery)
+    #expect(fileNamePlan.requiredEntities.contains("Nico-Unterlagen"))
+    #expect(
+        try await database.fileNameSearch(terms: fileNamePlan.hardTerms, limit: 10)
+            .first?.fileName == "Nico-Unterlagen.pdf"
+    )
+    let fileNameOutcome = try await HybridSearchService(database: database, embedder: embedder)
+        .search(
+            fileNameQuery,
+            plan: fileNamePlan
+        )
+    #expect(fileNameOutcome.directMatches.first?.fileName == "Nico-Unterlagen.pdf")
+}
+
+@Test
+func mandatoryNameEvidenceWorksForOCRText() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let pdf = root.appending(path: "Scan ohne Namen im Dateinamen.pdf")
+    try createImagePDF(at: pdf, text: "SYNTHETIC SCAN")
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    let embedder = TokenHashEmbedding(dimensions: 64)
+    await DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: embedder,
+        ocrProcessor: StubOCRProvider(
+            engine: .appleVision,
+            behavior: .success("Nico beginnt seine Ausbildung im Ausbildungsbetrieb"),
+            probe: OCRProviderProbe()
+        )
+    ).processPending(
+        ocrConfiguration: OCRConfiguration(engineSelection: .appleVision)
+    ) { _ in }
+
+    let query = "Nico Ausbildung"
+    let outcome = try await HybridSearchService(database: database, embedder: embedder)
+        .search(query, plan: RuleBasedSearchPlanner().plan(query: query))
+    let source = try #require(outcome.directMatches.first)
+    #expect(source.matchedEntities == ["Nico"])
+    #expect(source.matchedTopics == ["Ausbildung"])
+    #expect(source.textSource == "ocr")
+    #expect(source.ocrQuality == OCRQualityStatus.good.rawValue)
+}
+
+@Test
+func citationValidationRejectsInventedSourcesAndEmptyEvidence() {
+    let validator = SourceCitationValidator()
+    let valid = validator.validate(
+        "Nico beginnt die Ausbildung [S-001].",
+        sourceCount: 1
+    )
+    #expect(valid.contains("[1]"))
+    #expect(
+        validator.validate(
+            "Nico beginnt die Ausbildung [S-001]. Eine erfundene Quelle [S-999].",
+            sourceCount: 1
+        ) == SourceCitationValidator.noEvidenceMessage
+    )
+    #expect(
+        validator.validate("Unbelegte Behauptung [S-999].", sourceCount: 1)
+            == SourceCitationValidator.noEvidenceMessage
+    )
+    #expect(
+        validator.validate("Beliebige Antwort", sourceCount: 0)
+            == SourceCitationValidator.noEvidenceMessage
+    )
+}
+
+@Test
+func searchSessionContextKeepsOnlyRecentPlans() {
+    var context = SearchSessionContext(limit: 3)
+    for index in 1...5 {
+        context.record(
+            SearchPlan(
+                requiredEntities: ["Person \(index)"],
+                topics: ["Thema \(index)"]
+            )
+        )
+    }
+    #expect(context.plans.count == 3)
+    #expect(context.plans.first?.requiredEntities == ["Person 3"])
+    #expect(context.latestPlan?.requiredEntities == ["Person 5"])
+    context.reset()
+    #expect(context.plans.isEmpty)
+}
+
+@Test
+func documentStatusDetectsMixedEmbeddingIndex() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let pdf = root.appending(path: "Embeddings.pdf")
+    try createTextPDF(
+        at: pdf,
+        pages: ["GEMISCHTER EMBEDDING INDEX " + String(repeating: "Text ", count: 60)]
+    )
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    let files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    let fallback = TokenHashEmbedding(dimensions: 64)
+    await DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: fallback
+    ).processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+
+    let file = try #require(files.first)
+    let pages = try PDFKitTextExtractor().extractPages(from: pdf)
+    let hash = try SHA256Hasher().hash(fileAt: pdf)
+    let chunks = PageChunker().chunks(for: pages, documentHash: hash)
+    let embeddings = try await fallback.embed(documents: chunks.map(\.text))
+    _ = try await database.indexDocument(
+        file: file,
+        hash: hash,
+        pages: pages,
+        chunks: chunks,
+        embeddings: embeddings,
+        embeddingModelID: "multilingual-e5-small",
+        embeddingModelVersion: "synthetic-test",
+        ocrPerformed: false
+    )
+    let statistics = try await database.statistics()
+    #expect(statistics.fallbackEmbeddedChunks == statistics.totalChunks)
+    #expect(statistics.e5EmbeddedChunks == statistics.totalChunks)
+    #expect(statistics.totalChunks > 0)
+}
+
+@Test
 func indexingSearchRenameAndDeletionStayConsistent() async throws {
     let root = temporaryTestDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

@@ -566,6 +566,46 @@ public actor SQLiteDatabase {
         }
     }
 
+    public func fileNameSearch(terms: [String], limit: Int = 40) throws -> [SearchSource] {
+        let normalized = terms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .prefix(12)
+        guard !normalized.isEmpty else { return [] }
+        let conditions = Array(
+            repeating: "lower(l.file_name) LIKE lower(?) ESCAPE '\\'",
+            count: normalized.count
+        ).joined(separator: " OR ")
+        let bindings = normalized.map { term -> SQLiteValue in
+            let escaped = term
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "%", with: "\\%")
+                .replacingOccurrences(of: "_", with: "\\_")
+            return .text("%\(escaped)%")
+        } + [.integer(Int64(limit))]
+        let rows = try query(
+            """
+            SELECT c.document_id, c.id AS chunk_id, c.page_number, c.chunk_text,
+                   l.file_name, l.absolute_path, l.relative_path
+            FROM document_locations l
+            JOIN chunks c ON c.id = (
+                SELECT first_chunk.id
+                FROM chunks first_chunk
+                WHERE first_chunk.document_id = l.document_id
+                ORDER BY first_chunk.page_number, first_chunk.ordinal
+                LIMIT 1
+            )
+            WHERE l.deleted_at IS NULL AND (\(conditions))
+            ORDER BY l.file_name
+            LIMIT ?
+            """,
+            bindings: bindings
+        )
+        return rows.enumerated().compactMap { index, row in
+            Self.source(row: row, score: 1.0 / Double(index + 1))
+        }
+    }
+
     public func vectorRows(
         modelID: String,
         modelVersion: String
@@ -586,6 +626,52 @@ public actor SQLiteDatabase {
                   let data = row.data("vector") else { return nil }
             return (source, Self.decode(vector: data))
         }
+    }
+
+    public func searchEvidence(
+        documentIDs: Set<Int64>
+    ) throws -> [Int64: DocumentSearchEvidence] {
+        guard !documentIDs.isEmpty else { return [:] }
+        let identifiers = documentIDs.sorted().map(String.init).joined(separator: ",")
+        let rows = try query(
+            """
+            SELECT c.document_id, c.id AS chunk_id, c.page_number, c.chunk_text,
+                   COALESCE(p.text_source, 'extracted') AS text_source,
+                   q.status AS ocr_quality
+            FROM chunks c
+            LEFT JOIN pages p
+              ON p.document_id = c.document_id AND p.page_number = c.page_number
+            LEFT JOIN ocr_page_quality q
+              ON q.document_id = c.document_id AND q.page_number = c.page_number
+            WHERE c.document_id IN (\(identifiers))
+            ORDER BY c.document_id, c.page_number, c.ordinal
+            """
+        )
+        var grouped: [Int64: [SearchEvidenceChunk]] = [:]
+        for row in rows {
+            guard let documentID = row.int64("document_id"),
+                  let chunkID = row.string("chunk_id"),
+                  let pageNumber = row.int64("page_number"),
+                  let text = row.string("chunk_text"),
+                  let textSource = row.string("text_source") else { continue }
+            grouped[documentID, default: []].append(
+                SearchEvidenceChunk(
+                    chunkID: chunkID,
+                    pageNumber: Int(pageNumber),
+                    text: text,
+                    textSource: textSource,
+                    ocrQuality: row.string("ocr_quality")
+                )
+            )
+        }
+        var evidence: [Int64: DocumentSearchEvidence] = [:]
+        for (documentID, chunks) in grouped {
+            evidence[documentID] = DocumentSearchEvidence(
+                documentID: documentID,
+                chunks: chunks
+            )
+        }
+        return evidence
     }
 
     public func embeddingCoverage(

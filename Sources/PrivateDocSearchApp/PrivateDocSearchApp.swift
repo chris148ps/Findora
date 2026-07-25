@@ -53,6 +53,15 @@ enum AppSection: String, CaseIterable, Identifiable {
     }
 }
 
+struct SearchSessionTurn: Identifiable {
+    let id = UUID()
+    let question: String
+    let answer: String
+    let sources: [SearchSource]
+    let possibleSources: [SearchSource]
+    let plan: SearchPlan
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -65,6 +74,11 @@ final class AppState {
     var question = ""
     var answer = ""
     var searchResults: [SearchSource] = []
+    var possibleSearchResults: [SearchSource] = []
+    var submittedQuestion = ""
+    var currentSearchPlan: SearchPlan?
+    var searchPlanningNotice: String?
+    var searchSession: [SearchSessionTurn] = []
     var previewSource: SearchSource?
     var isSearching = false
     var lastError: String?
@@ -88,6 +102,17 @@ final class AppState {
     var ocrInstallationMessage: String?
     let hardwareProfile: HardwareProfile
 
+    var activeEmbeddingModelVersion: String? {
+        guard let activeEmbeddingModelID else { return nil }
+        return availableModels.first {
+            $0.id == activeEmbeddingModelID
+        }?.descriptor.modelVersion
+    }
+
+    var hasMixedEmbeddingIndex: Bool {
+        statistics.e5EmbeddedChunks > 0 && statistics.fallbackEmbeddedChunks > 0
+    }
+
     private let paths: AppPaths
     private let database: SQLiteDatabase
     private let fileLogger: AppFileLogger
@@ -103,6 +128,8 @@ final class AppState {
     private var folderWatcher: FolderChangeWatcher?
     private var modelDownloadTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
+    private var searchPlanCache: [String: SearchPlan] = [:]
+    private var searchContext = SearchSessionContext(limit: 6)
     private var memoryPressureMonitor: MemoryPressureMonitor?
     private var statusEventTask: Task<Void, Never>?
     private var statusRefreshTask: Task<Void, Never>?
@@ -442,6 +469,10 @@ final class AppState {
         isSearching = true
         answer = ""
         searchResults = []
+        possibleSearchResults = []
+        submittedQuestion = value
+        searchPlanningNotice = nil
+        question = ""
 
         searchTask = Task {
             defer {
@@ -449,10 +480,48 @@ final class AppState {
                 searchTask = nil
             }
             do {
-                let sources = try await searchService.search(value)
+                let rulePlanner = RuleBasedSearchPlanner()
+                let isFollowUp = rulePlanner.isFollowUp(value)
+                let rulePlan = rulePlanner.plan(
+                    query: value,
+                    previousPlan: isFollowUp ? searchContext.latestPlan : nil
+                )
+                let contextKey = isFollowUp
+                    ? searchContext.latestPlan?.retrievalTerms.joined(separator: "|") ?? ""
+                    : ""
+                let cacheKey = "\(value.lowercased())|\(contextKey)"
+                let plan: SearchPlan
+                if let cached = searchPlanCache[cacheKey] {
+                    plan = cached
+                } else if rulePlanner.needsModelPlanning(value),
+                          let planner = answerGenerator as? any SearchPlanning {
+                    do {
+                        plan = try await planner.planSearch(
+                            query: value,
+                            ruleBasedPlan: rulePlan
+                        )
+                    } catch {
+                        plan = rulePlan
+                        searchPlanningNotice = "Der lokale KI-Suchplan war ungültig; die sichere regelbasierte Analyse wurde verwendet."
+                    }
+                    searchPlanCache[cacheKey] = plan
+                } else {
+                    plan = rulePlan
+                    searchPlanCache[cacheKey] = plan
+                }
+                if searchPlanCache.count > 12,
+                   let firstKey = searchPlanCache.keys.first {
+                    searchPlanCache.removeValue(forKey: firstKey)
+                }
+                currentSearchPlan = plan
+                searchContext.record(plan)
+
+                let outcome = try await searchService.search(value, plan: plan)
+                let sources = outcome.directMatches
                 searchResults = sources
+                possibleSearchResults = outcome.possibleMatches
                 if sources.isEmpty {
-                    answer = "In den indexierten Unterlagen wurde keine ausreichend belastbare Antwort gefunden."
+                    answer = "Keine ausreichend passenden Dokumente gefunden."
                 } else if let answerGenerator {
                     answer = try await answerGenerator.answer(
                         question: value,
@@ -464,6 +533,18 @@ final class AppState {
                     ein kompatibles Antwortmodell, um daraus eine belegte natürlichsprachliche Antwort erzeugen zu lassen.
                     """
                 }
+                searchSession.append(
+                    SearchSessionTurn(
+                        question: value,
+                        answer: answer,
+                        sources: sources,
+                        possibleSources: outcome.possibleMatches,
+                        plan: plan
+                    )
+                )
+                if searchSession.count > 6 {
+                    searchSession.removeFirst(searchSession.count - 6)
+                }
             } catch is CancellationError {
                 answer = "Antwort wurde abgebrochen."
             } catch {
@@ -474,6 +555,23 @@ final class AppState {
 
     func cancelSearch() {
         searchTask?.cancel()
+    }
+
+    func copyAnswer() {
+        guard !answer.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(answer, forType: .string)
+    }
+
+    func clearSearchSession() {
+        searchSession = []
+        searchContext.reset()
+        searchPlanCache = [:]
+        submittedQuestion = ""
+        answer = ""
+        searchResults = []
+        possibleSearchResults = []
+        currentSearchPlan = nil
     }
 
     func open(_ source: SearchSource) {
@@ -999,13 +1097,211 @@ struct ContentView: View {
 
 struct SearchView: View {
     @Environment(AppState.self) private var state
+    @State private var showPossibleMatches = false
+    @State private var showSessionHistory = false
 
     var body: some View {
         @Bindable var state = state
         VStack(spacing: 0) {
+            if !historicalTurns.isEmpty {
+                DisclosureGroup(
+                    "Sitzungsverlauf (\(historicalTurns.count))",
+                    isExpanded: $showSessionHistory
+                ) {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            ForEach(historicalTurns) { turn in
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text("Sie:").font(.caption.bold())
+                                    Text(turn.question).lineLimit(2)
+                                    Text("PrivateDocSearch:").font(.caption.bold())
+                                    Text(plainMarkdown(turn.answer))
+                                        .lineLimit(4)
+                                        .foregroundStyle(.secondary)
+                                    HStack(spacing: 6) {
+                                        ForEach(Array(turn.sources.prefix(3).enumerated()), id: \.element.id) {
+                                            index, source in
+                                            Button("[\(index + 1)] \(source.fileName)") {
+                                                state.showPage(source)
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .lineLimit(1)
+                                        }
+                                    }
+                                    .font(.caption2)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(10)
+                                .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 220)
+                    Button("Sitzungsverlauf löschen") {
+                        state.clearSearchSession()
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.top, 10)
+            }
+
+            if state.isProcessing {
+                Label(
+                    "Lokale Antwortgenerierung wartet, bis OCR und Indexierung beendet oder pausiert sind.",
+                    systemImage: "memorychip"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
+            }
+
+            if state.submittedQuestion.isEmpty
+                && state.answer.isEmpty
+                && state.searchResults.isEmpty {
+                ContentUnavailableView(
+                    "Unterlagen lokal durchsuchen",
+                    systemImage: "doc.text.magnifyingglass",
+                    description: Text(
+                        "Stelle eine natürliche Frage. Eindeutige Namen und Nummern werden als Pflichtbedingungen behandelt."
+                    )
+                )
+            } else {
+                VStack(spacing: 0) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(alignment: .top) {
+                            Text("Sie")
+                                .font(.caption.bold())
+                                .foregroundStyle(.secondary)
+                            Text(state.submittedQuestion)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
+                        .padding(12)
+                        .background(.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 14))
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Label("PrivateDocSearch", systemImage: "sparkles")
+                                    .font(.headline)
+                                Spacer()
+                                if !state.answer.isEmpty {
+                                    Button("Antwort kopieren", systemImage: "doc.on.doc") {
+                                        state.copyAnswer()
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                            }
+                            if state.isSearching && state.answer.isEmpty {
+                                HStack(spacing: 10) {
+                                    ProgressView()
+                                    Text("Antwort wird erstellt …")
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button("Abbrechen", role: .destructive) {
+                                        state.cancelSearch()
+                                    }
+                                }
+                            } else {
+                                ScrollView {
+                                    Text(markdown(state.answer))
+                                        .font(.body)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .textSelection(.enabled)
+                                }
+                                .frame(minHeight: 80, maxHeight: 240)
+                                .environment(
+                                    \.openURL,
+                                    OpenURLAction { url in
+                                        guard url.scheme == "privatedocsearch",
+                                              url.host == "source",
+                                              let number = Int(url.lastPathComponent),
+                                              state.searchResults.indices.contains(number - 1) else {
+                                            return .systemAction
+                                        }
+                                        state.showPage(state.searchResults[number - 1])
+                                        return .handled
+                                    }
+                                )
+                            }
+                            if let notice = state.searchPlanningNotice {
+                                Label(notice, systemImage: "shield.checkered")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
+                            if !state.searchResults.isEmpty {
+                                HStack(spacing: 8) {
+                                    ForEach(Array(state.searchResults.prefix(5).enumerated()), id: \.element.id) {
+                                        index, source in
+                                        Button("[\(index + 1)] \(source.fileName)") {
+                                            state.showPage(source)
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .lineLimit(1)
+                                    }
+                                }
+                                .font(.caption)
+                            }
+                        }
+                        .padding(16)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 16)
+                                .stroke(.blue.opacity(0.25), lineWidth: 1)
+                        }
+                    }
+                    .padding()
+
+                    Divider()
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 14) {
+                            if !state.searchResults.isEmpty {
+                                HStack {
+                                    Text("Direkt passende Dokumente")
+                                        .font(.title2.bold())
+                                    Text(state.searchResults.count.formatted())
+                                        .foregroundStyle(.secondary)
+                                }
+                                ForEach(
+                                    Array(state.searchResults.enumerated()),
+                                    id: \.element.id
+                                ) { index, source in
+                                    SourceCard(number: index + 1, source: source)
+                                }
+                            } else if !state.isSearching {
+                                ContentUnavailableView(
+                                    "Keine ausreichend passenden Dokumente gefunden",
+                                    systemImage: "doc.text.magnifyingglass"
+                                )
+                            }
+
+                            if !state.possibleSearchResults.isEmpty {
+                                DisclosureGroup(
+                                    "Möglicherweise passende Dokumente (\(state.possibleSearchResults.count))",
+                                    isExpanded: $showPossibleMatches
+                                ) {
+                                    LazyVStack(spacing: 12) {
+                                        ForEach(state.possibleSearchResults) { source in
+                                            SourceCard(number: nil, source: source)
+                                        }
+                                    }
+                                    .padding(.top, 10)
+                                }
+                            }
+                        }
+                        .padding()
+                    }
+                }
+            }
+
+            Divider()
+
             HStack(alignment: .bottom, spacing: 10) {
                 TextField(
-                    "Frage zu deinen Unterlagen …",
+                    state.searchSession.isEmpty
+                        ? "Frage zu deinen Unterlagen …"
+                        : "Folgefrage stellen …",
                     text: $state.question,
                     axis: .vertical
                 )
@@ -1023,7 +1319,7 @@ struct SearchView: View {
                     if state.isSearching {
                         Label("Abbrechen", systemImage: "stop.fill")
                     } else {
-                        Label("Suchen", systemImage: "paperplane.fill")
+                        Label("Senden", systemImage: "paperplane.fill")
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -1035,73 +1331,76 @@ struct SearchView: View {
                 )
             }
             .padding()
-
-            if state.isProcessing {
-                Label(
-                    "Lokale Antwortgenerierung wartet, bis OCR und Indexierung beendet oder pausiert sind.",
-                    systemImage: "memorychip"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal)
-                .padding(.bottom, 8)
-            }
-
-            Divider()
-
-            if state.answer.isEmpty && state.searchResults.isEmpty {
-                ContentUnavailableView(
-                    "Unterlagen lokal durchsuchen",
-                    systemImage: "doc.text.magnifyingglass",
-                    description: Text("Wähle einen Dokumentenordner und stelle anschließend eine Frage.")
-                )
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 18) {
-                        if !state.answer.isEmpty {
-                            GroupBox("Antwort") {
-                                Text(state.answer)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .textSelection(.enabled)
-                                    .padding(.vertical, 4)
-                            }
-                        }
-                        if !state.searchResults.isEmpty {
-                            Text("Quellen")
-                                .font(.title2.bold())
-                            ForEach(Array(state.searchResults.enumerated()), id: \.element.id) { index, source in
-                                SourceCard(number: index + 1, source: source)
-                            }
-                        }
-                    }
-                    .padding()
-                }
-            }
         }
         .navigationTitle("Suche")
+    }
+
+    private func markdown(_ value: String) -> AttributedString {
+        var linked = value
+        for index in state.searchResults.indices.reversed() {
+            linked = linked.replacingOccurrences(
+                of: "[\(index + 1)]",
+                with: "[\(index + 1)](privatedocsearch://source/\(index + 1))"
+            )
+        }
+        return (try? AttributedString(
+            markdown: linked,
+            options: .init(interpretedSyntax: .full)
+        )) ?? AttributedString(value)
+    }
+
+    private func plainMarkdown(_ value: String) -> AttributedString {
+        (try? AttributedString(
+            markdown: value,
+            options: .init(interpretedSyntax: .full)
+        )) ?? AttributedString(value)
+    }
+
+    private var historicalTurns: [SearchSessionTurn] {
+        if state.isSearching {
+            return state.searchSession
+        }
+        if state.searchSession.last?.question == state.submittedQuestion {
+            return Array(state.searchSession.dropLast())
+        }
+        return state.searchSession
     }
 }
 
 struct SourceCard: View {
     @Environment(AppState.self) private var state
-    let number: Int
+    let number: Int?
     let source: SearchSource
 
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("\(number). \(source.fileName)")
+                    Text(number.map { "\($0). \(source.fileName)" } ?? source.fileName)
                         .font(.headline)
                     Spacer()
-                    Text("Seite \(source.pageNumber)")
+                    Text(source.relevance.displayName)
+                        .font(.caption.bold())
+                        .foregroundStyle(
+                            source.relevance == .veryRelevant ? .green : .blue
+                        )
+                }
+                HStack {
+                    Text(source.relativePath)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Label("Seite \(source.pageNumber)", systemImage: "doc.text")
+                        .font(.caption)
+                }
+                badgeRow
+                Text(highlightedExcerpt)
+                    .textSelection(.enabled)
+                if !source.reason.isEmpty {
+                    Label(source.reason, systemImage: "checkmark.seal")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text(source.relativePath)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(source.excerpt)
-                    .textSelection(.enabled)
                 HStack {
                     Button("Seite anzeigen") { state.showPage(source) }
                     Button("PDF öffnen") { state.open(source) }
@@ -1116,6 +1415,72 @@ struct SourceCard: View {
             }
             .padding(.vertical, 4)
         }
+    }
+
+    private var badgeRow: some View {
+        HStack(spacing: 7) {
+            if let entity = source.matchedEntities.first {
+                SearchBadge(text: "Person: \(entity)", color: .green)
+            }
+            if let topic = source.matchedTopics.first {
+                SearchBadge(text: "Thema: \(topic)", color: .blue)
+            }
+            SearchBadge(
+                text: source.textSource == "ocr" ? "OCR-Text" : "Digitale Textschicht",
+                color: .secondary
+            )
+            if let quality = source.ocrQuality {
+                SearchBadge(text: qualityLabel(quality), color: .orange)
+            }
+            if let kind = source.matchKinds.first {
+                SearchBadge(text: kind.displayName, color: .purple)
+            }
+        }
+    }
+
+    private var highlightedExcerpt: AttributedString {
+        let attributed = NSMutableAttributedString(string: source.excerpt)
+        let terms = source.matchedEntities + source.matchedTopics
+        for term in terms {
+            guard let expression = try? NSRegularExpression(
+                pattern: NSRegularExpression.escapedPattern(for: term),
+                options: [.caseInsensitive]
+            ) else { continue }
+            let range = NSRange(location: 0, length: attributed.length)
+            for match in expression.matches(in: source.excerpt, range: range) {
+                attributed.addAttributes(
+                    [
+                        .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
+                        .backgroundColor: NSColor.systemYellow.withAlphaComponent(0.22)
+                    ],
+                    range: match.range
+                )
+            }
+        }
+        return AttributedString(attributed)
+    }
+
+    private func qualityLabel(_ value: String) -> String {
+        switch OCRQualityStatus(rawValue: value) {
+        case .good: "OCR gut"
+        case .review: "OCR prüfen"
+        case .likelyFailed: "OCR schwach"
+        case nil: "OCR"
+        }
+    }
+}
+
+struct SearchBadge: View {
+    let text: String
+    let color: Color
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.bold())
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .foregroundStyle(color)
+            .background(color.opacity(0.10), in: Capsule())
     }
 }
 
@@ -1222,6 +1587,15 @@ struct StatusView: View {
                             Text(state.activeEmbeddingModelID ?? "Fallback (nicht neuronal)")
                         }
                         GridRow {
+                            Text("Embedding-Version").foregroundStyle(.secondary)
+                            Text(state.activeEmbeddingModelVersion ?? "Integriert")
+                        }
+                        GridRow {
+                            Text("Indexzustand").foregroundStyle(.secondary)
+                            Text(state.hasMixedEmbeddingIndex ? "Gemischte Embeddings" : "Konsistent")
+                                .foregroundStyle(state.hasMixedEmbeddingIndex ? .orange : .primary)
+                        }
+                        GridRow {
                             Text("Antwortmodell").foregroundStyle(.secondary)
                             Text(state.activeAnswerModelID ?? "Nicht aktiviert")
                         }
@@ -1231,6 +1605,18 @@ struct StatusView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    if state.hasMixedEmbeddingIndex {
+                        Divider()
+                        Label(
+                            "E5- und Fallback-Vektoren sind gleichzeitig vorhanden. Die aktive Suche verwendet nur das aktive Modell; baue den Index vollständig neu auf.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .foregroundStyle(.orange)
+                        Button("Suchindex neu aufbauen") {
+                            state.rebuildSearchIndex()
+                        }
+                        .disabled(state.isProcessing)
+                    }
                 }
 
                 if state.isProcessing

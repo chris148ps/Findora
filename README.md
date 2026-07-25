@@ -110,15 +110,28 @@ entladen.
 
 ## Suche und Quellen
 
-Die Suche kombiniert SQLite FTS5 mit lokaler Vektorsuche und führt beide
-Ranglisten per Reciprocal Rank Fusion zusammen. Treffer zeigen Dateiname,
-Pfad, Seite, Auszug und Relevanz. Eine PDF kann im Finder, in der
-Standard-PDF-App oder in der internen PDFKit-Vorschau geöffnet werden.
+Natürliche Anfragen werden zuerst in einen strikt validierten lokalen Suchplan
+übersetzt. Regeln sichern Namen, Nummern, Daten und Beträge als
+Pflichtbedingungen; bei komplexen Anfragen ergänzt das lokale Antwortmodell
+Themen und Synonyme. Ungültiger Modelloutput fällt auf den sicheren
+regelbasierten Plan zurück und wird nie als SQL ausgeführt.
+
+Die Suche kombiniert SQLite FTS5 mit lokaler Vektorsuche, prüft
+Pflichtbedingungen und bewertet Person-/Themennähe erneut. Nur „Sehr passend“
+und „Passend“ erscheinen regulär. Unsichere Treffer bleiben getrennt und
+eingeklappt. Trefferkarten zeigen Dateiname, Pfad, Seite, hervorgehobenen
+Auszug, Relevanz, belegte Person und Thema, OCR-Qualität, Suchart und eine
+regelbasierte Begründung.
 
 Für eine formulierte Antwort werden nur die besten lokalen Fundstellen an das
 lokale Modell übergeben. Quellen-IDs werden von der App erzeugt und nachher
 gegen die Datenbank validiert. Fehlen ausreichende Belege, gibt die App keine
 scheinbar belegte Antwort aus.
+
+Die Suchansicht zeigt Nutzerfrage und Markdown-Antwort chatähnlich in einem
+präsenten, während der Trefferansicht sichtbaren Bereich. Quellenlinks öffnen
+die richtige PDF-Seite. Folgefragen verwenden nur einen auf sechs Schritte
+begrenzten Sitzungskontext; ein dauerhaftes Chatgedächtnis gibt es nicht.
 
 ## Updates
 
