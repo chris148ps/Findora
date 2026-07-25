@@ -86,6 +86,12 @@ public actor SQLiteDatabase {
                             THEN processing_jobs.state
                             ELSE 'discovered'
                         END,
+                        ocr_engine = CASE
+                            WHEN processing_jobs.discovered_size = excluded.discovered_size
+                                 AND processing_jobs.discovered_modified_at = excluded.discovered_modified_at
+                            THEN processing_jobs.ocr_engine
+                            ELSE NULL
+                        END,
                         last_error = excluded.last_error,
                         updated_at = excluded.updated_at
                     """,
@@ -202,12 +208,18 @@ public actor SQLiteDatabase {
         }
     }
 
-    public func updateJob(path: String, state: ProcessingState, error: String? = nil) throws {
+    public func updateJob(
+        path: String,
+        state: ProcessingState,
+        error: String? = nil,
+        ocrEngine: OCREngine? = nil
+    ) throws {
         try execute(
             """
             UPDATE processing_jobs
             SET state = ?, last_error = ?, attempt_count = attempt_count + ?,
                 last_stage = CASE WHEN ? = 'failed' THEN last_stage ELSE ? END,
+                ocr_engine = COALESCE(?, ocr_engine),
                 updated_at = ?
             WHERE job_key = ?
             """,
@@ -217,6 +229,7 @@ public actor SQLiteDatabase {
                 .integer(state == .failed ? 1 : 0),
                 .text(state.rawValue),
                 .text(state.rawValue),
+                ocrEngine.map { .text($0.rawValue) } ?? .null,
                 .real(Date().timeIntervalSince1970),
                 .text(path)
             ]
@@ -706,7 +719,7 @@ public actor SQLiteDatabase {
 
         if let current = try query(
             """
-            SELECT state, file_name
+            SELECT state, file_name, ocr_engine
             FROM processing_jobs
             WHERE state IN (
                 'discovered', 'waitingForStability', 'extracting',
@@ -724,6 +737,9 @@ public actor SQLiteDatabase {
             """
         ).first {
             result.currentFile = current.string("file_name")
+            result.currentOCREngine = current.string("ocr_engine")
+                .flatMap(OCREngine.init(rawValue:))?
+                .displayName
             result.currentStep = result.isPaused
                 ? "Pausiert"
                 : current.string("state")
@@ -1136,6 +1152,17 @@ public actor SQLiteDatabase {
                 )
             }
         }
+        if current < 6 {
+            try transaction {
+                for statement in Self.migration6 {
+                    try execute(statement)
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
     }
 
     private func ensureOpen() throws {
@@ -1525,6 +1552,10 @@ public actor SQLiteDatabase {
             ELSE state
         END
         """
+    ]
+
+    private static let migration6 = [
+        "ALTER TABLE processing_jobs ADD COLUMN ocr_engine TEXT"
     ]
 }
 

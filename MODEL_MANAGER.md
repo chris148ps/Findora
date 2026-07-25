@@ -54,6 +54,8 @@ erst für eine Antwort geladen und nach Inaktivität, bei Modellwechsel oder
 kritischem Speicherdruck entladen. Das Embeddingmodell erzeugt den lokalen
 Suchindex; sein Wechsel erfordert deshalb die beschriebene Neuindexierung.
 
-Eine zukünftige lokale Vision-OCR kann das vorbereitete
-`VisionOCRProviding`-Protokoll implementieren. Der aktuelle Build lädt,
-aktiviert und verwendet kein Vision-Modell.
+Apple Vision OCR ist ein systemeigener `OCRProvider` und benötigt weder
+Modellkatalog noch Download. Es bleibt vollständig von Embedding- und
+Antwortmodellen getrennt. Weitere OCR-Engines können dieselbe
+Provider-Schnittstelle implementieren, ohne Modellverwaltung, Datenbank,
+Indexierung oder Suche anzupassen.

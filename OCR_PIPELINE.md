@@ -1,6 +1,22 @@
 # OCR-Pipeline
 
-## Standardkonfiguration
+## Austauschbare OCR-Provider
+
+`OCRProvider` liefert unabhängig von der Engine dasselbe `OCRResult`: Seiten,
+Text, Sprache, Qualitätswerte, Laufzeit, Engine und Diagnosen. Chunking,
+Embeddings, Suche und SQLite kennen keine enginespezifische Verarbeitung.
+
+Im Standard `Automatisch` wird auf macOS zuerst `VisionOCRProvider` verwendet.
+Scheitert Vision, protokolliert `OCRProviderRouter` den Fehler und versucht
+`OCRmyPDFProcessor`. Bei expliziter Vision-Auswahl findet kein Fallback statt.
+Auf Plattformen ohne Vision führt der Automatikpfad direkt zu Tesseract.
+
+Apple Vision rendert die PDF seitenweise lokal, erkennt Text und
+Konfidenzwerte über das Vision Framework und schreibt nur das vereinheitlichte
+Ergebnis in SQLite. Es entsteht keine temporäre OCR-PDF und das Original wird
+nie verändert.
+
+## OCRmyPDF-Konfiguration
 
 Für OCRmyPDF 17.8.1:
 
@@ -25,9 +41,17 @@ PDF/A ist eine ausdrückliche Nutzeroption. Optimierung 1 ist nur nach
 Nutzerwahl aktiv; Optimierung 2/3 wird als potenziell verlustbehaftet
 gekennzeichnet.
 
-## Abhängigkeitsprüfung und Installation
+## Bedarfsgesteuerte Abhängigkeitsprüfung und Installation
 
-Beim Start werden ausführbare Dateien in dieser Reihenfolge gesucht:
+Beim ersten Start und im nicht-destruktiven Automatik-/Vision-Modus prüft die
+App weder Homebrew noch OCRmyPDF, Tesseract oder Poppler. Die Prüfung beginnt
+erst bei:
+
+- ausdrücklicher Auswahl `Tesseract + OCRmyPDF`;
+- dauerhaftem OCR-Modus; oder
+- einem tatsächlichen Vision-Fehler im Automatikmodus.
+
+Dann werden ausführbare Dateien in dieser Reihenfolge gesucht:
 
 1. `/opt/homebrew/bin`;
 2. `/usr/local/bin`;
@@ -48,7 +72,7 @@ Für jeden Unterprozess setzt die App denselben expliziten, protokollierten
 `PATH`. Deshalb funktioniert die Toolchain auch beim Finder-Start. Erst nach
 erfolgreichen Versions- und Sprachtests wird „Bereit“ angezeigt.
 
-Nach Nutzerbestätigung darf die App das gefundene Homebrew-Executable direkt
+Erst nach Nutzerbestätigung darf die App das gefundene Homebrew-Executable direkt
 mit den festen Argumenten `install ocrmypdf tesseract-lang poppler` starten.
 Benutzereingaben gelangen nicht in Argumente; eine Shell und `sudo` werden
 nicht verwendet. Fehlt Homebrew, wird nur die offizielle Installationsanleitung
@@ -91,9 +115,11 @@ identische Kopien und reine Metadatenänderungen verwenden vorhandene Seiten,
 Chunks und Embeddings wieder. Ändert sich der Inhalt, wird der neue Hash
 verarbeitet und verwaiste alte Indexdaten werden kontrolliert entfernt.
 
-Im Standardmodus wird die validierte OCR-Ausgabe nur gelesen und anschließend
-gelöscht. Seiten und Index entstehen aus dem in SQLite gespeicherten OCR-Text.
-Im optionalen persistenten Modus gilt zusätzlich der folgende
+Im Standardmodus liefert Vision den erkannten Text direkt; bei Tesseract wird
+die validierte OCR-Ausgabe nur gelesen und anschließend gelöscht. Seiten und
+Index entstehen aus demselben in SQLite gespeicherten OCR-Text. Im optionalen
+persistenten Modus wird unabhängig von der gewählten Engine immer OCRmyPDF
+verwendet und es gilt zusätzlich der folgende
 Ersetzungsablauf:
 
 1. Eingabe-Metadaten, SHA-256 und Seitenzahl erfassen.
@@ -120,12 +146,14 @@ des gewählten Ordners und nur nach Alters-/Jobabgleich entfernt.
 
 ## Qualitätsprüfung
 
-Für jede Seite werden Tesseract-TSV-Konfidenz, Zeichen- und Wortzahl,
+Für jede Seite werden Engine-Konfidenz, Zeichen- und Wortzahl,
 ungewöhnliche Zeichen, verdächtig beschädigte Wörter, erkannte Sprache,
 Leerseitenindikator und Bild-/Text-Verhältnis gespeichert. Daraus entsteht „Gut“,
-„Prüfen“ oder „Wahrscheinlich fehlgeschlagen“. Bei wahrscheinlich
+„Prüfen“ oder „Wahrscheinlich fehlgeschlagen“. Tesseract liefert seine
+Konfidenz über TSV, Vision über erkannte Textbeobachtungen; beide durchlaufen
+denselben `OCRQualityEvaluator`. Bei wahrscheinlich
 fehlgeschlagenen Seiten ist genau ein zweiter Versuch mit Rotation,
-Begradigung und 300-dpi-Übersampling zulässig; nur die besser bewertete,
+Begradigung und 300-dpi-Übersampling im Tesseract-Pfad zulässig; nur die besser bewertete,
 vollständig validierte Variante wird verwendet.
 
 ## Parallelität

@@ -276,9 +276,9 @@ fertig, wenn nur ein UI-Platzhalter ohne funktionalen Dienst existiert.
 
 ## Risiken
 
-- **Sandbox und Homebrew:** Eine sandboxed App kann externe Programme nicht
-  beliebig ausführen. Die interne Entwicklungsdistribution verwendet daher
-  zunächst Homebrew-OCR mit dokumentierter Einschränkung. Für eine
+- **Sandbox und Homebrew:** Apple Vision benötigt keine externen Prozesse.
+  Nur der ausdrücklich gewählte Tesseract- oder persistente OCR-Pfad verwendet
+  Homebrew-Werkzeuge nach Nutzerbestätigung. Für eine
   Mac-App-Store-Distribution müssen OCR-Komponenten gebündelt oder die
   Distributionsstrategie angepasst werden.
 - **OCR-Lizenzen:** OCRmyPDF selbst ist MPL-2.0; mitgelieferte Komponenten
@@ -304,4 +304,3 @@ fertig, wenn nur ein UI-Platzhalter ohne funktionalen Dienst existiert.
 - [Apple: App Sandbox file access](https://developer.apple.com/documentation/security/accessing-files-from-the-macos-app-sandbox)
 - [Apple: SMAppService](https://developer.apple.com/documentation/servicemanagement/smappservice)
 - [OCRmyPDF 17.8.1 cookbook](https://ocrmypdf.readthedocs.io/en/latest/cookbook.html)
-

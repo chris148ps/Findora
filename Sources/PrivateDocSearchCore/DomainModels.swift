@@ -159,6 +159,7 @@ public struct DocumentStatistics: Equatable, Sendable {
     public var totalJobs = 0
     public var currentStep: String?
     public var currentFile: String?
+    public var currentOCREngine: String?
     public var isPaused = false
     public var lastSuccessfulStep: String?
     public var lastProcessingError: String?

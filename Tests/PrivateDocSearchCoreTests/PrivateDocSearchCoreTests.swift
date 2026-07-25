@@ -219,9 +219,158 @@ func nonDestructiveOCRKeepsOriginalAndReturnsRecognizedPages() async throws {
     #expect(result.pageCount == 1)
     #expect(try Data(contentsOf: pdf) == before)
     #expect(result.persistedToOriginal == false)
+    #expect(result.engine == .tesseract)
     #expect(result.pages.first?.text.uppercased().contains("SYNTHETIC") == true)
     #expect(result.pageQualities.first?.wordCount ?? 0 > 0)
     #expect(FileManager.default.fileExists(atPath: pdf.path))
+}
+
+@Test(.timeLimit(.minutes(1)))
+func appleVisionOCRKeepsOriginalAndReturnsUnifiedQualityResult() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pdf = root.appending(path: "vision-scan.pdf")
+    try createImagePDF(at: pdf, text: "APPLE VISION TEST 24680")
+    let before = try Data(contentsOf: pdf)
+
+    let result = try await VisionOCRProvider().process(
+        discoveredPDF(pdf),
+        configuration: OCRConfiguration(
+            languages: ["eng"],
+            rotatePages: false,
+            deskew: false,
+            engineSelection: .appleVision
+        )
+    )
+
+    #expect(result.engine == .appleVision)
+    #expect(!result.persistedToOriginal)
+    #expect(result.pageCount == 1)
+    #expect(result.pages.first?.text.uppercased().contains("VISION") == true)
+    #expect(result.pageQualities.first?.meanConfidence != nil)
+    #expect(result.pageQualities.first?.recognizedLanguage == "eng")
+    #expect(try Data(contentsOf: pdf) == before)
+}
+
+@Test
+func oldOCRConfigurationDefaultsToAutomaticEngine() throws {
+    let data = Data(
+        """
+        {
+          "isEnabled": true,
+          "languages": ["deu", "eng"],
+          "persistenceMode": "nonDestructive"
+        }
+        """.utf8
+    )
+    let configuration = try JSONDecoder().decode(OCRConfiguration.self, from: data)
+    #expect(configuration.engineSelection == .automatic)
+    #expect(!configuration.requiresTesseractComponents)
+    #expect(configuration.initiallyReportedEngine == .appleVision)
+}
+
+@Test
+func automaticOCRUsesVisionWithoutTesseractAndFallsBackWhenNeeded() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pdf = root.appending(path: "router.pdf")
+    try createImagePDF(at: pdf, text: "ROUTER TEST")
+    let file = discoveredPDF(pdf)
+    let probe = OCRProviderProbe()
+    let vision = StubOCRProvider(
+        engine: .appleVision,
+        behavior: .success("IDENTISCHER SUCHTEXT"),
+        probe: probe
+    )
+    let tesseract = StubOCRProvider(
+        engine: .tesseract,
+        behavior: .success("IDENTISCHER SUCHTEXT"),
+        probe: probe
+    )
+
+    let dependencyCheckProbe = SynchronousCallProbe()
+    let visionOnly = OCRProviderRouter(
+        visionProvider: vision,
+        tesseractProviderFactory: {
+            dependencyCheckProbe.record()
+            return tesseract
+        }
+    )
+    let first = try await visionOnly.process(
+        file,
+        configuration: OCRConfiguration(engineSelection: .automatic)
+    )
+    #expect(first.engine == .appleVision)
+    #expect(await probe.calls(for: .appleVision) == 1)
+    #expect(await probe.calls(for: .tesseract) == 0)
+    #expect(dependencyCheckProbe.count == 0)
+
+    let failingVision = StubOCRProvider(
+        engine: .appleVision,
+        behavior: .failure("synthetischer Vision-Fehler"),
+        probe: probe
+    )
+    let automatic = OCRProviderRouter(
+        visionProvider: failingVision,
+        tesseractProvider: tesseract
+    )
+    let engineChanges = OCREngineRecorder()
+    let fallback = try await automatic.process(
+        file,
+        configuration: OCRConfiguration(engineSelection: .automatic)
+    ) { engine in
+        await engineChanges.append(engine)
+    }
+    #expect(fallback.engine == .tesseract)
+    #expect(await engineChanges.values == [.appleVision, .tesseract])
+    #expect(fallback.messages.first?.contains("Vision") == true)
+    #expect(await probe.calls(for: .tesseract) == 1)
+}
+
+@Test
+func persistentOCRAlwaysRoutesToTesseract() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pdf = root.appending(path: "persistent-router.pdf")
+    try createImagePDF(at: pdf, text: "PERSISTENT ROUTER")
+    let probe = OCRProviderProbe()
+    let router = OCRProviderRouter(
+        visionProvider: StubOCRProvider(
+            engine: .appleVision,
+            behavior: .success("VISION"),
+            probe: probe
+        ),
+        tesseractProvider: StubOCRProvider(
+            engine: .tesseract,
+            behavior: .success("TESSERACT"),
+            probe: probe
+        )
+    )
+
+    let result = try await router.process(
+        discoveredPDF(pdf),
+        configuration: OCRConfiguration(
+            persistenceMode: .persistent,
+            engineSelection: .appleVision
+        )
+    )
+
+    #expect(result.engine == .tesseract)
+    #expect(await probe.calls(for: .appleVision) == 0)
+    #expect(await probe.calls(for: .tesseract) == 1)
+}
+
+@Test
+func OCRProvidersProduceEquivalentSearchResultsAndDatabaseShape() async throws {
+    let vision = try await indexedSyntheticOCRResult(engine: .appleVision)
+    let tesseract = try await indexedSyntheticOCRResult(engine: .tesseract)
+
+    #expect(vision.resultCount == tesseract.resultCount)
+    #expect(vision.excerpt == tesseract.excerpt)
+    #expect(vision.pageNumber == tesseract.pageNumber)
+    #expect(vision.statistics.totalChunks == tesseract.statistics.totalChunks)
+    #expect(vision.statistics.embeddedChunks == tesseract.statistics.embeddedChunks)
+    #expect(vision.statistics.ocrProcessedPDFs == tesseract.statistics.ocrProcessedPDFs)
 }
 
 @Test(.timeLimit(.minutes(1)))
@@ -245,6 +394,7 @@ func persistentOCRAtomicallyAddsValidatedTextLayer() async throws {
     )
 
     #expect(result.persistedToOriginal)
+    #expect(result.engine == .tesseract)
     #expect(try Data(contentsOf: pdf) != before)
     #expect(
         try PDFKitTextExtractor().extractPages(from: pdf)
@@ -654,7 +804,13 @@ func persistentStatusEventsAndSnapshotsTrackLiveProcessing() async throws {
     try createTextPDF(at: waiting, pages: ["Noch nicht verarbeitet"])
     files = try await scanner.scan(root: root)
     try await database.saveScan(files: files, root: root)
-    try await database.updateJob(path: failing.path, state: .ocrRunning)
+    try await database.updateJob(
+        path: failing.path,
+        state: .ocrRunning,
+        ocrEngine: .appleVision
+    )
+    status = try await database.statistics()
+    #expect(status.currentOCREngine == OCREngine.appleVision.displayName)
     try await database.updateJob(
         path: failing.path,
         state: .failed,
@@ -857,6 +1013,131 @@ private actor OCRConcurrencyProbe {
     func end() {
         active -= 1
     }
+}
+
+private enum StubOCRBehavior: Sendable {
+    case success(String)
+    case failure(String)
+}
+
+private actor OCRProviderProbe {
+    private var callCounts: [OCREngine: Int] = [:]
+
+    func record(_ engine: OCREngine) {
+        callCounts[engine, default: 0] += 1
+    }
+
+    func calls(for engine: OCREngine) -> Int {
+        callCounts[engine, default: 0]
+    }
+}
+
+private actor OCREngineRecorder {
+    private(set) var values: [OCREngine] = []
+
+    func append(_ engine: OCREngine) {
+        values.append(engine)
+    }
+}
+
+private final class SynchronousCallProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedCount = 0
+
+    var count: Int {
+        lock.withLock { storedCount }
+    }
+
+    func record() {
+        lock.withLock {
+            storedCount += 1
+        }
+    }
+}
+
+private struct StubOCRProvider: OCRProvider {
+    let engine: OCREngine
+    let behavior: StubOCRBehavior
+    let probe: OCRProviderProbe
+
+    func process(
+        _ file: DiscoveredPDF,
+        configuration: OCRConfiguration
+    ) async throws -> OCRResult {
+        await probe.record(engine)
+        switch behavior {
+        case .failure(let message):
+            throw PrivateDocSearchError.processFailed(message)
+        case .success(let text):
+            let page = ExtractedPage(
+                pageNumber: 1,
+                text: String(repeating: "\(text) ", count: 20)
+            )
+            let hash = try SHA256Hasher().hash(fileAt: file.url)
+            return OCRResult(
+                inputHash: hash,
+                outputHash: hash,
+                pageCount: 1,
+                pages: [page],
+                persistedToOriginal: configuration.persistenceMode == .persistent,
+                pageQualities: OCRQualityEvaluator().evaluate(
+                    pages: [page],
+                    configuredLanguages: configuration.languages,
+                    meanConfidences: [1: 92]
+                ),
+                engine: engine,
+                duration: .milliseconds(1),
+                completedAt: .now
+            )
+        }
+    }
+}
+
+private func indexedSyntheticOCRResult(
+    engine: OCREngine
+) async throws -> (
+    resultCount: Int,
+    excerpt: String?,
+    pageNumber: Int?,
+    statistics: DocumentStatistics
+) {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let pdf = root.appending(path: "Engine-\(engine.rawValue).pdf")
+    try createImagePDF(at: pdf, text: "ENGINE SEARCH")
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    let embedder = TokenHashEmbedding(dimensions: 64)
+    let processor = DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: embedder,
+        ocrProcessor: StubOCRProvider(
+            engine: engine,
+            behavior: .success("GEMEINSAMER ENGINE SUCHBEGRIFF"),
+            probe: OCRProviderProbe()
+        )
+    )
+    await processor.processPending(
+        ocrConfiguration: OCRConfiguration(
+            languages: ["deu"],
+            engineSelection: engine == .appleVision ? .appleVision : .tesseractOCRmyPDF
+        )
+    ) { _ in }
+    let results = try await HybridSearchService(database: database, embedder: embedder)
+        .search("GEMEINSAMER ENGINE SUCHBEGRIFF")
+    return (
+        results.count,
+        results.first?.excerpt,
+        results.first?.pageNumber,
+        try await database.statistics()
+    )
 }
 
 @MainActor

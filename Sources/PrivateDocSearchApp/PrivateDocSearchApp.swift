@@ -71,6 +71,7 @@ final class AppState {
     var logEntries: [(Date, String, String, String?)] = []
     var ocrConfiguration = OCRConfiguration.default
     var ocrDependencies: OCRDependencies
+    var ocrDependenciesChecked = false
     var scanIntervalMinutes = 5
     var showExperimentalModels = false
     var llmIdleMinutes = 10
@@ -119,11 +120,17 @@ final class AppState {
             self.modelManager = LocalModelManager(catalog: catalog, paths: paths)
             self.hardwareProfile = HardwareProfile.current(storageURL: paths.applicationSupport)
             let embedder = TokenHashEmbedding()
-            let dependencies = OCRDependencyChecker().check(runFunctionalSelfTest: false)
-            self.ocrDependencies = dependencies
+            self.ocrDependencies = .notChecked
             let ocrFactory: @Sendable () -> any OCRProcessing = {
-                OCRmyPDFProcessor(
-                    dependencies: OCRDependencyChecker().check(runFunctionalSelfTest: false)
+                OCRProviderRouter(
+                    visionProvider: VisionOCRProvider(),
+                    tesseractProviderFactory: {
+                        OCRmyPDFProcessor(
+                            dependencies: OCRDependencyChecker().check(
+                                runFunctionalSelfTest: false
+                            )
+                        )
+                    }
                 )
             }
             self.processor = DocumentProcessor(
@@ -152,7 +159,9 @@ final class AppState {
             await startDocumentStatusMonitoring()
             await runMemoryPressureDiagnosticIfRequested()
             await loadSettings()
-            await refreshOCRComponents()
+            if ocrConfiguration.requiresTesseractComponents {
+                await refreshOCRComponents()
+            }
             launchAtLogin = SMAppService.mainApp.status == .enabled
             let documentAccessDisabled =
                 ProcessInfo.processInfo.environment["PRIVATEDOCSEARCH_DISABLE_DOCUMENT_ACCESS"] == "1"
@@ -308,6 +317,7 @@ final class AppState {
             OCRDependencyChecker().check()
         }.value
         ocrDependencies = dependencies
+        ocrDependenciesChecked = true
         let paths = [
             dependencies.ocrMyPDF,
             dependencies.tesseract,
@@ -327,6 +337,10 @@ final class AppState {
 
     func installMissingOCRComponents() {
         guard !isInstallingOCRComponents else { return }
+        guard ocrConfiguration.requiresTesseractComponents else {
+            ocrInstallationMessage = "Für Apple Vision werden keine externen OCR-Komponenten benötigt."
+            return
+        }
         isInstallingOCRComponents = true
         ocrInstallationMessage = "OCR-Komponenten werden installiert …"
         let dependencies = ocrDependencies
@@ -825,12 +839,31 @@ final class AppState {
             database: database,
             embedder: embedder,
             ocrProcessorFactory: {
-                OCRmyPDFProcessor(
-                    dependencies: OCRDependencyChecker().check(runFunctionalSelfTest: false)
+                OCRProviderRouter(
+                    visionProvider: VisionOCRProvider(),
+                    tesseractProviderFactory: {
+                        OCRmyPDFProcessor(
+                            dependencies: OCRDependencyChecker().check(
+                                runFunctionalSelfTest: false
+                            )
+                        )
+                    }
                 )
             },
             fileLogger: fileLogger
         )
+    }
+
+    func ocrRequirementsChanged() {
+        ocrInstallationMessage = nil
+        guard ocrConfiguration.requiresTesseractComponents else {
+            ocrDependencies = .notChecked
+            ocrDependenciesChecked = false
+            return
+        }
+        Task {
+            await refreshOCRComponents()
+        }
     }
 
     private func startMemoryPressureMonitoring() {
@@ -1245,6 +1278,10 @@ struct StatusView: View {
                                     Text(state.statistics.currentFile ?? "—")
                                 }
                                 GridRow {
+                                    Text("OCR-Engine").foregroundStyle(.secondary)
+                                    Text(state.statistics.currentOCREngine ?? "—")
+                                }
+                                GridRow {
                                     Text("Zustand").foregroundStyle(.secondary)
                                     Text(
                                         state.statistics.isPaused
@@ -1306,44 +1343,74 @@ struct OCRView: View {
     var body: some View {
         @Bindable var state = state
         Form {
-            Section("OCR-Komponenten") {
-                componentRow("OCRmyPDF", available: state.ocrDependencies.ocrMyPDF != nil)
-                componentRow("Tesseract", available: state.ocrDependencies.tesseract != nil)
-                componentRow(
-                    "Deutsche Sprachdaten",
-                    available: state.ocrDependencies.installedLanguages.contains("deu")
-                )
-                componentRow(
-                    "Poppler",
-                    available: state.ocrDependencies.pdfInfo != nil
-                        && state.ocrDependencies.pdfText != nil
-                )
+            Section("OCR-Engine") {
+                Picker("OCR-Engine", selection: $state.ocrConfiguration.engineSelection) {
+                    ForEach(OCREngineSelection.allCases, id: \.self) {
+                        Text($0.displayName).tag($0)
+                    }
+                }
+                .pickerStyle(.radioGroup)
                 LabeledContent(
-                    "Verfügbarkeit",
-                    value: state.ocrDependencies.isReady ? "Bereit" : "Unvollständig"
+                    "Apple Vision",
+                    value: VisionOCRProvider.isAvailable ? "Verfügbar" : "Nicht verfügbar"
                 )
-                ForEach(state.ocrDependencies.messages, id: \.self) { Text($0).foregroundStyle(.orange) }
-                if state.ocrDependencies.homebrew != nil, !state.ocrDependencies.isReady {
-                    Button("Fehlende Komponenten installieren") {
-                        confirmsInstallation = true
+                Text(
+                    state.ocrConfiguration.engineSelection == .automatic
+                        ? "Apple Vision wird auf macOS bevorzugt. Nur wenn Vision fehlschlägt, versucht die App automatisch Tesseract."
+                        : state.ocrConfiguration.engineSelection == .appleVision
+                            ? "Apple Vision arbeitet vollständig lokal und benötigt weder Homebrew noch externe OCR-Komponenten."
+                            : "OCRmyPDF und Tesseract werden über zentral aufgelöste lokale Werkzeuge ausgeführt."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            if state.ocrConfiguration.requiresTesseractComponents {
+                Section("Tesseract-Komponenten") {
+                    componentRow("OCRmyPDF", available: state.ocrDependencies.ocrMyPDF != nil)
+                    componentRow("Tesseract", available: state.ocrDependencies.tesseract != nil)
+                    componentRow(
+                        "Deutsche Sprachdaten",
+                        available: state.ocrDependencies.installedLanguages.contains("deu")
+                    )
+                    componentRow(
+                        "Poppler",
+                        available: state.ocrDependencies.pdfInfo != nil
+                            && state.ocrDependencies.pdfText != nil
+                    )
+                    LabeledContent(
+                        "Verfügbarkeit",
+                        value: state.ocrDependenciesChecked
+                            ? state.ocrDependencies.isReady ? "Bereit" : "Unvollständig"
+                            : "Noch nicht geprüft"
+                    )
+                    ForEach(state.ocrDependencies.messages, id: \.self) {
+                        Text($0).foregroundStyle(.orange)
                     }
-                    .disabled(state.isInstallingOCRComponents)
-                } else if state.ocrDependencies.homebrew == nil {
-                    Text("Homebrew fehlt. Installiere es zuerst nach der offiziellen Anleitung von brew.sh.")
-                        .foregroundStyle(.secondary)
-                    Button("Offiziellen Installationsbefehl kopieren") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(
-                            "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
-                            forType: .string
-                        )
+                    if state.ocrDependenciesChecked,
+                       state.ocrDependencies.homebrew != nil,
+                       !state.ocrDependencies.isReady {
+                        Button("Fehlende Komponenten installieren") {
+                            confirmsInstallation = true
+                        }
+                        .disabled(state.isInstallingOCRComponents)
+                    } else if state.ocrDependenciesChecked,
+                              state.ocrDependencies.homebrew == nil {
+                        Text("Homebrew fehlt. Installiere es zuerst nach der offiziellen Anleitung von brew.sh.")
+                            .foregroundStyle(.secondary)
+                        Button("Offiziellen Installationsbefehl kopieren") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(
+                                "/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"",
+                                forType: .string
+                            )
+                        }
                     }
-                }
-                if let message = state.ocrInstallationMessage {
-                    Text(message).foregroundStyle(.secondary)
-                }
-                Button("Erneut prüfen") {
-                    Task { await state.refreshOCRComponents() }
+                    if let message = state.ocrInstallationMessage {
+                        Text(message).foregroundStyle(.secondary)
+                    }
+                    Button("Erneut prüfen") {
+                        Task { await state.refreshOCRComponents() }
+                    }
                 }
             }
             Section("Verarbeitung") {
@@ -1360,6 +1427,18 @@ struct OCRView: View {
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                if state.ocrConfiguration.persistenceMode == .persistent,
+                   state.ocrConfiguration.engineSelection != .tesseractOCRmyPDF {
+                    Text("Für dauerhaft durchsuchbare PDFs wird automatisch OCRmyPDF verwendet.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    if !state.ocrDependencies.isReady {
+                        Button("Jetzt installieren") {
+                            confirmsInstallation = true
+                        }
+                        .disabled(state.isInstallingOCRComponents)
+                    }
+                }
                 Toggle("Seiten automatisch drehen", isOn: $state.ocrConfiguration.rotatePages)
                 Toggle("Seiten begradigen", isOn: $state.ocrConfiguration.deskew)
                 Toggle("Bild vor OCR bereinigen", isOn: $state.ocrConfiguration.clean)
@@ -1380,7 +1459,7 @@ struct OCRView: View {
                 Text("Auf Macs mit 8 GB ist 1 empfohlen. Mehr parallele Dateien erhöhen Tempo und Speicherbedarf, nicht die OCR-Qualität.")
                     .font(.caption).foregroundStyle(.secondary)
                 Menu("Sprachen: \(state.ocrConfiguration.languages.joined(separator: " + "))") {
-                    ForEach(state.ocrDependencies.installedLanguages, id: \.self) { language in
+                    ForEach(availableLanguages, id: \.self) { language in
                         Button {
                             toggleLanguage(language)
                         } label: {
@@ -1402,6 +1481,12 @@ struct OCRView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("OCR")
+        .onChange(of: state.ocrConfiguration.engineSelection) {
+            state.ocrRequirementsChanged()
+        }
+        .onChange(of: state.ocrConfiguration.persistenceMode) {
+            state.ocrRequirementsChanged()
+        }
         .confirmationDialog(
             "OCR-Komponenten mit Homebrew installieren?",
             isPresented: $confirmsInstallation
@@ -1429,6 +1514,10 @@ struct OCRView: View {
             state.ocrConfiguration.languages.append(language)
             state.ocrConfiguration.languages.sort()
         }
+    }
+
+    private var availableLanguages: [String] {
+        Array(Set(["deu", "eng"] + state.ocrDependencies.installedLanguages)).sorted()
     }
 }
 

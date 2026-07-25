@@ -31,7 +31,8 @@ let package = Package(
             resources: [.process("Resources")],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
-                .linkedFramework("PDFKit")
+                .linkedFramework("PDFKit"),
+                .linkedFramework("Vision")
             ]
         ),
         .target(

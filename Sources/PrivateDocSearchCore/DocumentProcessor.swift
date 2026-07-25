@@ -192,7 +192,11 @@ public actor DocumentProcessor {
             guard let selectedOCRProcessor = ocrProcessorFactory?() ?? ocrProcessor else {
                 throw PrivateDocSearchError.dependencyMissing("OCR-Verarbeitung ist nicht verfügbar.")
             }
-            try await database.updateJob(path: file.id, state: .ocrRunning)
+            try await database.updateJob(
+                path: file.id,
+                state: .ocrRunning,
+                ocrEngine: ocrConfiguration.initiallyReportedEngine
+            )
             try? await fileLogger?.log(
                 .info,
                 category: "OCR",
@@ -201,7 +205,21 @@ public actor DocumentProcessor {
                     : "Persistente OCR wurde gestartet.",
                 path: stable.url.path
             )
-            let result = try await selectedOCRProcessor.process(stable, configuration: ocrConfiguration)
+            let result = try await selectedOCRProcessor.process(
+                stable,
+                configuration: ocrConfiguration
+            ) { [database] engine in
+                try? await database.updateJob(
+                    path: file.id,
+                    state: .ocrRunning,
+                    ocrEngine: engine
+                )
+            }
+            try await database.updateJob(
+                path: file.id,
+                state: .ocrRunning,
+                ocrEngine: result.engine
+            )
             ocrPerformed = true
             pages = result.pages
             pageQualities = result.pageQualities
@@ -225,11 +243,19 @@ public actor DocumentProcessor {
             try? await fileLogger?.log(
                 .info,
                 category: "OCR",
-                message: result.persistedToOriginal
+                message: "\(result.engine.displayName): " + (result.persistedToOriginal
                     ? "OCR wurde validiert und atomar in die PDF übernommen."
-                    : "OCR wurde validiert; Text wird nur in der Datenbank gespeichert.",
+                    : "OCR wurde validiert; Text wird nur in der Datenbank gespeichert."),
                 path: stable.url.path
             )
+            for message in result.messages {
+                try? await fileLogger?.log(
+                    .warning,
+                    category: "OCR-Fallback",
+                    message: message,
+                    path: stable.url.path
+                )
+            }
             let good = result.pageQualities.filter { $0.status == .good }.count
             let review = result.pageQualities.filter { $0.status == .review }.count
             let failed = result.pageQualities.filter { $0.status == .likelyFailed }.count

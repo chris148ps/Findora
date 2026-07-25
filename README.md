@@ -10,17 +10,17 @@ externer KI-Server oder eine Cloud-KI benötigt.
 - Apple-Silicon-Mac mit mindestens 8 GB Unified Memory
 - macOS 14 oder neuer
 - Xcode 26 mit installierter Metal-Toolchain
-- für die interne Version: OCRmyPDF über Homebrew
 
 ```bash
 xcodebuild -downloadComponent MetalToolchain
-brew install ocrmypdf tesseract-lang poppler
 ```
 
-PrivateDocSearch erkennt Homebrew-Werkzeuge auch bei einem Finder-Start ohne
-Terminal-`PATH`. Fehlende OCR-Komponenten können nach ausdrücklicher
-Bestätigung über Homebrew installiert werden; die App verwendet dabei nur
-feste Paketnamen und weder eine Shell noch `sudo`.
+Apple Vision ist die standardmäßige OCR-Engine und benötigt keine externe
+Installation. Nur für ausdrücklich gewähltes Tesseract oder dauerhaft mit
+Textschicht versehene PDFs werden OCRmyPDF, Tesseract und Poppler geprüft.
+Fehlende Komponenten installiert die App ausschließlich nach ausdrücklicher
+Bestätigung; sie verwendet feste Homebrew-Paketnamen und weder Shell noch
+`sudo`.
 
 ## Build
 
@@ -42,8 +42,8 @@ Für die interne, ad-hoc signierte Version:
 3. Falls macOS die interne Signatur beanstandet, im Finder mit Rechtsklick
    **Öffnen** wählen.
 
-Diese interne Version ist nicht notarisiert und setzt OCRmyPDF über Homebrew
-voraus. Vor einer externen Verteilung sind Developer-ID-Signierung,
+Diese interne Version ist nicht notarisiert. Vor einer externen Verteilung
+sind Developer-ID-Signierung,
 Notarisierung und die Lizenz-/Bundle-Strategie für OCR-Abhängigkeiten separat
 abzuschließen.
 
@@ -61,16 +61,17 @@ Arbeitsdateien werden nicht verfolgt. Der Ordner wird rekursiv durchsucht.
 ## OCR
 
 PrivateDocSearch prüft jede PDF seitenweise. Eine bereits brauchbare
-Textschicht bleibt unverändert. Für Scan-PDFs läuft OCRmyPDF standardmäßig mit
-Deutsch und Englisch, Rotation, Begradigung, ohne PDF/A-Konvertierung und ohne
-Bildoptimierung.
+Textschicht bleibt unverändert. Im empfohlenen Automatikmodus verwendet macOS
+zuerst Apple Vision. Scheitert Vision, versucht die App automatisch Tesseract.
 
-Standard ist die nicht-destruktive OCR: Die OCR-PDF ist nur temporär, Text,
-Seiteninformationen und Qualitätswerte werden in SQLite gespeichert, und das
-Original bleibt unverändert. Optional kann der Nutzer die validierte OCR-PDF
-atomar am selben Ort übernehmen lassen. Bei jedem Fehler bleibt das Original
-unverändert. Ein Moduswechsel verarbeitet vorhandene Dokumente nicht
-automatisch neu.
+Standard ist die nicht-destruktive OCR: Vision liefert den Text ohne
+temporäre OCR-PDF direkt an die gemeinsame Qualitäts- und Indexpipeline.
+Tesseract verwendet eine temporäre OCR-PDF, die anschließend gelöscht wird.
+Text, Seiteninformationen und Qualitätswerte landen in beiden Fällen im
+gleichen SQLite-Schema; das Original bleibt unverändert. Optional kann der
+Nutzer die validierte OCRmyPDF-Ausgabe atomar am selben Ort übernehmen lassen.
+Bei jedem Fehler bleibt das Original unverändert. Ein Modus- oder
+Engine-Wechsel verarbeitet bekannte Dokumente nicht automatisch neu.
 
 Unter **OCR** lassen sich Sprachen und konservative Optionen ändern. OCR und
 Indexierung können pausiert und fehlgeschlagene Jobs erneut eingeplant werden.
@@ -142,8 +143,9 @@ pdfinfo -v
 xcodebuild -showComponent MetalToolchain -json
 ```
 
-Bei fehlender Ordnerberechtigung den Stammordner erneut auswählen. Bei
-fehlenden OCR-Sprachen `tesseract-lang` installieren. Weitere Fälle stehen in
+Die externen Prüfkommandos sind nur für Tesseract/OCRmyPDF relevant. Bei
+fehlender Ordnerberechtigung den Stammordner erneut auswählen. Bei fehlenden
+OCR-Sprachen `tesseract-lang` installieren. Weitere Fälle stehen in
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ## Deinstallation

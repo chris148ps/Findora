@@ -14,6 +14,32 @@ public enum OCRPersistenceMode: String, Codable, CaseIterable, Sendable {
     }
 }
 
+public enum OCREngineSelection: String, Codable, CaseIterable, Sendable {
+    case automatic
+    case appleVision
+    case tesseractOCRmyPDF
+
+    public var displayName: String {
+        switch self {
+        case .automatic: "Automatisch (empfohlen)"
+        case .appleVision: "Apple Vision"
+        case .tesseractOCRmyPDF: "Tesseract + OCRmyPDF"
+        }
+    }
+}
+
+public enum OCREngine: String, Codable, CaseIterable, Sendable {
+    case appleVision
+    case tesseract
+
+    public var displayName: String {
+        switch self {
+        case .appleVision: "Apple Vision"
+        case .tesseract: "Tesseract"
+        }
+    }
+}
+
 public enum OCRCPUMode: String, Codable, CaseIterable, Sendable {
     case economical
     case normal
@@ -39,6 +65,7 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
     public var maximumParallelFiles: Int
     public var cpuMode: OCRCPUMode
     public var persistenceMode: OCRPersistenceMode
+    public var engineSelection: OCREngineSelection
 
     public init(
         isEnabled: Bool = true,
@@ -50,7 +77,8 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
         createPDFA: Bool = false,
         maximumParallelFiles: Int = 1,
         cpuMode: OCRCPUMode = .normal,
-        persistenceMode: OCRPersistenceMode = .nonDestructive
+        persistenceMode: OCRPersistenceMode = .nonDestructive,
+        engineSelection: OCREngineSelection = .automatic
     ) {
         self.isEnabled = isEnabled
         self.languages = languages
@@ -62,13 +90,14 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
         self.maximumParallelFiles = max(1, maximumParallelFiles)
         self.cpuMode = cpuMode
         self.persistenceMode = persistenceMode
+        self.engineSelection = engineSelection
     }
 
     public static let `default` = OCRConfiguration()
 
     private enum CodingKeys: String, CodingKey {
         case isEnabled, languages, rotatePages, deskew, clean, optimizeLevel
-        case createPDFA, maximumParallelFiles, cpuMode, persistenceMode
+        case createPDFA, maximumParallelFiles, cpuMode, persistenceMode, engineSelection
     }
 
     public init(from decoder: Decoder) throws {
@@ -83,8 +112,29 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
             createPDFA: try values.decodeIfPresent(Bool.self, forKey: .createPDFA) ?? false,
             maximumParallelFiles: try values.decodeIfPresent(Int.self, forKey: .maximumParallelFiles) ?? 1,
             cpuMode: try values.decodeIfPresent(OCRCPUMode.self, forKey: .cpuMode) ?? .normal,
-            persistenceMode: try values.decodeIfPresent(OCRPersistenceMode.self, forKey: .persistenceMode) ?? .nonDestructive
+            persistenceMode: try values.decodeIfPresent(OCRPersistenceMode.self, forKey: .persistenceMode) ?? .nonDestructive,
+            engineSelection: try values.decodeIfPresent(OCREngineSelection.self, forKey: .engineSelection) ?? .automatic
         )
+    }
+
+    public var initiallyReportedEngine: OCREngine {
+        if persistenceMode == .persistent {
+            return .tesseract
+        }
+        switch engineSelection {
+        case .automatic, .appleVision:
+            #if os(macOS)
+            return .appleVision
+            #else
+            return .tesseract
+            #endif
+        case .tesseractOCRmyPDF:
+            return .tesseract
+        }
+    }
+
+    public var requiresTesseractComponents: Bool {
+        persistenceMode == .persistent || engineSelection == .tesseractOCRmyPDF
     }
 }
 
@@ -137,6 +187,20 @@ public struct OCRDependencies: Equatable, Sendable {
     }
 
     public var isReady: Bool { componentsInstalled && selfTestPassed }
+
+    public static let notChecked = OCRDependencies(
+        homebrew: nil,
+        ocrMyPDF: nil,
+        tesseract: nil,
+        pdfText: nil,
+        pdfInfo: nil,
+        pdfToPPM: nil,
+        environmentPATH: "",
+        installedLanguages: [],
+        versions: [:],
+        selfTestPassed: false,
+        messages: []
+    )
 }
 
 public struct OCRDependencyChecker: Sendable {
@@ -365,6 +429,9 @@ public struct OCRResult: Equatable, Sendable {
     public let pages: [ExtractedPage]
     public let persistedToOriginal: Bool
     public let pageQualities: [OCRPageQuality]
+    public let engine: OCREngine
+    public let duration: Duration
+    public let messages: [String]
     public let completedAt: Date
 
     public init(
@@ -374,6 +441,9 @@ public struct OCRResult: Equatable, Sendable {
         pages: [ExtractedPage] = [],
         persistedToOriginal: Bool = true,
         pageQualities: [OCRPageQuality] = [],
+        engine: OCREngine = .tesseract,
+        duration: Duration = .zero,
+        messages: [String] = [],
         completedAt: Date
     ) {
         self.inputHash = inputHash
@@ -382,6 +452,9 @@ public struct OCRResult: Equatable, Sendable {
         self.pages = pages
         self.persistedToOriginal = persistedToOriginal
         self.pageQualities = pageQualities
+        self.engine = engine
+        self.duration = duration
+        self.messages = messages
         self.completedAt = completedAt
     }
 }
@@ -437,6 +510,74 @@ public struct OCRPageQuality: Codable, Equatable, Sendable {
     }
 }
 
+public struct OCRQualityEvaluator: Sendable {
+    public init() {}
+
+    public func evaluate(
+        pages: [ExtractedPage],
+        configuredLanguages: [String],
+        meanConfidences: [Int: Double] = [:]
+    ) -> [OCRPageQuality] {
+        pages.map { page in
+            let words = page.text.split(whereSeparator: \.isWhitespace).map(String.init)
+            let unusual = page.text.unicodeScalars.filter {
+                !$0.properties.isAlphabetic
+                    && $0.properties.numericType == nil
+                    && !CharacterSet.whitespacesAndNewlines.contains($0)
+                    && !CharacterSet.punctuationCharacters.contains($0)
+            }.count
+            let broken = words.filter {
+                $0.count >= 4
+                    && $0.unicodeScalars.filter(\.properties.isAlphabetic).count * 2 < $0.count
+            }.count
+            let confidence = meanConfidences[page.pageNumber]
+            let characters = page.text.trimmingCharacters(in: .whitespacesAndNewlines).count
+            let density = min(1, Double(characters) / 1_500)
+            let status: OCRQualityStatus
+            if characters < 8 || (confidence ?? 100) < 40 {
+                status = .likelyFailed
+            } else if (confidence ?? 100) < 70
+                        || unusual > max(3, characters / 20)
+                        || broken > max(2, words.count / 10) {
+                status = .review
+            } else {
+                status = .good
+            }
+            return OCRPageQuality(
+                pageNumber: page.pageNumber,
+                meanConfidence: confidence,
+                characterCount: characters,
+                wordCount: words.count,
+                unusualCharacterCount: unusual,
+                suspectedBrokenWordCount: broken,
+                recognizedLanguage: detectedLanguage(
+                    in: page.text,
+                    configuredLanguages: configuredLanguages
+                ),
+                isEmpty: characters == 0,
+                imageToTextRatio: 1 - density,
+                status: status
+            )
+        }
+    }
+
+    private func detectedLanguage(
+        in text: String,
+        configuredLanguages: [String]
+    ) -> String {
+        let normalized = " \(text.lowercased()) "
+        let germanMarkers = [" der ", " die ", " und ", " ist ", " nicht ", " ein ", " eine "]
+        let englishMarkers = [" the ", " and ", " is ", " not ", " a ", " of ", " to "]
+        let germanScore = germanMarkers.filter(normalized.contains).count
+        let englishScore = englishMarkers.filter(normalized.contains).count
+        if germanScore > englishScore, configuredLanguages.contains("deu") { return "deu" }
+        if englishScore > germanScore, configuredLanguages.contains("eng") { return "eng" }
+        return configuredLanguages.count == 1
+            ? configuredLanguages[0]
+            : "unbestimmt"
+    }
+}
+
 public struct OCRTemporaryFileCleaner: Sendable {
     public init() {}
 
@@ -481,7 +622,8 @@ public struct OCRTemporaryFileCleaner: Sendable {
     }
 }
 
-public actor OCRmyPDFProcessor: OCRProcessing {
+public actor OCRmyPDFProcessor: OCRProvider {
+    public nonisolated let engine = OCREngine.tesseract
     private let dependencies: OCRDependencies
     private let extractor: PDFKitTextExtractor
     private let hasher: SHA256Hasher
@@ -504,6 +646,7 @@ public actor OCRmyPDFProcessor: OCRProcessing {
         _ file: DiscoveredPDF,
         configuration: OCRConfiguration
     ) async throws -> OCRResult {
+        let started = ContinuousClock.now
         try Task.checkCancellation()
         guard configuration.isEnabled else { throw PrivateDocSearchError.cancelled }
         guard dependencies.componentsInstalled, let executable = dependencies.ocrMyPDF else {
@@ -595,6 +738,8 @@ public actor OCRmyPDFProcessor: OCRProcessing {
             pages: bestPages,
             persistedToOriginal: configuration.persistenceMode == .persistent,
             pageQualities: bestQualities,
+            engine: engine,
+            duration: started.duration(to: .now),
             completedAt: Date()
         )
     }
@@ -713,66 +858,21 @@ public actor OCRmyPDFProcessor: OCRProcessing {
         pages: [ExtractedPage],
         languages: [String]
     ) -> [OCRPageQuality] {
-        pages.map { page in
-            let words = page.text.split(whereSeparator: \.isWhitespace).map(String.init)
-            let unusual = page.text.unicodeScalars.filter {
-                !$0.properties.isAlphabetic
-                    && $0.properties.numericType == nil
-                    && !CharacterSet.whitespacesAndNewlines.contains($0)
-                    && !CharacterSet.punctuationCharacters.contains($0)
-            }.count
-            let broken = words.filter {
-                $0.count >= 4 && $0.unicodeScalars.filter(\.properties.isAlphabetic).count * 2 < $0.count
-            }.count
-            let confidence = tesseractConfidence(
+        var confidences: [Int: Double] = [:]
+        for page in pages {
+            if let confidence = tesseractConfidence(
                 pdf: pdf,
                 pageNumber: page.pageNumber,
                 languages: languages
-            )
-            let characters = page.text.trimmingCharacters(in: .whitespacesAndNewlines).count
-            let density = min(1, Double(characters) / 1_500)
-            let status: OCRQualityStatus
-            if characters < 8 || (confidence ?? 100) < 40 {
-                status = .likelyFailed
-            } else if (confidence ?? 100) < 70
-                        || unusual > max(3, characters / 20)
-                        || broken > max(2, words.count / 10) {
-                status = .review
-            } else {
-                status = .good
+            ) {
+                confidences[page.pageNumber] = confidence
             }
-            return OCRPageQuality(
-                pageNumber: page.pageNumber,
-                meanConfidence: confidence,
-                characterCount: characters,
-                wordCount: words.count,
-                unusualCharacterCount: unusual,
-                suspectedBrokenWordCount: broken,
-                recognizedLanguage: detectedLanguage(
-                    in: page.text,
-                    configuredLanguages: languages
-                ),
-                isEmpty: characters == 0,
-                imageToTextRatio: 1 - density,
-                status: status
-            )
         }
-    }
-
-    private func detectedLanguage(
-        in text: String,
-        configuredLanguages: [String]
-    ) -> String {
-        let normalized = text.lowercased()
-        let germanMarkers = [" der ", " die ", " und ", " ist ", " nicht ", " ein ", " eine "]
-        let englishMarkers = [" the ", " and ", " is ", " not ", " a ", " of ", " to "]
-        let germanScore = germanMarkers.filter(normalized.contains).count
-        let englishScore = englishMarkers.filter(normalized.contains).count
-        if germanScore > englishScore, configuredLanguages.contains("deu") { return "deu" }
-        if englishScore > germanScore, configuredLanguages.contains("eng") { return "eng" }
-        return configuredLanguages.count == 1
-            ? configuredLanguages[0]
-            : "unbestimmt"
+        return OCRQualityEvaluator().evaluate(
+            pages: pages,
+            configuredLanguages: languages,
+            meanConfidences: confidences
+        )
     }
 
     private func tesseractConfidence(

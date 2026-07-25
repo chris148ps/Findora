@@ -20,6 +20,10 @@ Abgedeckt sind:
 - unverändertes Original bei korrupter OCR-Eingabe;
 - reale OCRmyPDF-Verarbeitung einer synthetischen Scan-PDF im
   nicht-destruktiven und persistenten Modus;
+- reale Apple-Vision-OCR einer synthetischen Scan-PDF ohne Originaländerung;
+- Automatikmodus ohne Tesseract, Vision-zu-Tesseract-Fallback und erzwungenes
+  OCRmyPDF im dauerhaften Modus;
+- identische Suchresultate und Datenbankaggregation für beide OCR-Provider;
 - Moduswechsel ohne automatische Neuverarbeitung;
 - Finder-sichere Toolauflösung und sicherer Abbruch ohne Homebrew;
 - seitenweise OCR-Qualität einschließlich Tesseract-Konfidenz;
