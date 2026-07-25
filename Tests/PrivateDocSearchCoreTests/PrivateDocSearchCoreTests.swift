@@ -965,13 +965,15 @@ func switchingOCRModeDoesNotReprocessKnownDocument() async throws {
     await processor.processPending(
         ocrConfiguration: OCRConfiguration(persistenceMode: .nonDestructive)
     ) { _ in }
+    let callsAfterInitialIndexing = await probe.calls
+    #expect(callsAfterInitialIndexing >= 1)
     files = try await scanner.scan(root: root)
     try await database.saveScan(files: files, root: root)
     await processor.processPending(
         ocrConfiguration: OCRConfiguration(persistenceMode: .persistent)
     ) { _ in }
 
-    #expect(await probe.calls == 1)
+    #expect(await probe.calls == callsAfterInitialIndexing)
     #expect(try Data(contentsOf: pdf) == original)
 
     try await database.resetOCRData()

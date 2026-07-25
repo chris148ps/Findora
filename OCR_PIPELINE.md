@@ -33,9 +33,10 @@ Für OCRmyPDF 17.8.1:
 `--output-type pdf` verhindert die standardmäßige PDF/A-Erzeugung.
 `--optimize 0` vermeidet standardmäßig Re-Komprimierung. `--skip-text`
 bewahrt Seiten mit vorhandener Textschicht. Drehung und Begradigung sind
-standardmäßig aktiv, aber einzeln abschaltbar. `--clean` ist optional;
-`--clean-final` und `--remove-background` werden wegen möglicher sichtbarer
-Artefakte nicht angeboten.
+standardmäßig aktiv, aber einzeln abschaltbar. `--clean` ist optional. Die
+nicht-destruktive automatische Nachbearbeitung kann für ein konkretes
+Problemdokument zusätzlich Hintergrundkorrektur und Oversampling anfordern;
+die Ausgabe wird erst nach der Qualitätsprüfung verwendet.
 
 PDF/A ist eine ausdrückliche Nutzeroption. Optimierung 1 ist nur nach
 Nutzerwahl aktiv; Optimierung 2/3 wird als potenziell verlustbehaftet
@@ -144,17 +145,45 @@ Wenn der atomare Austausch fehlschlägt, bleibt das Original erhalten.
 Temporäre Dateien tragen ein eindeutiges App-Präfix und werden nur innerhalb
 des gewählten Ordners und nur nach Alters-/Jobabgleich entfernt.
 
-## Qualitätsprüfung
+## Begrenzte automatische Nachbearbeitung
+
+`OCRRetryCoordinator` definiert zentral höchstens acht eindeutige Strategien:
+
+1. Standardrendering (144 dpi), automatische Drehung;
+2. 300 dpi;
+3. 300 dpi mit Graustufen, Kontrast- und Hintergrundkorrektur;
+4. 300 dpi mit Binarisierung und Reinigung;
+5. Begradigung, Drehung und Randbereinigung;
+6. Deutsch + Englisch;
+7. verfügbare alternative Engine;
+8. 400 dpi mit Kontrastkorrektur.
+
+Pro Problemseite gelten höchstens acht Versuche und 120 Sekunden
+Gesamtlaufzeit. Vor jedem Versuch werden Abbruch und Zeitlimit geprüft.
+Hochauflösende Versuche laufen global einzeln; jede Konfiguration erzwingt
+Parallelität 1. Ein Fehler beendet nicht die gesamte Folge. Identische
+Strategie-IDs werden nur einmal ausgeführt. Die Nachbearbeitung betrifft nur
+das aktuelle Problemdokument; bei manueller Prüfung wird ausschließlich die
+Zielseite gespeichert und neu indexiert, nie der gesamte Bestand.
+
+## Qualitätsprüfung und Übernahme
 
 Für jede Seite werden Engine-Konfidenz, Zeichen- und Wortzahl,
 ungewöhnliche Zeichen, verdächtig beschädigte Wörter, erkannte Sprache,
-Leerseitenindikator und Bild-/Text-Verhältnis gespeichert. Daraus entsteht „Gut“,
-„Prüfen“ oder „Wahrscheinlich fehlgeschlagen“. Tesseract liefert seine
-Konfidenz über TSV, Vision über erkannte Textbeobachtungen; beide durchlaufen
-denselben `OCRQualityEvaluator`. Bei wahrscheinlich
-fehlgeschlagenen Seiten ist genau ein zweiter Versuch mit Rotation,
-Begradigung und 300-dpi-Übersampling im Tesseract-Pfad zulässig; nur die besser bewertete,
-vollständig validierte Variante wird verwendet.
+Leerseitenindikator und Bild-/Text-Verhältnis gespeichert. Der gemeinsame
+Qualitätswert berücksichtigt zusätzlich Textumfang, Artefakte sowie plausible
+Zahlen-/Datumsformen. Daraus entsteht „Gut“, „Prüfen“ oder „Wahrscheinlich
+fehlgeschlagen“. Tesseract liefert seine Konfidenz über TSV, Vision über
+erkannte Textbeobachtungen; beide durchlaufen denselben `OCRQualityEvaluator`
+und `OCRQualityScorer`.
+
+Nur Text über der zentralen Schwelle (standardmäßig 0,68), mit mindestens acht
+Zeichen, zwei Wörtern und ohne offensichtlichen Fehlschlag wird automatisch
+übernommen. Die beste bisherige Variante gewinnt; der letzte Versuch hat keine
+Sonderstellung. Unsichere Varianten werden mit Strategie, Engine, Aufbereitung,
+Laufzeit und Qualitätsdaten in `ocr_page_attempts` gespeichert und unter
+**OCR prüfen** angeboten. Eine übernommene oder manuell geprüfte Seite ersetzt
+gezielt ihren SQLite-Seitentext, FTS-Eintrag, ihre Chunks und Embeddings.
 
 ## Parallelität
 

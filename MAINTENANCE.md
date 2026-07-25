@@ -24,22 +24,49 @@ Messwerte:
 - Zeichen- und Wortanzahl sowie vorhandene OCR-Konfidenz;
 - eingebettete Bild-/Grafikobjekte;
 - Annotationen als Schutz für Stempel, Unterschriften und Formularinhalte;
-- Hinweise auf sehr kleinen oder randnahen Text.
+- Hinweise auf sehr kleinen oder randnahen Text;
+- zusammenhängende dunkle Komponenten, Rand-/Eckinhalte und Kontrastinseln.
 
 Die Zustände sind:
 
-- **Vollständig leer**: praktisch vollständig weiß, ohne Text-, Kanten-,
-  Bild- oder Annotationsstruktur.
+- **Sicher leer**: nur bei erfolgreichem Rendering, homogenem Hintergrund und
+  gleichzeitig fehlenden Text-, Bild-, Grafik-, Annotations-, Kanten-,
+  Komponenten-, Rand- und Kontrastmerkmalen.
 - **Vermutlich leer**: sehr hoher Weißanteil und nur minimale visuelle
   Struktur; manuelle Bestätigung bleibt erforderlich.
-- **Bild ohne erkannten Text**: sichtbares Bild/Grafikobjekt ohne Text. Dieser
-  Zustand ist ausdrücklich nicht leer.
-- **OCR überprüfen**: beispielsweise Trennlinie, Stempel, Unterschrift,
-  kontrastarme Struktur oder nicht erklärbare dunkle Pixel.
-- **Technischer Fehler**: Rendering oder Seitenzugriff war nicht zuverlässig.
+- **Inhalt erkannt** und **Bildinhalt ohne erkannten Text**: ausdrücklich nicht
+  leer.
+- **OCR prüfen/OCR ohne Ergebnis**: sichtbarer Inhalt blieb nach der begrenzten
+  Nachbearbeitung ohne sicher übernehmbaren Text.
+- **Technischer Prüfungsfehler**: Rendering oder Seitenzugriff war nicht
+  zuverlässig und ist kein Leerbeleg.
 
-Fehlender Vision- oder Tesseract-Text reicht nie als Leerbeleg. Die Analyse
-verwendet den ohnehin vorhandenen OCR-Text und startet keine zweite OCR.
+Fehlender Vision- oder Tesseract-Text reicht nie als Leerbeleg.
+Leerseitenerkennung und OCR-Erfolg bleiben getrennte Zustände. Eine manuelle
+Leer-/Nichtleer-Entscheidung ist an Pfad, Seite und SHA-256 gebunden, trägt
+Zeitpunkt und Quelle `manuelle Prüfung` und bleibt bis zu einer
+Inhaltsänderung oder einem ausdrücklichen Zurücksetzen geschützt.
+
+Die Schema-Migration setzt frühere rein automatische `Vollständig leer`-
+Markierungen transaktional auf **Ungeprüft** zurück. Manuell bestätigte
+Entscheidungen bleiben erhalten; ein Migrationsfehler rollt die gesamte
+Schemaänderung zurück.
+
+## OCR prüfen und Seitentext
+
+**OCR prüfen** zeigt Seitenvorschau, Status, aktuelle/beste/alternative
+OCR-Varianten, Engine, Aufbereitung und Qualitätswerte. Mehrfach ausgewählte
+Seiten lassen sich als nicht leer markieren oder sequenziell automatisch
+nachbearbeiten; hochauflösende Läufe sind global serialisiert.
+
+Der manuelle Dialog bietet Engine, Sprache, Drehung, 144/300/400/600 dpi sowie
+die tatsächlich unterstützten Kontrast-, Binarisierungs-, Hintergrund-,
+Begradigungs- und Reinigungsoptionen. 600 dpi ist eine warnpflichtige
+Einzelseitenoption. Korrigierter OCR-Text bewahrt die ursprüngliche OCR-Fassung;
+vollständig manueller Text wird getrennt gekennzeichnet. Beide landen nur in
+SQLite. Für die betroffene Seite werden in einer Transaktion der alte
+FTS-Eintrag, Chunks und Embeddings ersetzt; andere Dokumente und das Original
+bleiben unverändert.
 
 ## Einzelne Seiten entfernen
 
@@ -62,7 +89,8 @@ PDF wiederhergestellt.
 ## Vollständig leere PDFs
 
 Eine PDF erscheint nur dann in **Leere PDFs**, wenn jede Seite vollständig
-analysiert und jede Seite als vollständig oder vermutlich leer eingestuft ist.
+analysiert, automatisch sicher/vermutlich leer und zusätzlich ausdrücklich
+manuell als leer bestätigt wurde.
 Bildseiten, Prüffälle, technische Fehler und manuell als nicht leer markierte
 Seiten schließen die PDF aus. Die Benutzeraktion verschiebt die ausgewählten
 Dateien in den Papierkorb und bereinigt anschließend ihre Suchdaten.

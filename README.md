@@ -76,6 +76,16 @@ Engine-Wechsel verarbeitet bekannte Dokumente nicht automatisch neu.
 Unter **OCR** lassen sich Sprachen und konservative Optionen ändern. OCR und
 Indexierung können pausiert und fehlgeschlagene Jobs erneut eingeplant werden.
 
+Reicht der erste OCR-Lauf nicht aus, probiert die App zentral begrenzt bis zu
+acht unterschiedliche Strategien in höchstens 120 Sekunden: Standard,
+300 dpi, Kontrast-/Hintergrundkorrektur, Binarisierung,
+Begradigung/Randbereinigung, Deutsch + Englisch, eine verfügbare alternative
+Engine und zuletzt 400 dpi. Nach jedem Lauf wird dieselbe Qualitätswertung
+verwendet; eine spätere schlechtere Variante ersetzt niemals die bisher beste.
+Unsichere Seiten erscheinen unter **Dokumentenwartung > OCR prüfen**. Dort
+können sie als nicht leer bestätigt, mit manuellen OCR-Einstellungen getestet
+oder textlich korrigiert beziehungsweise vollständig erfasst werden.
+
 ## Erstindexierung
 
 Nach der Ordnerauswahl startet ein Vollscan. Danach kombiniert die App
@@ -146,11 +156,17 @@ Embedding-Werkzeuge getrennt verwaltet. Die visuelle Leerseitenanalyse läuft
 bei der normalen Dokumentenverarbeitung mit. Für ältere Indexeinträge kann sie
 gezielt ergänzt werden, ohne eine zweite OCR zu starten.
 
-Eine Seite gilt nie allein wegen fehlenden OCR-Texts als leer. Die App prüft
-Rendering, Weiß- und Dunkelanteil, Varianz, Kanten, Kontrast, Textmenge,
-OCR-Konfidenz, eingebettete Bild-/Grafikobjekte sowie Annotationen. Bildseiten,
+Eine Seite gilt nie allein wegen fehlenden OCR-Texts als leer. Die davon
+unabhängige visuelle Prüfung berücksichtigt Rendering, Weiß- und Dunkelanteil,
+Varianz, Kanten, Kontrastinseln, zusammenhängende Strukturen, Randzonen,
+Text-/Bild-/Grafikobjekte und Annotationen. Schon ein relevantes Gegenmerkmal
+verhindert **Sicher leer**. Bildseiten, Barcodes, QR-Codes, Formularfelder,
 Stempel, Unterschriften, kontrastarme Inhalte und kleine Randnotizen werden
 deshalb als Inhalt oder als manuell zu prüfen eingestuft.
+
+Automatische Leereinstufungen sind keine Löschfreigabe. Nur ausdrücklich
+manuell als leer bestätigte Seiten sind auswählbar; auch eine ganze leere PDF
+erscheint erst nach Bestätigung jeder Seite als Papierkorb-Kandidat.
 
 Dateien werden ausschließlich nach ausdrücklicher Auswahl und Bestätigung
 verändert. Duplikate müssen denselben SHA-256 des Originaldokuments besitzen.

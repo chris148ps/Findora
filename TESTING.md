@@ -41,8 +41,16 @@ Abgedeckt sind:
 - persistierte Pause und identische Statusrekonstruktion nach Datenbank-Neustart;
 - genau vier primäre Dokumentenstatus-Kennzahlen;
 - visuelle Leerseitenerkennung für vollständig leere Seiten, Trennseiten,
-  Bildseiten, Unterschriften, Stempel, kontrastarme Seiten und kleine
+  Bildseiten, Unterschriften, Stempel, Barcode, QR-Code, Formularfeld,
+  Annotation, kontrastarme Seiten, extrem hohen Weißanteil und kleine
   Randnotizen;
+- eindeutige, begrenzte OCR-Strategiefolge, progressive Verbesserung,
+  Bestvariantenauswahl, Schutz gegen spätere Verschlechterung, Versuchslimit
+  und kontrollierten Abbruch;
+- Schutz manueller Nichtleer-Entscheidungen bei erneuter Analyse und
+  Zurücksetzen bei geändertem SHA-256;
+- gezielte FTS-/Chunk-/Embedding-Aktualisierung für korrigierten Seitentext,
+  Bewahrung der ursprünglichen OCR-Fassung und unverändertes Original;
 - getrennte Erkennung vollständig leerer und gemischter PDFs;
 - bestätigte Einzelseitenentfernung mit PDF-, Reihenfolge- und
   Reindexierungsprüfung;
@@ -103,6 +111,13 @@ Danach manuell:
 16. Wartungslisten durchsuchen, sortieren, Seiten vorschauen und Entscheidungen
     zurücksetzen.
 17. Nur mit synthetischen PDFs Papierkorb- und Seitenaustauschdialoge prüfen.
+18. **OCR prüfen** mit Mehrfachauswahl, automatischer Nachbearbeitung und
+    sichtbarer Strategie-/Qualitätsanzeige prüfen.
+19. Manuelle OCR mit Vision/Tesseract, Sprache, Drehung und 300/400/600 dpi
+    testen; 600-dpi-Warnung und Einzelverarbeitung beobachten.
+20. OCR-Text korrigieren und vollständig manuell erfassen; FTS-Suche,
+    Seitenchunks, Embeddings, Original-OCR-Rücksetzung und unveränderten
+    PDF-Hash prüfen.
 
 Der Memory-Pressure-Pfad lässt sich ohne echten Speichermangel kontrolliert
 beim App-Start auslösen:

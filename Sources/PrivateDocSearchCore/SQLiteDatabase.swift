@@ -237,6 +237,167 @@ public actor SQLiteDatabase {
         publishStatusChange(.jobChanged)
     }
 
+    public func updateOCRRetryProgress(
+        path: String,
+        attempt: Int,
+        total: Int,
+        strategy: String?
+    ) throws {
+        try execute(
+            """
+            UPDATE processing_jobs
+            SET ocr_attempt_current = ?, ocr_attempt_total = ?,
+                ocr_strategy = ?, updated_at = ?
+            WHERE job_key = ?
+            """,
+            bindings: [
+                .integer(Int64(attempt)),
+                .integer(Int64(total)),
+                strategy.map(SQLiteValue.text) ?? .null,
+                .real(Date().timeIntervalSince1970),
+                .text(path)
+            ]
+        )
+        publishStatusChange(.jobChanged)
+    }
+
+    public func saveOCRAttempts(
+        path: String,
+        originalHash: String,
+        attempts: [OCRAttemptRecord],
+        bestStrategyByPage _: [Int: OCRRetryStrategy]
+    ) throws {
+        try transaction {
+            let attemptedPages = Set(attempts.map(\.pageNumber))
+            for pageNumber in attemptedPages {
+                try execute(
+                    """
+                    UPDATE ocr_page_attempts
+                    SET is_best = 0
+                    WHERE absolute_path = ? AND original_hash = ? AND page_number = ?
+                    """,
+                    bindings: [
+                        .text(path),
+                        .text(originalHash),
+                        .integer(Int64(pageNumber))
+                    ]
+                )
+            }
+            for attempt in attempts {
+                try execute(
+                    """
+                    DELETE FROM ocr_page_attempts
+                    WHERE absolute_path = ? AND original_hash = ?
+                      AND page_number = ? AND strategy_id = ?
+                    """,
+                    bindings: [
+                        .text(path),
+                        .text(originalHash),
+                        .integer(Int64(attempt.pageNumber)),
+                        .text(attempt.strategy.id)
+                    ]
+                )
+            }
+            for attempt in attempts {
+                let duration = attempt.duration.components
+                let seconds = Double(duration.seconds)
+                    + Double(duration.attoseconds) / 1_000_000_000_000_000_000
+                try execute(
+                    """
+                    INSERT INTO ocr_page_attempts (
+                        absolute_path, original_hash, page_number, strategy_id,
+                        strategy_name, engine, preprocessing, recognized_text,
+                        quality_score, quality_status, character_count, word_count,
+                        mean_confidence, recognized_language, duration_seconds,
+                        is_best, completed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    bindings: [
+                        .text(path),
+                        .text(originalHash),
+                        .integer(Int64(attempt.pageNumber)),
+                        .text(attempt.strategy.id),
+                        .text(attempt.strategy.displayName),
+                        .text(attempt.engine.rawValue),
+                        .text(attempt.strategy.preprocessing),
+                        .text(attempt.text),
+                        .real(attempt.qualityScore),
+                        .text(attempt.quality.status.rawValue),
+                        .integer(Int64(attempt.quality.characterCount)),
+                        .integer(Int64(attempt.quality.wordCount)),
+                        attempt.quality.meanConfidence.map(SQLiteValue.real) ?? .null,
+                        .text(attempt.quality.recognizedLanguage),
+                        .real(seconds),
+                        .integer(0),
+                        .real(attempt.completedAt.timeIntervalSince1970)
+                    ]
+                )
+            }
+            for pageNumber in attemptedPages {
+                try execute(
+                    """
+                    UPDATE ocr_page_attempts
+                    SET is_best = CASE
+                        WHEN id = (
+                            SELECT id FROM ocr_page_attempts
+                            WHERE absolute_path = ? AND original_hash = ?
+                              AND page_number = ?
+                            ORDER BY quality_score DESC, completed_at DESC
+                            LIMIT 1
+                        ) THEN 1 ELSE 0 END
+                    WHERE absolute_path = ? AND original_hash = ? AND page_number = ?
+                    """,
+                    bindings: [
+                        .text(path),
+                        .text(originalHash),
+                        .integer(Int64(pageNumber)),
+                        .text(path),
+                        .text(originalHash),
+                        .integer(Int64(pageNumber))
+                    ]
+                )
+            }
+        }
+        publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func applyOCRPageStatuses(
+        path: String,
+        acceptedPageNumbers: Set<Int>,
+        attemptedPageNumbers: Set<Int>,
+        pagesWithAnyText: Set<Int>
+    ) throws {
+        try transaction {
+            for page in attemptedPageNumbers {
+                let status: PageContentStatus
+                if acceptedPageNumbers.contains(page) {
+                    status = .contentDetected
+                } else if pagesWithAnyText.contains(page) {
+                    status = .needsOCRReview
+                } else {
+                    status = .ocrNoResult
+                }
+                try execute(
+                    """
+                    UPDATE page_content_analysis
+                    SET status = ?, updated_at = ?
+                    WHERE absolute_path = ? AND page_number = ?
+                      AND status != 'safelyEmpty'
+                      AND status NOT IN ('manuallyCorrectedText', 'manuallyEnteredText')
+                    """,
+                    bindings: [
+                        .text(status.rawValue),
+                        .real(Date().timeIntervalSince1970),
+                        .text(path),
+                        .integer(Int64(page))
+                    ]
+                )
+            }
+        }
+        publishStatusChange(.maintenanceCompleted)
+    }
+
     public func updateObservedHash(path: String, hash: String) throws {
         try execute(
             """
@@ -260,21 +421,25 @@ public actor SQLiteDatabase {
     ) throws {
         let existingRows = try query(
             """
-            SELECT page_number, original_hash, user_decision
+            SELECT page_number, original_hash, user_decision,
+                   decision_at, decision_source
             FROM page_content_analysis
             WHERE absolute_path = ?
             """,
             bindings: [.text(path)]
         )
         let existingDecisions = Dictionary(uniqueKeysWithValues: existingRows.compactMap {
-            row -> (Int, PageReviewDecision)? in
+            row -> (Int, (PageReviewDecision, Double?, String?))? in
             guard row.string("original_hash") == originalHash,
                   let page = row.int64("page_number"),
                   let rawDecision = row.string("user_decision"),
                   let decision = PageReviewDecision(rawValue: rawDecision) else {
                 return nil
             }
-            return (Int(page), decision)
+            return (
+                Int(page),
+                (decision, row.double("decision_at"), row.string("decision_source"))
+            )
         })
         try transaction {
             try execute(
@@ -292,9 +457,10 @@ public actor SQLiteDatabase {
                         pixel_height, white_ratio, dark_pixel_ratio, variance,
                         edge_ratio, contrast, character_count, word_count,
                         ocr_confidence, embedded_image_count, annotation_count,
-                        has_small_text, user_decision, updated_at
+                        has_small_text, user_decision, decision_at,
+                        decision_source, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     bindings: [
                         .text(path),
@@ -319,8 +485,12 @@ public actor SQLiteDatabase {
                         .integer(Int64(metrics.annotationCount)),
                         .integer(metrics.hasSmallText ? 1 : 0),
                         .text(
-                            (existingDecisions[analysis.pageNumber] ?? .undecided).rawValue
+                            (existingDecisions[analysis.pageNumber]?.0 ?? .undecided).rawValue
                         ),
+                        existingDecisions[analysis.pageNumber]?.1
+                            .map(SQLiteValue.real) ?? .null,
+                        existingDecisions[analysis.pageNumber]?.2
+                            .map(SQLiteValue.text) ?? .null,
                         .real(now)
                     ]
                 )
@@ -388,11 +558,33 @@ public actor SQLiteDatabase {
         try execute(
             """
             UPDATE page_content_analysis
-            SET user_decision = ?, updated_at = ?
+            SET user_decision = ?, decision_at = ?,
+                decision_source = ?, updated_at = ?
             WHERE absolute_path = ? AND page_number = ?
             """,
             bindings: [
                 .text(decision.rawValue),
+                .real(Date().timeIntervalSince1970),
+                decision == .undecided
+                    ? .null
+                    : .text("manuelle Prüfung"),
+                .real(Date().timeIntervalSince1970),
+                .text(path),
+                .integer(Int64(pageNumber))
+            ]
+        )
+        publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func resetPageReviewDecision(path: String, pageNumber: Int) throws {
+        try execute(
+            """
+            UPDATE page_content_analysis
+            SET user_decision = 'undecided', decision_at = NULL,
+                decision_source = NULL, updated_at = ?
+            WHERE absolute_path = ? AND page_number = ?
+            """,
+            bindings: [
                 .real(Date().timeIntervalSince1970),
                 .text(path),
                 .integer(Int64(pageNumber))
@@ -408,7 +600,7 @@ public actor SQLiteDatabase {
             FROM page_content_analysis a
             JOIN processing_jobs j ON j.job_key = a.absolute_path
             WHERE j.state NOT IN ('retired', 'unavailable')
-              AND a.status != 'content'
+              AND a.status IN ('unreviewed', 'safelyEmpty', 'probablyEmpty')
               AND a.user_decision NOT IN ('notEmpty', 'excluded')
             ORDER BY j.file_name, a.page_number
             """
@@ -423,8 +615,8 @@ public actor SQLiteDatabase {
                    a.original_hash, MAX(a.page_count) AS page_count,
                    MIN(a.confidence) AS confidence,
                    COUNT(*) AS analyzed_pages,
-                   SUM(CASE WHEN a.status IN ('fullyEmpty', 'probablyEmpty')
-                                 AND a.user_decision NOT IN ('notEmpty', 'excluded')
+                   SUM(CASE WHEN a.status IN ('safelyEmpty', 'probablyEmpty')
+                                 AND a.user_decision = 'confirmedEmpty'
                             THEN 1 ELSE 0 END) AS empty_pages
             FROM page_content_analysis a
             JOIN processing_jobs j ON j.job_key = a.absolute_path
@@ -450,6 +642,289 @@ public actor SQLiteDatabase {
                 confidence: confidence
             )
         }
+    }
+
+    public func ocrReviewCandidates() throws -> [OCRReviewCandidate] {
+        let pageRows = try query(
+            """
+            SELECT a.absolute_path, j.relative_path, j.file_name,
+                   a.original_hash, a.page_number, a.page_count,
+                   a.status, a.user_decision,
+                   COALESCE(p.text, '') AS current_text,
+                   p.original_ocr_text,
+                   COALESCE(p.text_kind, 'automatic') AS text_kind
+            FROM page_content_analysis a
+            JOIN processing_jobs j ON j.job_key = a.absolute_path
+            LEFT JOIN documents d ON d.content_hash = j.content_hash
+            LEFT JOIN pages p
+              ON p.document_id = d.id AND p.page_number = a.page_number
+            WHERE j.state NOT IN ('retired', 'unavailable')
+              AND (
+                  a.status IN (
+                      'imageWithoutRecognizedText', 'needsOCRReview',
+                      'ocrNoResult', 'technicalReviewError'
+                  )
+                  OR a.user_decision = 'notEmpty'
+              )
+              AND a.user_decision != 'excluded'
+            ORDER BY j.file_name, a.page_number
+            """
+        )
+        let attemptRows = try query(
+            """
+            SELECT absolute_path, original_hash, page_number, strategy_id,
+                   strategy_name, engine, preprocessing, recognized_text,
+                   quality_score, quality_status, character_count, word_count,
+                   mean_confidence, recognized_language, duration_seconds, is_best
+            FROM ocr_page_attempts
+            ORDER BY absolute_path, page_number, quality_score DESC
+            """
+        )
+        var attempts: [String: [OCRVariantSummary]] = [:]
+        for row in attemptRows {
+            guard let path = row.string("absolute_path"),
+                  let hash = row.string("original_hash"),
+                  let page = row.int64("page_number"),
+                  let strategyID = row.string("strategy_id"),
+                  let strategyName = row.string("strategy_name"),
+                  let engineRaw = row.string("engine"),
+                  let engine = OCREngine(rawValue: engineRaw),
+                  let preprocessing = row.string("preprocessing"),
+                  let text = row.string("recognized_text"),
+                  let score = row.double("quality_score"),
+                  let qualityRaw = row.string("quality_status"),
+                  let quality = OCRQualityStatus(rawValue: qualityRaw),
+                  let characters = row.int64("character_count"),
+                  let words = row.int64("word_count"),
+                  let language = row.string("recognized_language"),
+                  let duration = row.double("duration_seconds"),
+                  let isBest = row.int64("is_best") else { continue }
+            let key = "\(path)#\(hash)#\(page)"
+            attempts[key, default: []].append(
+                OCRVariantSummary(
+                    pageNumber: Int(page),
+                    strategyID: strategyID,
+                    strategyName: strategyName,
+                    engine: engine,
+                    preprocessing: preprocessing,
+                    text: text,
+                    qualityScore: score,
+                    qualityStatus: quality,
+                    characterCount: Int(characters),
+                    wordCount: Int(words),
+                    meanConfidence: row.double("mean_confidence"),
+                    recognizedLanguage: language,
+                    durationSeconds: duration,
+                    isBest: isBest == 1
+                )
+            )
+        }
+        return pageRows.compactMap { row in
+            guard let path = row.string("absolute_path"),
+                  let relative = row.string("relative_path"),
+                  let name = row.string("file_name"),
+                  let hash = row.string("original_hash"),
+                  let page = row.int64("page_number"),
+                  let pageCount = row.int64("page_count"),
+                  let statusRaw = row.string("status"),
+                  let status = PageContentStatus(rawValue: statusRaw),
+                  let decisionRaw = row.string("user_decision"),
+                  let decision = PageReviewDecision(rawValue: decisionRaw),
+                  let currentText = row.string("current_text"),
+                  let kindRaw = row.string("text_kind"),
+                  let kind = PageTextKind(rawValue: kindRaw) else { return nil }
+            return OCRReviewCandidate(
+                absolutePath: path,
+                relativePath: relative,
+                fileName: name,
+                originalHash: hash,
+                pageNumber: Int(page),
+                pageCount: Int(pageCount),
+                status: status,
+                decision: decision,
+                currentText: currentText,
+                originalOCRText: row.string("original_ocr_text"),
+                textKind: kind,
+                variants: attempts["\(path)#\(hash)#\(page)"] ?? []
+            )
+        }
+    }
+
+    public func storedDocumentText(path: String) throws -> StoredDocumentText? {
+        guard let row = try query(
+            """
+            SELECT d.id, d.content_hash, l.current_file_hash, l.modified_at
+            FROM document_locations l
+            JOIN documents d ON d.id = l.document_id
+            WHERE l.absolute_path = ? AND l.deleted_at IS NULL
+            LIMIT 1
+            """,
+            bindings: [.text(path)]
+        ).first,
+        let documentID = row.int64("id"),
+        let hash = row.string("content_hash"),
+        let modified = row.double("modified_at") else { return nil }
+        let pages = try query(
+            """
+            SELECT page_number, text
+            FROM pages
+            WHERE document_id = ?
+            ORDER BY page_number
+            """,
+            bindings: [.integer(documentID)]
+        ).compactMap { page -> ExtractedPage? in
+            guard let number = page.int64("page_number"),
+                  let text = page.string("text") else { return nil }
+            return ExtractedPage(pageNumber: Int(number), text: text)
+        }
+        return StoredDocumentText(
+            documentID: documentID,
+            contentHash: hash,
+            currentFileHash: row.string("current_file_hash"),
+            modifiedAt: Date(timeIntervalSince1970: modified),
+            pages: pages
+        )
+    }
+
+    public func replacePageTextAndIndex(
+        path: String,
+        pageNumber: Int,
+        text: String,
+        textKind: PageTextKind,
+        chunks: [TextChunk],
+        embeddings: [[Float]],
+        embeddingModelID: String,
+        embeddingModelVersion: String
+    ) throws {
+        guard chunks.count == embeddings.count else {
+            throw PrivateDocSearchError.database(
+                "Chunk- und Embedding-Anzahl stimmen nicht überein."
+            )
+        }
+        try transaction {
+            let documentID = try scalarInt64(
+                """
+                SELECT document_id FROM document_locations
+                WHERE absolute_path = ? AND deleted_at IS NULL
+                """,
+                bindings: [.text(path)]
+            )
+            let oldChunkRows = try query(
+                """
+                SELECT id FROM chunks
+                WHERE document_id = ? AND page_number = ?
+                """,
+                bindings: [
+                    .integer(documentID),
+                    .integer(Int64(pageNumber))
+                ]
+            )
+            for row in oldChunkRows {
+                if let id = row.string("id") {
+                    try execute(
+                        "DELETE FROM chunks_fts WHERE chunk_id = ?",
+                        bindings: [.text(id)]
+                    )
+                }
+            }
+            try execute(
+                "DELETE FROM chunks WHERE document_id = ? AND page_number = ?",
+                bindings: [.integer(documentID), .integer(Int64(pageNumber))]
+            )
+            try execute(
+                """
+                UPDATE pages
+                SET original_ocr_text = CASE
+                        WHEN ? != 'automatic'
+                        THEN COALESCE(original_ocr_text, text)
+                        ELSE original_ocr_text
+                    END,
+                    text = ?, text_source = ?, text_kind = ?
+                WHERE document_id = ? AND page_number = ?
+                """,
+                bindings: [
+                    .text(textKind.rawValue),
+                    .text(text),
+                    .text(textKind == .automatic ? "ocr" : "manual"),
+                    .text(textKind.rawValue),
+                    .integer(documentID),
+                    .integer(Int64(pageNumber))
+                ]
+            )
+            let now = Date().timeIntervalSince1970
+            for (index, chunk) in chunks.enumerated() {
+                try execute(
+                    """
+                    INSERT INTO chunks (
+                        id, document_id, document_hash, page_number, ordinal,
+                        chunk_text, modified_at, indexed_at,
+                        embedding_model_id, embedding_model_version
+                    )
+                    SELECT ?, ?, content_hash, ?, ?, ?, ?, ?, ?, ?
+                    FROM documents WHERE id = ?
+                    """,
+                    bindings: [
+                        .text(chunk.id),
+                        .integer(documentID),
+                        .integer(Int64(pageNumber)),
+                        .integer(Int64(chunk.ordinal)),
+                        .text(chunk.text),
+                        .real(now),
+                        .real(now),
+                        .text(embeddingModelID),
+                        .text(embeddingModelVersion),
+                        .integer(documentID)
+                    ]
+                )
+                try execute(
+                    "INSERT INTO chunks_fts (chunk_id, chunk_text) VALUES (?, ?)",
+                    bindings: [.text(chunk.id), .text(chunk.text)]
+                )
+                try execute(
+                    """
+                    INSERT INTO chunk_embeddings (
+                        chunk_id, model_id, model_version, dimensions, vector
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    bindings: [
+                        .text(chunk.id),
+                        .text(embeddingModelID),
+                        .text(embeddingModelVersion),
+                        .integer(Int64(embeddings[index].count)),
+                        .blob(Self.encode(vector: embeddings[index]))
+                    ]
+                )
+            }
+            let status: PageContentStatus = switch textKind {
+            case .automatic:
+                text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? .ocrNoResult
+                    : .contentDetected
+            case .manuallyCorrected: .manuallyCorrectedText
+            case .manuallyEntered: .manuallyEnteredText
+            }
+            try execute(
+                """
+                UPDATE page_content_analysis
+                SET status = ?, user_decision = 'notEmpty',
+                    decision_at = ?, decision_source = 'manuelle Prüfung',
+                    updated_at = ?
+                WHERE absolute_path = ? AND page_number = ?
+                """,
+                bindings: [
+                    .text(status.rawValue),
+                    .real(now),
+                    .real(now),
+                    .text(path),
+                    .integer(Int64(pageNumber))
+                ]
+            )
+            try execute(
+                "UPDATE documents SET last_indexed_at = ? WHERE id = ?",
+                bindings: [.real(now), .integer(documentID)]
+            )
+        }
+        publishStatusChange(.documentIndexed)
     }
 
     public func duplicateGroups() throws -> [DuplicateGroup] {
@@ -596,7 +1071,8 @@ public actor SQLiteDatabase {
         embeddingModelID: String,
         embeddingModelVersion: String,
         ocrPerformed: Bool,
-        pageQualities: [OCRPageQuality] = []
+        pageQualities: [OCRPageQuality] = [],
+        textLayerPresent: Bool = true
     ) throws -> Int64 {
         guard chunks.count == embeddings.count else {
             throw PrivateDocSearchError.database("Chunk- und Embedding-Anzahl stimmen nicht überein.")
@@ -609,10 +1085,10 @@ public actor SQLiteDatabase {
                 INSERT INTO documents
                     (content_hash, page_count, text_layer_present, ocr_status,
                      last_successful_processing, last_indexed_at, active_version)
-                VALUES (?, ?, 1, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(content_hash) DO UPDATE SET
                     page_count = excluded.page_count,
-                    text_layer_present = 1,
+                    text_layer_present = excluded.text_layer_present,
                     ocr_status = excluded.ocr_status,
                     last_successful_processing = excluded.last_successful_processing,
                     last_indexed_at = excluded.last_indexed_at,
@@ -621,6 +1097,7 @@ public actor SQLiteDatabase {
                 bindings: [
                     .text(hash),
                     .integer(Int64(pages.count)),
+                    .integer(textLayerPresent ? 1 : 0),
                     .text(ocrPerformed ? "completed" : "not_required"),
                     .real(now),
                     .real(now)
@@ -1129,10 +1606,7 @@ public actor SQLiteDatabase {
                  FROM page_content_analysis a
                  JOIN processing_jobs j ON j.job_key = a.absolute_path
                  WHERE j.state NOT IN ('retired', 'unavailable')
-                   AND a.status IN (
-                       'fullyEmpty', 'probablyEmpty', 'imageWithoutText',
-                       'needsOCRReview', 'technicalError'
-                   )
+                   AND a.status IN ('unreviewed', 'safelyEmpty', 'probablyEmpty')
                    AND a.user_decision NOT IN ('notEmpty', 'excluded'))
                     AS empty_page_candidates,
                 (SELECT COUNT(*)
@@ -1144,11 +1618,40 @@ public actor SQLiteDatabase {
                      GROUP BY a.absolute_path
                      HAVING COUNT(*) = MAX(a.page_count)
                         AND SUM(
-                            CASE WHEN a.status IN ('fullyEmpty', 'probablyEmpty')
+                            CASE WHEN a.status IN ('safelyEmpty', 'probablyEmpty')
                                       AND a.user_decision NOT IN ('notEmpty', 'excluded')
                                  THEN 1 ELSE 0 END
                         ) = MAX(a.page_count)
                  )) AS fully_empty_pdfs,
+                (SELECT COUNT(*) FROM page_content_analysis
+                 WHERE status = 'safelyEmpty'
+                   AND user_decision NOT IN ('notEmpty', 'excluded'))
+                    AS safely_empty_pages,
+                (SELECT COUNT(*) FROM page_content_analysis
+                 WHERE status = 'probablyEmpty'
+                   AND user_decision NOT IN ('notEmpty', 'excluded'))
+                    AS probably_empty_pages,
+                (SELECT COUNT(*) FROM processing_jobs
+                 WHERE state = 'ocrRunning' AND ocr_attempt_current > 0)
+                    AS ocr_retrying_pages,
+                (SELECT COUNT(*) FROM page_content_analysis
+                 WHERE status IN (
+                     'needsOCRReview', 'imageWithoutRecognizedText',
+                     'ocrNoResult', 'technicalReviewError'
+                 ) AND user_decision != 'excluded')
+                    AS ocr_review_pages,
+                (SELECT COUNT(*) FROM page_content_analysis
+                 WHERE user_decision = 'notEmpty')
+                    AS manually_not_empty_pages,
+                (SELECT COUNT(*) FROM page_content_analysis
+                 WHERE status = 'ocrNoResult')
+                    AS ocr_no_result_pages,
+                (SELECT COUNT(*) FROM page_content_analysis
+                 WHERE status = 'manuallyCorrectedText')
+                    AS manually_corrected_pages,
+                (SELECT COUNT(*) FROM page_content_analysis
+                 WHERE status = 'manuallyEnteredText')
+                    AS manually_entered_pages,
                 (SELECT COUNT(*) FROM processing_jobs
                  WHERE state IN ('indexed', 'failed')) AS processed_jobs,
                 (SELECT COUNT(*) FROM processing_jobs
@@ -1178,6 +1681,14 @@ public actor SQLiteDatabase {
         result.ocrQualityFailedPages = Int(row?.int64("ocr_quality_failed") ?? 0)
         result.emptyPageCandidates = Int(row?.int64("empty_page_candidates") ?? 0)
         result.fullyEmptyPDFs = Int(row?.int64("fully_empty_pdfs") ?? 0)
+        result.safelyEmptyPages = Int(row?.int64("safely_empty_pages") ?? 0)
+        result.probablyEmptyPages = Int(row?.int64("probably_empty_pages") ?? 0)
+        result.ocrRetryingPages = Int(row?.int64("ocr_retrying_pages") ?? 0)
+        result.ocrReviewPages = Int(row?.int64("ocr_review_pages") ?? 0)
+        result.manuallyNotEmptyPages = Int(row?.int64("manually_not_empty_pages") ?? 0)
+        result.ocrNoResultPages = Int(row?.int64("ocr_no_result_pages") ?? 0)
+        result.manuallyCorrectedPages = Int(row?.int64("manually_corrected_pages") ?? 0)
+        result.manuallyEnteredPages = Int(row?.int64("manually_entered_pages") ?? 0)
         result.processedJobs = Int(row?.int64("processed_jobs") ?? 0)
         result.totalJobs = Int(row?.int64("total_jobs") ?? 0)
         result.isPaused = try setting(key: "processingPaused") == "1"
@@ -1187,7 +1698,8 @@ public actor SQLiteDatabase {
 
         if let current = try query(
             """
-            SELECT state, file_name, ocr_engine
+            SELECT state, file_name, ocr_engine, ocr_attempt_current,
+                   ocr_attempt_total, ocr_strategy
             FROM processing_jobs
             WHERE state IN (
                 'discovered', 'waitingForStability', 'extracting',
@@ -1208,11 +1720,20 @@ public actor SQLiteDatabase {
             result.currentOCREngine = current.string("ocr_engine")
                 .flatMap(OCREngine.init(rawValue:))?
                 .displayName
-            result.currentStep = result.isPaused
-                ? "Pausiert"
-                : current.string("state")
+            if result.isPaused {
+                result.currentStep = "Pausiert"
+            } else if let attempt = current.int64("ocr_attempt_current"),
+                      let total = current.int64("ocr_attempt_total"),
+                      attempt > 0,
+                      total > 0 {
+                let strategy = current.string("ocr_strategy") ?? "OCR-Strategie"
+                result.currentStep =
+                    "OCR wird verbessert · Versuch \(attempt) von \(total) · \(strategy)"
+            } else {
+                result.currentStep = current.string("state")
                     .flatMap(ProcessingState.init(rawValue:))?
                     .displayName
+            }
         }
         if let success = try query(
             """
@@ -1638,6 +2159,17 @@ public actor SQLiteDatabase {
                 }
                 try execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (7, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 8 {
+            try transaction {
+                for statement in Self.migration8 {
+                    try execute(statement)
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (8, ?)",
                     bindings: [.real(Date().timeIntervalSince1970)]
                 )
             }
@@ -2151,6 +2683,54 @@ public actor SQLiteDatabase {
         """,
         "CREATE INDEX idx_page_analysis_status ON page_content_analysis(status, user_decision)",
         "CREATE INDEX idx_page_analysis_hash ON page_content_analysis(original_hash)"
+    ]
+
+    private static let migration8 = [
+        "ALTER TABLE page_content_analysis ADD COLUMN decision_at REAL",
+        "ALTER TABLE page_content_analysis ADD COLUMN decision_source TEXT",
+        "ALTER TABLE pages ADD COLUMN original_ocr_text TEXT",
+        "ALTER TABLE pages ADD COLUMN text_kind TEXT NOT NULL DEFAULT 'automatic'",
+        "ALTER TABLE processing_jobs ADD COLUMN ocr_attempt_current INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE processing_jobs ADD COLUMN ocr_attempt_total INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE processing_jobs ADD COLUMN ocr_strategy TEXT",
+        """
+        CREATE TABLE ocr_page_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            absolute_path TEXT NOT NULL,
+            original_hash TEXT NOT NULL,
+            page_number INTEGER NOT NULL,
+            strategy_id TEXT NOT NULL,
+            strategy_name TEXT NOT NULL,
+            engine TEXT NOT NULL,
+            preprocessing TEXT NOT NULL,
+            recognized_text TEXT NOT NULL,
+            quality_score REAL NOT NULL,
+            quality_status TEXT NOT NULL,
+            character_count INTEGER NOT NULL,
+            word_count INTEGER NOT NULL,
+            mean_confidence REAL,
+            recognized_language TEXT NOT NULL,
+            duration_seconds REAL NOT NULL,
+            is_best INTEGER NOT NULL DEFAULT 0,
+            completed_at REAL NOT NULL,
+            UNIQUE(absolute_path, original_hash, page_number, strategy_id)
+        )
+        """,
+        """
+        CREATE INDEX idx_ocr_attempt_review
+        ON ocr_page_attempts(absolute_path, original_hash, page_number, is_best)
+        """,
+        """
+        UPDATE page_content_analysis
+        SET status = CASE status
+            WHEN 'fullyEmpty' THEN 'unreviewed'
+            WHEN 'imageWithoutText' THEN 'imageWithoutRecognizedText'
+            WHEN 'content' THEN 'contentDetected'
+            WHEN 'technicalError' THEN 'technicalReviewError'
+            ELSE status
+        END
+        WHERE user_decision = 'undecided'
+        """
     ]
 }
 

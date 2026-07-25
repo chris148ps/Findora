@@ -94,49 +94,56 @@ public struct PageContentAnalyzer: Sendable {
         let confidence: Double
         let reason: String
         if characters > 0 {
-            status = .content
+            status = .contentDetected
             confidence = hasSmallText ? 0.92 : 0.99
             reason = hasSmallText
                 ? "Text wurde erkannt; auch kleiner oder randnaher Text wird als Inhalt behandelt."
                 : "\(words) Wörter und \(characters) Zeichen wurden erkannt."
         } else if annotations > 0 {
-            status = .needsOCRReview
+            status = .contentDetected
             confidence = 0.98
             reason = "Die Seite enthält \(annotations) Annotation(en), etwa Stempel, Unterschrift oder Formularinhalt."
         } else if xObjects > 0,
                   raster.darkPixelRatio > 0.00015 || raster.edgeRatio > 0.00015 {
-            status = .imageWithoutText
+            status = .imageWithoutRecognizedText
             confidence = 0.96
             reason = "Eingebettete Bild- oder Grafikobjekte sind sichtbar, aber es wurde kein Text erkannt."
-        } else if raster.whiteRatio >= 0.9995,
-                  raster.darkPixelRatio < 0.00008,
-                  raster.edgeRatio < 0.00008,
-                  raster.variance < 0.00002,
+        } else if raster.whiteRatio >= 0.99999,
+                  raster.darkPixelRatio == 0,
+                  raster.edgeRatio == 0,
+                  raster.variance < 0.0000001,
+                  raster.contrast < 0.005,
+                  raster.borderNonWhiteRatio == 0,
+                  raster.largestStructurePixels == 0,
+                  raster.contrastIslandPixels == 0,
                   xObjects == 0 {
-            status = .fullyEmpty
-            confidence = min(1, 0.995 + (raster.whiteRatio - 0.9995) * 10)
+            status = .safelyEmpty
+            confidence = 0.999
             reason = String(
                 format: "%.3f %% Weißfläche; keine Text-, Bild-, Kanten- oder Annotationsstruktur.",
                 raster.whiteRatio * 100
             )
-        } else if raster.whiteRatio >= 0.995,
-                  raster.darkPixelRatio < 0.001,
-                  raster.edgeRatio < 0.0008,
+        } else if raster.whiteRatio >= 0.999,
+                  raster.darkPixelRatio < 0.00002,
+                  raster.edgeRatio < 0.00002,
+                  raster.largestStructurePixels <= 1,
+                  raster.contrastIslandPixels <= 1,
+                  raster.borderNonWhiteRatio == 0,
                   xObjects == 0 {
             status = .probablyEmpty
-            confidence = min(0.99, max(0.80, raster.whiteRatio))
+            confidence = min(0.95, max(0.70, raster.whiteRatio))
             reason = String(
                 format: "%.2f %% Weißfläche; nur sehr geringe Pixel- und Kantenstruktur.",
                 raster.whiteRatio * 100
             )
-        } else if raster.contrast < 0.10 {
-            status = .needsOCRReview
-            confidence = 0.90
-            reason = "Kontrastarme Strukturen sind vorhanden; die Seite wird nicht als leer eingestuft."
         } else {
-            status = .needsOCRReview
-            confidence = 0.94
-            reason = "Grafische Strukturen oder dunkle Pixel sind vorhanden, obwohl kein Text erkannt wurde."
+            status = .contentDetected
+            confidence = 0.98
+            reason = raster.borderNonWhiteRatio > 0
+                ? "Sichtbare Rand- oder Eckinhalte wurden erkannt; die Seite ist nicht leer."
+                : raster.contrast < 0.10
+                    ? "Kontrastarme Strukturen wurden erkannt; die Seite ist nicht leer."
+                    : "Zusammenhängende Grafik-, Linien-, Barcode- oder Kontraststrukturen wurden erkannt."
         }
         return PageContentAnalysis(
             pageNumber: pageNumber,
@@ -216,6 +223,30 @@ public struct PageContentAnalyzer: Sendable {
                 }
             }
         }
+        let structureMask = pixels.map { $0 < 248 }
+        let largestStructure = Self.largestConnectedComponent(
+            mask: structureMask,
+            width: width,
+            height: height
+        )
+        let borderThickness = max(1, min(width, height) / 10)
+        var borderPixels = 0
+        var borderNonWhite = 0
+        for y in 0..<height {
+            for x in 0..<width
+            where x < borderThickness
+                || x >= width - borderThickness
+                || y < borderThickness
+                || y >= height - borderThickness {
+                borderPixels += 1
+                if pixels[y * width + x] < 250 {
+                    borderNonWhite += 1
+                }
+            }
+        }
+        let contrastIslands = pixels.count {
+            abs(Double($0) - mean) >= 8
+        }
         return RasterMetrics(
             width: width,
             height: height,
@@ -223,8 +254,49 @@ public struct PageContentAnalyzer: Sendable {
             darkPixelRatio: dark,
             variance: variance,
             edgeRatio: comparisons > 0 ? Double(edgeCount) / Double(comparisons) : 0,
-            contrast: Double(Int(maximum) - Int(minimum)) / 255
+            contrast: Double(Int(maximum) - Int(minimum)) / 255,
+            borderNonWhiteRatio: borderPixels > 0
+                ? Double(borderNonWhite) / Double(borderPixels)
+                : 0,
+            largestStructurePixels: largestStructure,
+            contrastIslandPixels: contrastIslands
         )
+    }
+
+    private static func largestConnectedComponent(
+        mask: [Bool],
+        width: Int,
+        height: Int
+    ) -> Int {
+        guard mask.contains(true) else { return 0 }
+        var visited = [Bool](repeating: false, count: mask.count)
+        var largest = 0
+        for start in mask.indices where mask[start] && !visited[start] {
+            var queue = [start]
+            visited[start] = true
+            var cursor = 0
+            while cursor < queue.count {
+                let index = queue[cursor]
+                cursor += 1
+                let x = index % width
+                let y = index / width
+                let neighbors = [
+                    x > 0 ? index - 1 : -1,
+                    x + 1 < width ? index + 1 : -1,
+                    y > 0 ? index - width : -1,
+                    y + 1 < height ? index + width : -1
+                ]
+                for neighbor in neighbors
+                where neighbor >= 0
+                    && mask[neighbor]
+                    && !visited[neighbor] {
+                    visited[neighbor] = true
+                    queue.append(neighbor)
+                }
+            }
+            largest = max(largest, queue.count)
+        }
+        return largest
     }
 
     private static func xObjectCount(on page: CGPDFPage) -> Int {
@@ -252,7 +324,7 @@ public struct PageContentAnalyzer: Sendable {
         PageContentAnalysis(
             pageNumber: pageNumber,
             pageCount: pageCount,
-            status: .technicalError,
+            status: .technicalReviewError,
             confidence: 1,
             reason: reason,
             metrics: PageVisualMetrics(
@@ -283,4 +355,7 @@ private struct RasterMetrics {
     let variance: Double
     let edgeRatio: Double
     let contrast: Double
+    let borderNonWhiteRatio: Double
+    let largestStructurePixels: Int
+    let contrastIslandPixels: Int
 }

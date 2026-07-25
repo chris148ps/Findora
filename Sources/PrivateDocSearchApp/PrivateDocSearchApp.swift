@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import Observation
 import PDFKit
 import PrivateDocSearchCore
@@ -105,6 +106,7 @@ final class AppState {
     var duplicateGroups: [DuplicateGroup] = []
     var emptyPageCandidates: [EmptyPageCandidate] = []
     var emptyPDFCandidates: [EmptyPDFCandidate] = []
+    var ocrReviewCandidates: [OCRReviewCandidate] = []
     var isMaintainingDocuments = false
     var maintenanceMessage: String?
     let hardwareProfile: HardwareProfile
@@ -473,10 +475,14 @@ final class AppState {
             async let duplicates = database.duplicateGroups()
             async let emptyPages = database.emptyPageCandidates()
             async let emptyPDFs = database.emptyPDFCandidates()
-            let snapshot = try await (duplicates, emptyPages, emptyPDFs)
+            async let ocrReview = database.ocrReviewCandidates()
+            let snapshot = try await (
+                duplicates, emptyPages, emptyPDFs, ocrReview
+            )
             duplicateGroups = snapshot.0
             emptyPageCandidates = snapshot.1
             emptyPDFCandidates = snapshot.2
+            ocrReviewCandidates = snapshot.3
         } catch {
             report(error)
         }
@@ -518,9 +524,177 @@ final class AppState {
                     decision: decision
                 )
                 await refreshMaintenance()
+                if decision == .notEmpty {
+                    await retryOCRPage(
+                        path: candidate.absolutePath,
+                        pageNumber: candidate.pageNumber
+                    )
+                }
             } catch {
                 report(error)
             }
+        }
+    }
+
+    func retryOCR(
+        _ candidate: OCRReviewCandidate,
+        configuration: OCRConfiguration? = nil
+    ) {
+        Task {
+            await retryOCRPage(
+                path: candidate.absolutePath,
+                pageNumber: candidate.pageNumber,
+                configuration: configuration
+            )
+        }
+    }
+
+    func retryOCR(_ candidates: [OCRReviewCandidate]) {
+        guard !candidates.isEmpty else { return }
+        Task {
+            for candidate in candidates {
+                guard !Task.isCancelled else { return }
+                await retryOCRPage(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber,
+                    configuration: nil
+                )
+            }
+        }
+    }
+
+    func retryOCR(
+        _ candidates: [OCRReviewCandidate],
+        configuration: OCRConfiguration
+    ) {
+        guard !candidates.isEmpty else { return }
+        Task {
+            for candidate in candidates {
+                guard !Task.isCancelled else { return }
+                await retryOCRPage(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber,
+                    configuration: configuration
+                )
+            }
+        }
+    }
+
+    func confirmNotEmpty(_ candidates: [OCRReviewCandidate]) {
+        guard !candidates.isEmpty else { return }
+        Task {
+            for candidate in candidates {
+                try? await database.setPageReviewDecision(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber,
+                    decision: .notEmpty
+                )
+            }
+            await refreshMaintenance()
+            retryOCR(candidates)
+        }
+    }
+
+    func savePageText(
+        _ candidate: OCRReviewCandidate,
+        text: String,
+        kind: PageTextKind
+    ) {
+        guard !isMaintainingDocuments else { return }
+        isMaintainingDocuments = true
+        Task {
+            defer { isMaintainingDocuments = false }
+            do {
+                try await processor.updatePageText(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber,
+                    text: text,
+                    kind: kind
+                )
+                maintenanceMessage =
+                    "\(kind.displayName) wurde lokal gespeichert und der Seitenindex gezielt aktualisiert."
+                try? await fileLogger.log(
+                    .info,
+                    category: "OCR-Nachbearbeitung",
+                    message: "Benutzergeprüfter Seitentext gespeichert und gezielt indexiert.",
+                    path: candidate.absolutePath
+                )
+                await refreshMaintenance()
+                await refreshDocumentStatus()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func resetManualPageText(_ candidate: OCRReviewCandidate) {
+        guard let original = candidate.originalOCRText else { return }
+        savePageText(candidate, text: original, kind: .automatic)
+    }
+
+    func resetPageReview(_ candidate: OCRReviewCandidate) {
+        Task {
+            do {
+                try await database.resetPageReviewDecision(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber
+                )
+                await refreshMaintenance()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    private func retryOCRPage(
+        path: String,
+        pageNumber: Int,
+        configuration: OCRConfiguration? = nil
+    ) async {
+        guard !isMaintainingDocuments, !isProcessing else { return }
+        isMaintainingDocuments = true
+        maintenanceMessage = "OCR wird automatisch nachbearbeitet …"
+        defer { isMaintainingDocuments = false }
+        do {
+            let outcome = try await processor.retryOCRPage(
+                path: path,
+                pageNumber: pageNumber,
+                configuration: configuration ?? ocrConfiguration
+            ) { [weak self] attempt, total, strategy in
+                await MainActor.run {
+                    self?.maintenanceMessage =
+                        "OCR wird verbessert · Versuch \(attempt) von \(total) · \(strategy.displayName)"
+                }
+            }
+            let isPreview = configuration?.retryStrategyID != nil
+            if let strategy = outcome.bestStrategyByPage[pageNumber] {
+                if isPreview {
+                    maintenanceMessage =
+                        "OCR-Vorschau berechnet · \(strategy.displayName) · noch nicht übernommen"
+                } else {
+                    maintenanceMessage =
+                        outcome.acceptedPageNumbers.contains(pageNumber)
+                            ? "OCR verbessert · Beste Strategie: \(strategy.displayName)"
+                            : "Automatische OCR-Nachbearbeitung ohne ausreichendes Ergebnis."
+                }
+            } else {
+                maintenanceMessage =
+                    "Automatische OCR-Nachbearbeitung ohne ausreichendes Ergebnis."
+            }
+            try? await fileLogger.log(
+                outcome.acceptedPageNumbers.contains(pageNumber) ? .info : .warning,
+                category: "OCR-Nachbearbeitung",
+                message: isPreview
+                    ? "Manuelle OCR-Vorschau ohne Übernahme berechnet."
+                    : outcome.acceptedPageNumbers.contains(pageNumber)
+                        ? "Automatische OCR-Nachbearbeitung erfolgreich abgeschlossen."
+                        : "Automatische OCR-Nachbearbeitung ohne ausreichendes Ergebnis.",
+                path: path
+            )
+            await refreshMaintenance()
+            await refreshDocumentStatus()
+        } catch {
+            report(error)
         }
     }
 
@@ -569,11 +743,11 @@ final class AppState {
             do {
                 let count = try await maintenanceService.trashEmptyPDFs(candidates)
                 maintenanceMessage =
-                    "\(count) vollständig leere PDF(s) wurden in den macOS-Papierkorb verschoben."
+                    "\(count) bestätigte leere PDF(s) wurden in den macOS-Papierkorb verschoben."
                 try? await fileLogger.log(
                     .warning,
                     category: "Dokumentenwartung",
-                    message: "Vollständig leere PDFs in den Papierkorb verschoben: \(count)."
+                    message: "Bestätigte leere PDFs in den Papierkorb verschoben: \(count)."
                 )
                 await refreshMaintenance()
                 await refreshDatabaseState()
@@ -1783,6 +1957,11 @@ struct StatusView: View {
                                 .foregroundStyle(.secondary)
                             Text(state.statistics.currentFile ?? "Ordner wird gescannt …")
                                 .font(.headline)
+                            if let step = state.statistics.currentStep {
+                                Text(step)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -1813,7 +1992,15 @@ struct StatusView: View {
                             MetricCard(title: "OCR-Seiten gut", value: state.statistics.ocrQualityGoodPages)
                             MetricCard(title: "OCR überprüfen", value: state.statistics.ocrQualityReviewPages)
                             MetricCard(title: "Zu prüfende Seiten", value: state.statistics.emptyPageCandidates)
-                            MetricCard(title: "Vollständig leere PDFs", value: state.statistics.fullyEmptyPDFs)
+                            MetricCard(title: "Bestätigte leere PDFs", value: state.statistics.fullyEmptyPDFs)
+                            MetricCard(title: "Sicher leere Seiten", value: state.statistics.safelyEmptyPages)
+                            MetricCard(title: "Vermutlich leere Seiten", value: state.statistics.probablyEmptyPages)
+                            MetricCard(title: "OCR-Nachbearbeitung aktiv", value: state.statistics.ocrRetryingPages)
+                            MetricCard(title: "OCR prüfen", value: state.statistics.ocrReviewPages)
+                            MetricCard(title: "Manuell nicht leer", value: state.statistics.manuallyNotEmptyPages)
+                            MetricCard(title: "OCR ohne Ergebnis", value: state.statistics.ocrNoResultPages)
+                            MetricCard(title: "Manuell korrigiert", value: state.statistics.manuallyCorrectedPages)
+                            MetricCard(title: "Manuell erfasst", value: state.statistics.manuallyEnteredPages)
                         }
                         Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 6) {
                             GridRow {
@@ -1892,6 +2079,7 @@ struct MetricCard: View {
 private enum MaintenanceSection: String, CaseIterable, Identifiable {
     case duplicates = "Duplikate"
     case emptyPages = "Leere Seiten"
+    case ocrReview = "OCR prüfen"
     case emptyPDFs = "Leere PDFs"
     case missingFiles = "Fehlende Dateien"
     case index = "Index und Embeddings"
@@ -1914,7 +2102,9 @@ struct MaintenanceView: View {
     @State private var sort: MaintenanceSort = .fileName
     @State private var selectedDuplicatePaths: Set<String> = []
     @State private var selectedPageIDs: Set<String> = []
+    @State private var selectedOCRReviewIDs: Set<String> = []
     @State private var selectedEmptyPDFPaths: Set<String> = []
+    @State private var manualOCRCandidate: OCRReviewCandidate?
     @State private var confirmsDuplicateTrash = false
     @State private var confirmsPageRemoval = false
     @State private var confirmsEmptyPDFTrash = false
@@ -1963,6 +2153,8 @@ struct MaintenanceView: View {
                     duplicateList
                 case .emptyPages:
                     emptyPageList
+                case .ocrReview:
+                    ocrReviewList
                 case .emptyPDFs:
                     emptyPDFList
                 case .missingFiles:
@@ -1975,6 +2167,10 @@ struct MaintenanceView: View {
         }
         .navigationTitle("Dokumentenwartung")
         .task { await state.refreshMaintenance() }
+        .sheet(item: $manualOCRCandidate) { candidate in
+            ManualOCRReviewSheet(candidate: candidate)
+                .environment(state)
+        }
         .confirmationDialog(
             "Ausgewählte Duplikate in den Papierkorb verschieben?",
             isPresented: $confirmsDuplicateTrash
@@ -2004,7 +2200,7 @@ struct MaintenanceView: View {
             )
         }
         .confirmationDialog(
-            "Vollständig leere PDFs in den Papierkorb verschieben?",
+            "Bestätigte leere PDFs in den Papierkorb verschieben?",
             isPresented: $confirmsEmptyPDFTrash
         ) {
             Button("In den Papierkorb", role: .destructive) {
@@ -2229,7 +2425,7 @@ struct MaintenanceView: View {
             List {
                 if filteredEmptyPDFs.isEmpty {
                     ContentUnavailableView(
-                        "Keine vollständig leeren PDFs",
+                        "Keine bestätigten leeren PDFs",
                         systemImage: "doc"
                     )
                 }
@@ -2257,7 +2453,7 @@ struct MaintenanceView: View {
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                             Text(
-                                "\(candidate.pageCount) vollständig analysierte leere Seite(n) · \(candidate.confidence, format: .percent.precision(.fractionLength(1))) Sicherheit"
+                                "\(candidate.pageCount) analysierte und manuell als leer bestätigte Seite(n) · \(candidate.confidence, format: .percent.precision(.fractionLength(1))) Sicherheit"
                             )
                             .font(.caption)
                             Button("Vorschau") {
@@ -2281,6 +2477,144 @@ struct MaintenanceView: View {
             } reset: {
                 selectedEmptyPDFPaths.removeAll()
             }
+        }
+    }
+
+    private var ocrReviewList: some View {
+        VStack(spacing: 0) {
+            List {
+                if filteredOCRReviewCandidates.isEmpty {
+                    ContentUnavailableView(
+                        "Keine OCR-Prüfung erforderlich",
+                        systemImage: "checkmark.circle"
+                    )
+                }
+                ForEach(filteredOCRReviewCandidates) { candidate in
+                    HStack(alignment: .top, spacing: 12) {
+                        Toggle(
+                            "Auswählen",
+                            isOn: selectionBinding(
+                                candidate.id,
+                                in: $selectedOCRReviewIDs
+                            )
+                        )
+                        .labelsHidden()
+                        MaintenanceThumbnail(
+                            path: candidate.absolutePath,
+                            pageNumber: candidate.pageNumber
+                        )
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(candidate.fileName).font(.headline)
+                                Text("Seite \(candidate.pageNumber)")
+                                Spacer()
+                                Text(candidate.status.displayName)
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.orange)
+                            }
+                            Text(candidate.relativePath)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(candidate.absolutePath)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                            if let best = candidate.bestVariant {
+                                Text(
+                                    "Beste Variante: \(best.strategyName) · \(best.engine.displayName) · \(best.qualityScore, format: .percent.precision(.fractionLength(0)))"
+                                )
+                                .font(.caption)
+                                Text(
+                                    "\(best.characterCount) Zeichen · \(best.wordCount) Wörter · \(best.recognizedLanguage) · \(best.preprocessing)"
+                                )
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                if !best.text.isEmpty {
+                                    Text(best.text)
+                                        .font(.caption)
+                                        .lineLimit(3)
+                                        .textSelection(.enabled)
+                                }
+                            } else {
+                                Text("Noch keine verwertbare OCR-Variante gespeichert.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(
+                                "\(candidate.variants.count) Variante(n) · \(candidate.textKind.displayName)"
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            HStack {
+                                Button("Vorschau") {
+                                    state.previewMaintenanceFile(
+                                        path: candidate.absolutePath,
+                                        fileName: candidate.fileName,
+                                        relativePath: candidate.relativePath,
+                                        pageNumber: candidate.pageNumber
+                                    )
+                                }
+                                Button("Nicht leer") {
+                                    state.confirmNotEmpty([candidate])
+                                }
+                                Button("Automatisch nachbearbeiten") {
+                                    state.retryOCR(candidate)
+                                }
+                                Button("OCR manuell nachbearbeiten") {
+                                    manualOCRCandidate = candidate
+                                }
+                                Button("Manuelle Bewertung zurücksetzen") {
+                                    state.resetPageReview(candidate)
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    .padding(.vertical, 5)
+                }
+            }
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(
+                        "\(selectedOCRReviewIDs.count) ausgewählt · hohe Auflösungen werden einzeln verarbeitet"
+                    )
+                    Text(
+                        "Gemeinsame Strategie: 300 dpi + Kontrast · geschätzt bis ca. 45 MB Arbeitspeicher je Seite"
+                    )
+                    .font(.caption2)
+                }
+                .foregroundStyle(.secondary)
+                Spacer()
+                Button("Auswahl zurücksetzen") {
+                    selectedOCRReviewIDs.removeAll()
+                }
+                .disabled(selectedOCRReviewIDs.isEmpty)
+                Button("Ausgewählte als nicht leer markieren") {
+                    state.confirmNotEmpty(selectedOCRReviewCandidates)
+                }
+                .disabled(selectedOCRReviewCandidates.isEmpty)
+                Button("Ausgewählte automatisch nachbearbeiten") {
+                    state.retryOCR(selectedOCRReviewCandidates)
+                }
+                .disabled(
+                    selectedOCRReviewCandidates.isEmpty
+                        || state.isMaintainingDocuments
+                        || state.isProcessing
+                )
+                Button("Ausgewählte mit gleicher Strategie testen") {
+                    state.retryOCR(
+                        selectedOCRReviewCandidates,
+                        configuration: sharedBulkOCRConfiguration
+                    )
+                }
+                .disabled(
+                    selectedOCRReviewCandidates.isEmpty
+                        || state.isMaintainingDocuments
+                        || state.isProcessing
+                )
+            }
+            .padding()
+            .background(.bar)
         }
     }
 
@@ -2411,6 +2745,30 @@ struct MaintenanceView: View {
         }
     }
 
+    private var filteredOCRReviewCandidates: [OCRReviewCandidate] {
+        let values = state.ocrReviewCandidates.filter {
+            normalizedFilter.isEmpty
+                || $0.fileName.localizedCaseInsensitiveContains(normalizedFilter)
+                || $0.relativePath.localizedCaseInsensitiveContains(normalizedFilter)
+                || $0.status.displayName.localizedCaseInsensitiveContains(normalizedFilter)
+        }
+        switch sort {
+        case .fileName:
+            return values.sorted {
+                $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending
+            }
+        case .path:
+            return values.sorted {
+                $0.relativePath.localizedStandardCompare($1.relativePath) == .orderedAscending
+            }
+        case .confidence:
+            return values.sorted {
+                ($0.bestVariant?.qualityScore ?? 0)
+                    > ($1.bestVariant?.qualityScore ?? 0)
+            }
+        }
+    }
+
     private var selectedDuplicateLocations: [DuplicateLocation] {
         state.duplicateGroups.flatMap(\.locations).filter {
             selectedDuplicatePaths.contains($0.absolutePath)
@@ -2435,10 +2793,27 @@ struct MaintenanceView: View {
         }
     }
 
+    private var selectedOCRReviewCandidates: [OCRReviewCandidate] {
+        state.ocrReviewCandidates.filter {
+            selectedOCRReviewIDs.contains($0.id)
+        }
+    }
+
     private var selectedEmptyPDFs: [EmptyPDFCandidate] {
         state.emptyPDFCandidates.filter {
             selectedEmptyPDFPaths.contains($0.absolutePath)
         }
+    }
+
+    private var sharedBulkOCRConfiguration: OCRConfiguration {
+        var configuration = state.ocrConfiguration
+        configuration.persistenceMode = .nonDestructive
+        configuration.maximumParallelFiles = 1
+        configuration.renderDPI = 300
+        configuration.enhanceContrast = true
+        configuration.backgroundLightening = true
+        configuration.retryStrategyID = "shared-300-contrast"
+        return configuration
     }
 
     private var normalizedFilter: String {
@@ -2526,6 +2901,333 @@ private struct MaintenanceThumbnail: View {
                 for: .mediaBox
             )
         }
+    }
+}
+
+private struct ManualOCRReviewSheet: View {
+    @Environment(AppState.self) private var state
+    @Environment(\.dismiss) private var dismiss
+    let candidate: OCRReviewCandidate
+    @State private var configuration: OCRConfiguration
+    @State private var editedText: String
+
+    init(candidate: OCRReviewCandidate) {
+        self.candidate = candidate
+        var configuration = OCRConfiguration.default
+        configuration.persistenceMode = .nonDestructive
+        configuration.maximumParallelFiles = 1
+        configuration.rotatePages = true
+        _configuration = State(initialValue: configuration)
+        _editedText = State(
+            initialValue: candidate.currentText.isEmpty
+                ? candidate.bestVariant?.text ?? ""
+                : candidate.currentText
+        )
+    }
+
+    private var latestCandidate: OCRReviewCandidate {
+        state.ocrReviewCandidates.first(where: { $0.id == candidate.id })
+            ?? candidate
+    }
+
+    var body: some View {
+        HSplitView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Originalseite").font(.headline)
+                PDFKitView(
+                    url: URL(filePath: candidate.absolutePath),
+                    pageNumber: candidate.pageNumber
+                )
+                Text("Vorschau der gewählten Bildaufbereitung").font(.headline)
+                ProcessedOCRPreview(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber,
+                    configuration: configuration
+                )
+                .frame(height: 190)
+            }
+            .padding()
+            .frame(minWidth: 520, minHeight: 680)
+
+            Form {
+                Section("OCR-Einstellungen") {
+                    Picker("OCR-Engine", selection: $configuration.engineSelection) {
+                        Text("Automatisch").tag(OCREngineSelection.automatic)
+                        Text("Apple Vision").tag(OCREngineSelection.appleVision)
+                        Text("Tesseract").tag(OCREngineSelection.tesseractOCRmyPDF)
+                    }
+                    Picker("Sprache", selection: languageBinding) {
+                        Text("Deutsch").tag("deu")
+                        Text("Englisch").tag("eng")
+                        Text("Deutsch + Englisch").tag("deu+eng")
+                    }
+                    Picker("Drehung", selection: $configuration.manualRotationDegrees) {
+                        Text("Automatisch / 0°").tag(0)
+                        Text("90°").tag(90)
+                        Text("180°").tag(180)
+                        Text("270°").tag(270)
+                    }
+                    Picker("Auflösung", selection: $configuration.renderDPI) {
+                        Text("Standard").tag(144)
+                        Text("300 dpi").tag(300)
+                        Text("400 dpi").tag(400)
+                        Text("600 dpi").tag(600)
+                    }
+                    if configuration.renderDPI == 600 {
+                        Label(
+                            "600 dpi benötigt viel Speicher und wird nur für diese Seite einzeln ausgeführt.",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    }
+                }
+
+                Section("Bildaufbereitung") {
+                    Toggle("Kontrast erhöhen", isOn: $configuration.enhanceContrast)
+                    Toggle("Schwarz-Weiß-Binarisierung", isOn: $configuration.binarize)
+                    Toggle("Adaptive Binarisierung", isOn: $configuration.adaptiveBinarize)
+                    Toggle("Hintergrund aufhellen", isOn: $configuration.backgroundLightening)
+                    Toggle("Schatten reduzieren", isOn: $configuration.reduceShadows)
+                    Toggle("Begradigen", isOn: $configuration.deskew)
+                    Toggle("Rauschen entfernen", isOn: $configuration.denoise)
+                    Toggle("Schärfen", isOn: $configuration.sharpen)
+                    Toggle("Rand beschneiden", isOn: $configuration.cropBorders)
+                    Text(
+                        "Graustufen werden bei Kontrast- oder Binarisierungsverarbeitung automatisch verwendet. Nicht unterstützte Filter werden nicht vorgetäuscht."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                Section("OCR-Vorschau") {
+                    if let best = latestCandidate.bestVariant {
+                        LabeledContent("Beste Strategie", value: best.strategyName)
+                        LabeledContent("Engine", value: best.engine.displayName)
+                        LabeledContent(
+                            "Qualität",
+                            value: best.qualityScore.formatted(
+                                .percent.precision(.fractionLength(0))
+                            )
+                        )
+                        LabeledContent(
+                            "Umfang",
+                            value: "\(best.characterCount) Zeichen · \(best.wordCount) Wörter"
+                        )
+                        LabeledContent("Sprache", value: best.recognizedLanguage)
+                        LabeledContent(
+                            "Laufzeit",
+                            value: "\(best.durationSeconds.formatted(.number.precision(.fractionLength(1)))) s"
+                        )
+                    } else {
+                        Text("Noch keine OCR-Variante verfügbar.")
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Andere Einstellungen testen") {
+                        state.retryOCR(
+                            candidate,
+                            configuration: manualTestConfiguration
+                        )
+                    }
+                    .disabled(state.isMaintainingDocuments || state.isProcessing)
+                }
+
+                Section("Aktuelle und alternative Fassungen") {
+                    if !latestCandidate.currentText.isEmpty {
+                        DisclosureGroup("Aktuell gespeicherte Fassung") {
+                            Text(latestCandidate.currentText)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    ForEach(
+                        latestCandidate.variants.sorted {
+                            $0.qualityScore > $1.qualityScore
+                        }
+                    ) { variant in
+                        DisclosureGroup(
+                            "\(variant.isBest ? "Beste Variante · " : "")\(variant.strategyName) · \(variant.qualityScore, format: .percent.precision(.fractionLength(0)))"
+                        ) {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(
+                                    "\(variant.engine.displayName) · \(variant.preprocessing)"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                Text(variant.text.isEmpty ? "Kein Text erkannt" : variant.text)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+
+                Section("Text bearbeiten oder manuell erfassen") {
+                    TextEditor(text: $editedText)
+                        .font(.body.monospaced())
+                        .frame(minHeight: 180)
+                    HStack {
+                        Button("Beste OCR-Fassung einsetzen") {
+                            editedText = latestCandidate.bestVariant?.text ?? editedText
+                        }
+                        .disabled(latestCandidate.bestVariant == nil)
+                        Button("Zur ursprünglichen OCR-Fassung zurücksetzen") {
+                            editedText = latestCandidate.originalOCRText ?? ""
+                        }
+                        .disabled(latestCandidate.originalOCRText == nil)
+                    }
+                    Text(
+                        "Der Text wird nur lokal in SQLite gespeichert. Die PDF bleibt unverändert; FTS, Chunks und Embeddings werden nur für diese Seite ersetzt."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            .frame(minWidth: 440)
+        }
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Button("Abbrechen") { dismiss() }
+                Spacer()
+                Button("Als vollständig manuell erfasst speichern") {
+                    state.savePageText(
+                        latestCandidate,
+                        text: editedText,
+                        kind: .manuallyEntered
+                    )
+                    dismiss()
+                }
+                .disabled(editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Korrigiertes Ergebnis übernehmen") {
+                    state.savePageText(
+                        latestCandidate,
+                        text: editedText,
+                        kind: .manuallyCorrected
+                    )
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(editedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding()
+            .background(.bar)
+        }
+        .frame(minWidth: 1_050, minHeight: 740)
+    }
+
+    private var languageBinding: Binding<String> {
+        Binding(
+            get: {
+                configuration.languages == ["deu"] ? "deu"
+                    : configuration.languages == ["eng"] ? "eng"
+                    : "deu+eng"
+            },
+            set: { selection in
+                configuration.languages = switch selection {
+                case "deu": ["deu"]
+                case "eng": ["eng"]
+                default: ["deu", "eng"]
+                }
+            }
+        )
+    }
+
+    private var manualTestConfiguration: OCRConfiguration {
+        var tested = configuration
+        tested.retryStrategyID = "manual-\(UUID().uuidString)"
+        return tested
+    }
+}
+
+private struct ProcessedOCRPreview: View {
+    let path: String
+    let pageNumber: Int
+    let configuration: OCRConfiguration
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                ProgressView()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.black.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+        .task(id: configuration) {
+            image = render()
+        }
+    }
+
+    private func render() -> NSImage? {
+        guard let document = PDFDocument(url: URL(filePath: path)),
+              let page = document.page(at: max(0, pageNumber - 1)) else {
+            return nil
+        }
+        let thumbnail = page.thumbnail(
+            of: NSSize(width: 900, height: 1_200),
+            for: .mediaBox
+        )
+        guard let data = thumbnail.tiffRepresentation,
+              var input = CIImage(data: data) else {
+            return thumbnail
+        }
+        if configuration.cropBorders {
+            let extent = input.extent
+            input = input.cropped(
+                to: extent.insetBy(
+                    dx: extent.width * 0.01,
+                    dy: extent.height * 0.01
+                )
+            )
+        }
+        if configuration.enhanceContrast
+            || configuration.binarize
+            || configuration.adaptiveBinarize {
+            input = input.applyingFilter(
+                "CIColorControls",
+                parameters: [
+                    kCIInputSaturationKey: 0,
+                    kCIInputContrastKey: configuration.binarize
+                        || configuration.adaptiveBinarize ? 4.0 : 1.6
+                ]
+            )
+        }
+        if configuration.backgroundLightening || configuration.reduceShadows {
+            input = input.applyingFilter(
+                "CIExposureAdjust",
+                parameters: [kCIInputEVKey: 0.35]
+            )
+        }
+        if configuration.denoise {
+            input = input.applyingFilter(
+                "CINoiseReduction",
+                parameters: ["inputNoiseLevel": 0.02, "inputSharpness": 0.4]
+            )
+        }
+        if configuration.sharpen {
+            input = input.applyingFilter(
+                "CISharpenLuminance",
+                parameters: [kCIInputSharpnessKey: 0.7]
+            )
+        }
+        let orientation: CGImagePropertyOrientation = switch
+            configuration.manualRotationDegrees {
+        case 90: .right
+        case 180: .down
+        case 270: .left
+        default: .up
+        }
+        input = input.oriented(orientation)
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        guard let cgImage = context.createCGImage(input, from: input.extent) else {
+            return thumbnail
+        }
+        return NSImage(cgImage: cgImage, size: .zero)
     }
 }
 

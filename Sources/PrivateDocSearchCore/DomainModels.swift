@@ -258,6 +258,14 @@ public struct DocumentStatistics: Equatable, Sendable {
     public var ocrQualityFailedPages = 0
     public var emptyPageCandidates = 0
     public var fullyEmptyPDFs = 0
+    public var safelyEmptyPages = 0
+    public var probablyEmptyPages = 0
+    public var ocrRetryingPages = 0
+    public var ocrReviewPages = 0
+    public var manuallyNotEmptyPages = 0
+    public var ocrNoResultPages = 0
+    public var manuallyCorrectedPages = 0
+    public var manuallyEnteredPages = 0
     public var processedJobs = 0
     public var totalJobs = 0
     public var currentStep: String?
@@ -304,26 +312,59 @@ public enum DocumentStatusPrimaryMetric: String, CaseIterable, Identifiable, Sen
 }
 
 public enum PageContentStatus: String, Codable, CaseIterable, Hashable, Sendable {
+    case unreviewed
+    case safelyEmpty
     case fullyEmpty
     case probablyEmpty
+    case contentDetected
     case imageWithoutText
+    case imageWithoutRecognizedText
+    case ocrRetrying
     case needsOCRReview
     case content
+    case manuallyConfirmedEmpty
+    case manuallyConfirmedNotEmpty
+    case ocrNoResult
+    case manuallyCorrectedText
+    case manuallyEnteredText
     case technicalError
+    case technicalReviewError
 
     public var displayName: String {
         switch self {
+        case .unreviewed: "Ungeprüft"
+        case .safelyEmpty: "Sicher leer"
         case .fullyEmpty: "Vollständig leer"
         case .probablyEmpty: "Vermutlich leer"
+        case .contentDetected: "Inhalt erkannt"
         case .imageWithoutText: "Bild ohne erkannten Text"
+        case .imageWithoutRecognizedText: "Bildinhalt ohne erkannten Text"
+        case .ocrRetrying: "OCR wird automatisch nachbearbeitet"
         case .needsOCRReview: "OCR überprüfen"
         case .content: "Inhalt vorhanden"
+        case .manuallyConfirmedEmpty: "Manuell als leer bestätigt"
+        case .manuallyConfirmedNotEmpty: "Manuell als nicht leer bestätigt"
+        case .ocrNoResult: "OCR ohne Ergebnis"
+        case .manuallyCorrectedText: "Manuell korrigierter Text"
+        case .manuallyEnteredText: "Manuell erfasster Text"
         case .technicalError: "Technischer Fehler"
+        case .technicalReviewError: "Technischer Prüfungsfehler"
         }
     }
 
     public var isEmptyCandidate: Bool {
-        self == .fullyEmpty || self == .probablyEmpty
+        self == .safelyEmpty || self == .probablyEmpty
+    }
+
+    public var hasVisibleContent: Bool {
+        switch self {
+        case .contentDetected, .imageWithoutRecognizedText, .needsOCRReview,
+             .manuallyConfirmedNotEmpty, .ocrNoResult, .manuallyCorrectedText,
+             .manuallyEnteredText:
+            true
+        default:
+            false
+        }
     }
 }
 
@@ -340,6 +381,119 @@ public enum PageReviewDecision: String, Codable, CaseIterable, Hashable, Sendabl
         case .notEmpty: "Als nicht leer markiert"
         case .excluded: "Von Prüfungen ausgeschlossen"
         }
+    }
+}
+
+public enum PageTextKind: String, Codable, CaseIterable, Hashable, Sendable {
+    case automatic
+    case manuallyCorrected
+    case manuallyEntered
+
+    public var displayName: String {
+        switch self {
+        case .automatic: "Automatisch erkannter Text"
+        case .manuallyCorrected: "Manuell korrigierter Text"
+        case .manuallyEntered: "Manuell vollständig erfasster Text"
+        }
+    }
+}
+
+public struct OCRVariantSummary: Identifiable, Equatable, Hashable, Sendable {
+    public var id: String { "\(pageNumber)#\(strategyID)" }
+    public let pageNumber: Int
+    public let strategyID: String
+    public let strategyName: String
+    public let engine: OCREngine
+    public let preprocessing: String
+    public let text: String
+    public let qualityScore: Double
+    public let qualityStatus: OCRQualityStatus
+    public let characterCount: Int
+    public let wordCount: Int
+    public let meanConfidence: Double?
+    public let recognizedLanguage: String
+    public let durationSeconds: Double
+    public let isBest: Bool
+
+    public init(
+        pageNumber: Int,
+        strategyID: String,
+        strategyName: String,
+        engine: OCREngine,
+        preprocessing: String,
+        text: String,
+        qualityScore: Double,
+        qualityStatus: OCRQualityStatus,
+        characterCount: Int,
+        wordCount: Int,
+        meanConfidence: Double?,
+        recognizedLanguage: String,
+        durationSeconds: Double,
+        isBest: Bool
+    ) {
+        self.pageNumber = pageNumber
+        self.strategyID = strategyID
+        self.strategyName = strategyName
+        self.engine = engine
+        self.preprocessing = preprocessing
+        self.text = text
+        self.qualityScore = qualityScore
+        self.qualityStatus = qualityStatus
+        self.characterCount = characterCount
+        self.wordCount = wordCount
+        self.meanConfidence = meanConfidence
+        self.recognizedLanguage = recognizedLanguage
+        self.durationSeconds = durationSeconds
+        self.isBest = isBest
+    }
+}
+
+public struct OCRReviewCandidate: Identifiable, Equatable, Hashable, Sendable {
+    public var id: String { "\(absolutePath)#\(pageNumber)" }
+    public let absolutePath: String
+    public let relativePath: String
+    public let fileName: String
+    public let originalHash: String
+    public let pageNumber: Int
+    public let pageCount: Int
+    public let status: PageContentStatus
+    public let decision: PageReviewDecision
+    public let currentText: String
+    public let originalOCRText: String?
+    public let textKind: PageTextKind
+    public let variants: [OCRVariantSummary]
+
+    public init(
+        absolutePath: String,
+        relativePath: String,
+        fileName: String,
+        originalHash: String,
+        pageNumber: Int,
+        pageCount: Int,
+        status: PageContentStatus,
+        decision: PageReviewDecision,
+        currentText: String,
+        originalOCRText: String?,
+        textKind: PageTextKind,
+        variants: [OCRVariantSummary]
+    ) {
+        self.absolutePath = absolutePath
+        self.relativePath = relativePath
+        self.fileName = fileName
+        self.originalHash = originalHash
+        self.pageNumber = pageNumber
+        self.pageCount = pageCount
+        self.status = status
+        self.decision = decision
+        self.currentText = currentText
+        self.originalOCRText = originalOCRText
+        self.textKind = textKind
+        self.variants = variants
+    }
+
+    public var bestVariant: OCRVariantSummary? {
+        variants.first(where: \.isBest)
+            ?? variants.max(by: { $0.qualityScore < $1.qualityScore })
     }
 }
 
@@ -430,6 +584,14 @@ public struct EmptyPageCandidate: Identifiable, Equatable, Hashable, Sendable {
     public let reason: String
     public let metrics: PageVisualMetrics
     public let decision: PageReviewDecision
+
+    public var effectiveStatus: PageContentStatus {
+        switch decision {
+        case .confirmedEmpty: .manuallyConfirmedEmpty
+        case .notEmpty: .manuallyConfirmedNotEmpty
+        case .undecided, .excluded: status
+        }
+    }
 
     public init(
         absolutePath: String,
@@ -538,17 +700,20 @@ public struct DuplicateGroup: Identifiable, Equatable, Hashable, Sendable {
 public struct StoredDocumentText: Sendable {
     public let documentID: Int64
     public let contentHash: String
+    public let currentFileHash: String?
     public let modifiedAt: Date
     public let pages: [ExtractedPage]
 
     public init(
         documentID: Int64,
         contentHash: String,
+        currentFileHash: String? = nil,
         modifiedAt: Date,
         pages: [ExtractedPage]
     ) {
         self.documentID = documentID
         self.contentHash = contentHash
+        self.currentFileHash = currentFileHash
         self.modifiedAt = modifiedAt
         self.pages = pages
     }

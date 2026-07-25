@@ -2,6 +2,7 @@ import AppKit
 import CoreText
 import Foundation
 import PDFKit
+import SQLite3
 import Testing
 @testable import PrivateDocSearchCore
 
@@ -11,6 +12,22 @@ func documentStatusHasExactlyFourPrimaryMetrics() {
         DocumentStatusPrimaryMetric.allCases
             == [.totalPDFs, .indexedPDFs, .pendingJobs, .duplicates]
     )
+}
+
+@Test
+func migrationResetsLegacyAutomaticEmptyStatusButPreservesManualDecision() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let databaseURL = root.appending(path: "legacy.sqlite")
+    try createLegacyMaintenanceDatabase(at: databaseURL)
+
+    let database = SQLiteDatabase(url: databaseURL)
+    try await database.initialize()
+
+    let rows = try readLegacyMigrationRows(at: databaseURL)
+    #expect(rows["/automatic.pdf"] == "unreviewed|undecided")
+    #expect(rows["/manual.pdf"] == "fullyEmpty|confirmedEmpty")
+    #expect(rows["/content.pdf"] == "contentDetected|undecided")
 }
 
 @Test
@@ -26,26 +43,27 @@ func pageContentAnalysisDistinguishesBlankVisualAndTextPages() throws {
             .signature,
             .stamp,
             .lowContrast,
-            .smallMarginNote
+            .smallMarginNote,
+            .barcode,
+            .qrCode,
+            .formField,
+            .annotation,
+            .highWhiteSmallContent
         ]
     )
     let analyses = try PageContentAnalyzer().analyze(fileAt: visualPDF)
-    #expect(analyses.count == 6)
-    #expect(analyses[0].status == .fullyEmpty)
-    #expect(analyses[1].status == .needsOCRReview)
-    #expect(analyses[2].status == .needsOCRReview)
-    #expect(analyses[3].status == .needsOCRReview)
-    #expect(analyses[4].status == .needsOCRReview)
-    #expect(analyses[5].status == .content)
+    #expect(analyses.count == 11)
+    #expect(analyses[0].status == .safelyEmpty)
+    #expect(analyses.dropFirst().allSatisfy { $0.status != .safelyEmpty })
     #expect(analyses[5].metrics.hasSmallText)
-    #expect(analyses.dropFirst().allSatisfy { !$0.status.isEmptyCandidate })
+    #expect(analyses[9].metrics.annotationCount > 0)
 
     let imagePDF = root.appending(path: "Bild-ohne-Text.pdf")
     try createMaintenanceImagePDF(at: imagePDF)
     let image = try #require(
         PageContentAnalyzer().analyze(fileAt: imagePDF).first
     )
-    #expect(image.status == .imageWithoutText)
+    #expect(image.status == .imageWithoutRecognizedText)
     #expect(image.metrics.embeddedImageCount > 0)
 }
 
@@ -78,12 +96,21 @@ func fullyEmptyPDFAndSingleEmptyPageArePersistedSeparately() async throws {
         candidates.contains {
             $0.fileName == "Gemischt.pdf"
                 && $0.pageNumber == 2
-                && $0.status == .fullyEmpty
+                && $0.status == .safelyEmpty
         }
     )
     let emptyPDFs = try await database.emptyPDFCandidates()
-    #expect(emptyPDFs.map(\.fileName) == ["Komplett leer.pdf"])
-    #expect(emptyPDFs.first?.pageCount == 2)
+    #expect(emptyPDFs.isEmpty)
+    for pageNumber in 1...2 {
+        try await database.setPageReviewDecision(
+            path: blank.path,
+            pageNumber: pageNumber,
+            decision: .confirmedEmpty
+        )
+    }
+    let confirmedEmptyPDFs = try await database.emptyPDFCandidates()
+    #expect(confirmedEmptyPDFs.map(\.fileName) == ["Komplett leer.pdf"])
+    #expect(confirmedEmptyPDFs.first?.pageCount == 2)
 }
 
 @Test
@@ -164,6 +191,11 @@ func emptyPDFTrashUpdatesDatabaseOnlyAfterRecoverableMove() async throws {
     await maintenanceProcessor(database: database).processPending(
         ocrConfiguration: OCRConfiguration(isEnabled: false)
     ) { _ in }
+    try await database.setPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 1,
+        decision: .confirmedEmpty
+    )
     let candidate = try #require(try await database.emptyPDFCandidates().first)
     let trash = TestTrashManager(
         directory: root.appending(path: "Trash", directoryHint: .isDirectory)
@@ -177,6 +209,98 @@ func emptyPDFTrashUpdatesDatabaseOnlyAfterRecoverableMove() async throws {
     #expect(try await database.emptyPDFCandidates().isEmpty)
     #expect(try await database.statistics().totalPDFs == 0)
     #expect(trash.trashedItemCount == 1)
+}
+
+@Test
+func manualNotEmptyDecisionSurvivesReanalysisAndResetsForChangedHash() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let pdf = root.appending(path: "Entscheidung.pdf")
+    try createMaintenancePDF(at: pdf, pages: [.blank])
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    let original = try #require(
+        try await database.emptyPageCandidates().first
+    )
+    try await database.setPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 1,
+        decision: .notEmpty
+    )
+    try await database.replacePageContentAnalyses(
+        path: pdf.path,
+        originalHash: original.originalHash,
+        analyses: PageContentAnalyzer().analyze(fileAt: pdf)
+    )
+    #expect(try await database.emptyPageCandidates().isEmpty)
+    #expect(try await database.statistics().manuallyNotEmptyPages == 1)
+
+    try await database.replacePageContentAnalyses(
+        path: pdf.path,
+        originalHash: "synthetic-changed-hash",
+        analyses: PageContentAnalyzer().analyze(fileAt: pdf)
+    )
+    #expect(try await database.emptyPageCandidates().first?.decision == .undecided)
+}
+
+@Test
+func manualPageTextUpdatesOnlyPageIndexAndPreservesOriginalOCRText() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let pdf = root.appending(path: "Manueller Text.pdf")
+    try createMaintenancePDF(at: pdf, pages: [.blank])
+    let hashBefore = try SHA256Hasher().hash(fileAt: pdf)
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    let embedder = TokenHashEmbedding(dimensions: 64)
+    let processor = DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: embedder
+    )
+    await processor.processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    try await processor.updatePageText(
+        path: pdf.path,
+        pageNumber: 1,
+        text: "URSPRÜNGLICHE SYNTHETISCHE OCR FASSUNG",
+        kind: .automatic
+    )
+    try await processor.updatePageText(
+        path: pdf.path,
+        pageNumber: 1,
+        text: "KORRIGIERTER EINDEUTIGER SUCHBEGRIFF",
+        kind: .manuallyCorrected
+    )
+    let candidate = try #require(
+        try await database.ocrReviewCandidates().first
+    )
+    #expect(candidate.originalOCRText == "URSPRÜNGLICHE SYNTHETISCHE OCR FASSUNG")
+    #expect(candidate.currentText == "KORRIGIERTER EINDEUTIGER SUCHBEGRIFF")
+    #expect(candidate.textKind == .manuallyCorrected)
+    let results = try await HybridSearchService(
+        database: database,
+        embedder: embedder
+    ).search("KORRIGIERTER EINDEUTIGER SUCHBEGRIFF")
+    #expect(results.first?.pageNumber == 1)
+    #expect(try SHA256Hasher().hash(fileAt: pdf) == hashBefore)
+    #expect(try await database.statistics().manuallyCorrectedPages == 1)
 }
 
 @Test
@@ -297,6 +421,11 @@ private enum MaintenancePage {
     case stamp
     case lowContrast
     case smallMarginNote
+    case barcode
+    case qrCode
+    case formField
+    case annotation
+    case highWhiteSmallContent
     case text(String)
 }
 
@@ -305,6 +434,98 @@ private func maintenanceTemporaryDirectory() -> URL {
         .appending(path: "PrivateDocSearchMaintenanceTests-\(UUID().uuidString)")
     try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+private func createLegacyMaintenanceDatabase(at url: URL) throws {
+    var connection: OpaquePointer?
+    guard sqlite3_open(url.path, &connection) == SQLITE_OK,
+          let connection else {
+        throw PrivateDocSearchError.database("Legacy-Testdatenbank konnte nicht geöffnet werden.")
+    }
+    defer { sqlite3_close(connection) }
+    let statements = [
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)",
+        "INSERT INTO schema_migrations VALUES (7, 0)",
+        """
+        CREATE TABLE page_content_analysis (
+            absolute_path TEXT NOT NULL,
+            original_hash TEXT NOT NULL,
+            page_number INTEGER NOT NULL,
+            page_count INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            reason TEXT NOT NULL,
+            render_succeeded INTEGER NOT NULL,
+            pixel_width INTEGER NOT NULL,
+            pixel_height INTEGER NOT NULL,
+            white_ratio REAL NOT NULL,
+            dark_pixel_ratio REAL NOT NULL,
+            variance REAL NOT NULL,
+            edge_ratio REAL NOT NULL,
+            contrast REAL NOT NULL,
+            character_count INTEGER NOT NULL,
+            word_count INTEGER NOT NULL,
+            ocr_confidence REAL,
+            embedded_image_count INTEGER NOT NULL,
+            annotation_count INTEGER NOT NULL,
+            has_small_text INTEGER NOT NULL,
+            user_decision TEXT NOT NULL DEFAULT 'undecided',
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(absolute_path, page_number)
+        )
+        """,
+        """
+        INSERT INTO page_content_analysis
+        VALUES ('/automatic.pdf','a',1,1,'fullyEmpty',1,'legacy',1,1,1,1,0,0,0,0,0,0,NULL,0,0,0,'undecided',0)
+        """,
+        """
+        INSERT INTO page_content_analysis
+        VALUES ('/manual.pdf','b',1,1,'fullyEmpty',1,'legacy',1,1,1,1,0,0,0,0,0,0,NULL,0,0,0,'confirmedEmpty',0)
+        """,
+        """
+        INSERT INTO page_content_analysis
+        VALUES ('/content.pdf','c',1,1,'content',1,'legacy',1,1,1,1,0,0,0,0,0,0,NULL,0,0,0,'undecided',0)
+        """,
+        "CREATE TABLE pages (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE processing_jobs (id INTEGER PRIMARY KEY)"
+    ]
+    for statement in statements {
+        guard sqlite3_exec(connection, statement, nil, nil, nil) == SQLITE_OK else {
+            throw PrivateDocSearchError.database(
+                String(cString: sqlite3_errmsg(connection))
+            )
+        }
+    }
+}
+
+private func readLegacyMigrationRows(at url: URL) throws -> [String: String] {
+    var connection: OpaquePointer?
+    guard sqlite3_open_v2(url.path, &connection, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+          let connection else {
+        throw PrivateDocSearchError.database("Migrierte Testdatenbank konnte nicht gelesen werden.")
+    }
+    defer { sqlite3_close(connection) }
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(
+        connection,
+        "SELECT absolute_path, status, user_decision FROM page_content_analysis",
+        -1,
+        &statement,
+        nil
+    ) == SQLITE_OK,
+    let statement else {
+        throw PrivateDocSearchError.database(String(cString: sqlite3_errmsg(connection)))
+    }
+    defer { sqlite3_finalize(statement) }
+    var result: [String: String] = [:]
+    while sqlite3_step(statement) == SQLITE_ROW {
+        guard let pathBytes = sqlite3_column_text(statement, 0),
+              let statusBytes = sqlite3_column_text(statement, 1),
+              let decisionBytes = sqlite3_column_text(statement, 2) else { continue }
+        result[String(cString: pathBytes)] =
+            "\(String(cString: statusBytes))|\(String(cString: decisionBytes))"
+    }
+    return result
 }
 
 private func maintenanceProcessor(database: SQLiteDatabase) -> DocumentProcessor {
@@ -368,6 +589,45 @@ private func createMaintenancePDF(
                 at: CGPoint(x: 8, y: 18),
                 in: context
             )
+        case .barcode:
+            context.setFillColor(gray: 0.05, alpha: 1)
+            for index in 0..<24 where index % 3 != 0 {
+                context.fill(
+                    CGRect(
+                        x: 190 + CGFloat(index * 7),
+                        y: 100,
+                        width: index.isMultiple(of: 4) ? 4 : 2,
+                        height: 42
+                    )
+                )
+            }
+        case .qrCode:
+            context.setFillColor(gray: 0, alpha: 1)
+            for row in 0..<9 {
+                for column in 0..<9
+                    where (row * 7 + column * 3 + row * column).isMultiple(of: 4) {
+                    context.fill(
+                        CGRect(
+                            x: 270 + CGFloat(column * 5),
+                            y: 390 + CGFloat(row * 5),
+                            width: 5,
+                            height: 5
+                        )
+                    )
+                }
+            }
+        case .formField:
+            context.setStrokeColor(gray: 0.25, alpha: 1)
+            context.setLineWidth(1)
+            context.stroke(CGRect(x: 80, y: 650, width: 12, height: 12))
+            context.move(to: CGPoint(x: 110, y: 656))
+            context.addLine(to: CGPoint(x: 280, y: 656))
+            context.strokePath()
+        case .annotation:
+            break
+        case .highWhiteSmallContent:
+            context.setFillColor(gray: 0, alpha: 1)
+            context.fill(CGRect(x: 565, y: 12, width: 5, height: 5))
         case .text(let value):
             drawMaintenanceText(
                 value,
@@ -379,6 +639,28 @@ private func createMaintenancePDF(
         context.endPDFPage()
     }
     context.closePDF()
+    if pages.contains(where: {
+        if case .annotation = $0 { return true }
+        return false
+    }), let document = PDFDocument(url: url) {
+        for (index, pageKind) in pages.enumerated() {
+            guard case .annotation = pageKind,
+                  let page = document.page(at: index) else { continue }
+            let annotation = PDFAnnotation(
+                bounds: CGRect(x: 40, y: 40, width: 80, height: 24),
+                forType: .widget,
+                withProperties: nil
+            )
+            annotation.widgetFieldType = .button
+            annotation.fieldName = "synthetic-test-field"
+            page.addAnnotation(annotation)
+        }
+        guard document.write(to: url) else {
+            throw PrivateDocSearchError.invalidPDF(
+                "Synthetische Annotation konnte nicht gespeichert werden."
+            )
+        }
+    }
 }
 
 private func drawMaintenanceText(

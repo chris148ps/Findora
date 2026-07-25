@@ -71,11 +71,22 @@ public actor VisionOCRProvider: OCRProvider {
                     "Apple Vision konnte Seite \(pageNumber) nicht laden."
                 )
             }
-            let image = try render(page)
-            let recognized = try recognize(
-                image,
-                configuredLanguages: configuration.languages
-            )
+            let image = try render(page, configuration: configuration)
+            let rotations = configuration.manualRotationDegrees == 0
+                && configuration.rotatePages
+                ? [0, 90, 180, 270]
+                : [configuration.manualRotationDegrees]
+            let recognized = try rotations.map {
+                try recognize(
+                    image,
+                    configuredLanguages: configuration.languages,
+                    rotationDegrees: $0
+                )
+            }.max { lhs, rhs in
+                let left = Double(lhs.text.count) + (lhs.meanConfidence ?? 0)
+                let right = Double(rhs.text.count) + (rhs.meanConfidence ?? 0)
+                return left < right
+            } ?? (text: "", meanConfidence: nil)
             pages.append(
                 ExtractedPage(
                     pageNumber: pageNumber,
@@ -115,39 +126,145 @@ public actor VisionOCRProvider: OCRProvider {
         )
     }
 
-    private func render(_ page: CGPDFPage) throws -> CGImage {
+    private func render(
+        _ page: CGPDFPage,
+        configuration: OCRConfiguration
+    ) throws -> CGImage {
         let bounds = page.getBoxRect(.mediaBox)
         let longestEdge = max(bounds.width, bounds.height)
-        let scale = min(rendererScale, longestEdge > 0 ? 3_000 / longestEdge : 1)
+        let requestedScale = max(rendererScale, CGFloat(configuration.renderDPI) / 72)
+        let maximumPixels: CGFloat = configuration.renderDPI >= 600 ? 6_000 : 4_500
+        let scale = min(
+            requestedScale,
+            longestEdge > 0 ? maximumPixels / longestEdge : 1
+        )
         let width = max(1, Int(ceil(bounds.width * scale)))
         let height = max(1, Int(ceil(bounds.height * scale)))
-        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                  data: nil,
-                  width: width,
-                  height: height,
-                  bitsPerComponent: 8,
-                  bytesPerRow: 0,
-                  space: colorSpace,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              ) else {
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
             throw PrivateDocSearchError.processFailed(
-                "Apple Vision konnte keinen Bildpuffer anlegen."
+                "Apple Vision konnte keinen Farbraum anlegen."
             )
         }
-        let target = CGRect(x: 0, y: 0, width: width, height: height)
-        context.setFillColor(CGColor(gray: 1, alpha: 1))
-        context.fill(target)
-        context.concatenate(
-            page.getDrawingTransform(
-                .mediaBox,
-                rect: target,
-                rotate: 0,
-                preserveAspectRatio: true
+        let image = pixels.withUnsafeMutableBytes { bytes -> CGImage? in
+            guard let context = CGContext(
+                data: bytes.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                return nil
+            }
+            let target = CGRect(x: 0, y: 0, width: width, height: height)
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            context.fill(target)
+            context.concatenate(
+                page.getDrawingTransform(
+                    .mediaBox,
+                    rect: target,
+                    rotate: 0,
+                    preserveAspectRatio: true
+                )
             )
-        )
-        context.drawPDFPage(page)
-        guard let image = context.makeImage() else {
+            context.drawPDFPage(page)
+            if configuration.enhanceContrast
+                || configuration.binarize
+                || configuration.adaptiveBinarize
+                || configuration.backgroundLightening
+                || configuration.reduceShadows
+                || configuration.denoise
+                || configuration.sharpen {
+                let buffer = bytes.bindMemory(to: UInt8.self)
+                var luminances = [UInt8](repeating: 255, count: width * height)
+                let blockSize = 64
+                let blockColumns = (width + blockSize - 1) / blockSize
+                let blockRows = (height + blockSize - 1) / blockSize
+                var blockSums = [Int](repeating: 0, count: blockColumns * blockRows)
+                var blockCounts = [Int](repeating: 0, count: blockColumns * blockRows)
+                for pixelIndex in 0..<(width * height) {
+                    let index = pixelIndex * 4
+                    let luminance = (
+                        299 * Int(buffer[index])
+                            + 587 * Int(buffer[index + 1])
+                            + 114 * Int(buffer[index + 2])
+                    ) / 1_000
+                    luminances[pixelIndex] = UInt8(luminance)
+                    let x = pixelIndex % width
+                    let y = pixelIndex / width
+                    let block = (y / blockSize) * blockColumns + x / blockSize
+                    blockSums[block] += luminance
+                    blockCounts[block] += 1
+                }
+                for index in stride(from: 0, to: buffer.count, by: 4) {
+                    let pixelIndex = index / 4
+                    let x = pixelIndex % width
+                    let y = pixelIndex / width
+                    let luminance = Int(luminances[pixelIndex])
+                    var adjusted = luminance
+                    if configuration.enhanceContrast {
+                        adjusted = min(255, max(0, (luminance - 128) * 17 / 10 + 128))
+                    }
+                    if configuration.sharpen, x > 0, x + 1 < width, y > 0, y + 1 < height {
+                        let neighborAverage = (
+                            Int(luminances[pixelIndex - 1])
+                                + Int(luminances[pixelIndex + 1])
+                                + Int(luminances[pixelIndex - width])
+                                + Int(luminances[pixelIndex + width])
+                        ) / 4
+                        adjusted = min(255, max(0, adjusted * 2 - neighborAverage))
+                    }
+                    if configuration.backgroundLightening, adjusted >= 210 {
+                        adjusted = 255
+                    }
+                    if configuration.reduceShadows, adjusted >= 145 {
+                        adjusted = min(255, adjusted + (255 - adjusted) / 2)
+                    }
+                    if configuration.binarize || configuration.adaptiveBinarize {
+                        let block = (y / blockSize) * blockColumns + x / blockSize
+                        let localMean = blockSums[block] / max(1, blockCounts[block])
+                        let threshold = configuration.adaptiveBinarize
+                            ? max(100, min(220, localMean - 12))
+                            : 180
+                        adjusted = adjusted < threshold ? 0 : 255
+                    }
+                    if configuration.denoise, adjusted == 0,
+                       x > 0, x + 1 < width, y > 0, y + 1 < height {
+                        let darkNeighbors = [
+                            luminances[pixelIndex - 1],
+                            luminances[pixelIndex + 1],
+                            luminances[pixelIndex - width],
+                            luminances[pixelIndex + width]
+                        ].filter { $0 < 180 }.count
+                        if darkNeighbors == 0 {
+                            adjusted = 255
+                        }
+                    }
+                    let value = UInt8(adjusted)
+                    buffer[index] = value
+                    buffer[index + 1] = value
+                    buffer[index + 2] = value
+                    buffer[index + 3] = 255
+                }
+            }
+            guard let rendered = context.makeImage() else { return nil }
+            if configuration.cropBorders {
+                let insetX = max(1, rendered.width / 100)
+                let insetY = max(1, rendered.height / 100)
+                return rendered.cropping(
+                    to: CGRect(
+                        x: insetX,
+                        y: insetY,
+                        width: rendered.width - insetX * 2,
+                        height: rendered.height - insetY * 2
+                    )
+                )
+            }
+            return rendered
+        }
+        guard let image else {
             throw PrivateDocSearchError.processFailed(
                 "Apple Vision konnte die PDF-Seite nicht rendern."
             )
@@ -157,7 +274,8 @@ public actor VisionOCRProvider: OCRProvider {
 
     private func recognize(
         _ image: CGImage,
-        configuredLanguages: [String]
+        configuredLanguages: [String],
+        rotationDegrees: Int
     ) throws -> (text: String, meanConfidence: Double?) {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
@@ -169,7 +287,13 @@ public actor VisionOCRProvider: OCRProvider {
             request.recognitionLanguages = usable
         }
 
-        let handler = VNImageRequestHandler(cgImage: image, orientation: .up)
+        let orientation: CGImagePropertyOrientation = switch rotationDegrees {
+        case 90: .right
+        case 180: .down
+        case 270: .left
+        default: .up
+        }
+        let handler = VNImageRequestHandler(cgImage: image, orientation: orientation)
         try handler.perform([request])
         let observations = (request.results ?? []).sorted {
             if abs($0.boundingBox.maxY - $1.boundingBox.maxY) > 0.015 {

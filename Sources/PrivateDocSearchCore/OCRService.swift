@@ -66,6 +66,17 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
     public var cpuMode: OCRCPUMode
     public var persistenceMode: OCRPersistenceMode
     public var engineSelection: OCREngineSelection
+    public var renderDPI: Int
+    public var enhanceContrast: Bool
+    public var binarize: Bool
+    public var adaptiveBinarize: Bool
+    public var backgroundLightening: Bool
+    public var reduceShadows: Bool
+    public var denoise: Bool
+    public var sharpen: Bool
+    public var cropBorders: Bool
+    public var manualRotationDegrees: Int
+    public var retryStrategyID: String?
 
     public init(
         isEnabled: Bool = true,
@@ -78,7 +89,18 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
         maximumParallelFiles: Int = 1,
         cpuMode: OCRCPUMode = .normal,
         persistenceMode: OCRPersistenceMode = .nonDestructive,
-        engineSelection: OCREngineSelection = .automatic
+        engineSelection: OCREngineSelection = .automatic,
+        renderDPI: Int = 144,
+        enhanceContrast: Bool = false,
+        binarize: Bool = false,
+        adaptiveBinarize: Bool = false,
+        backgroundLightening: Bool = false,
+        reduceShadows: Bool = false,
+        denoise: Bool = false,
+        sharpen: Bool = false,
+        cropBorders: Bool = false,
+        manualRotationDegrees: Int = 0,
+        retryStrategyID: String? = nil
     ) {
         self.isEnabled = isEnabled
         self.languages = languages
@@ -91,6 +113,19 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
         self.cpuMode = cpuMode
         self.persistenceMode = persistenceMode
         self.engineSelection = engineSelection
+        self.renderDPI = min(600, max(72, renderDPI))
+        self.enhanceContrast = enhanceContrast
+        self.binarize = binarize
+        self.adaptiveBinarize = adaptiveBinarize
+        self.backgroundLightening = backgroundLightening
+        self.reduceShadows = reduceShadows
+        self.denoise = denoise
+        self.sharpen = sharpen
+        self.cropBorders = cropBorders
+        self.manualRotationDegrees = [0, 90, 180, 270].contains(manualRotationDegrees)
+            ? manualRotationDegrees
+            : 0
+        self.retryStrategyID = retryStrategyID
     }
 
     public static let `default` = OCRConfiguration()
@@ -98,6 +133,9 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case isEnabled, languages, rotatePages, deskew, clean, optimizeLevel
         case createPDFA, maximumParallelFiles, cpuMode, persistenceMode, engineSelection
+        case renderDPI, enhanceContrast, binarize, adaptiveBinarize
+        case backgroundLightening, reduceShadows, denoise, sharpen, cropBorders
+        case manualRotationDegrees, retryStrategyID
     }
 
     public init(from decoder: Decoder) throws {
@@ -113,7 +151,21 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
             maximumParallelFiles: try values.decodeIfPresent(Int.self, forKey: .maximumParallelFiles) ?? 1,
             cpuMode: try values.decodeIfPresent(OCRCPUMode.self, forKey: .cpuMode) ?? .normal,
             persistenceMode: try values.decodeIfPresent(OCRPersistenceMode.self, forKey: .persistenceMode) ?? .nonDestructive,
-            engineSelection: try values.decodeIfPresent(OCREngineSelection.self, forKey: .engineSelection) ?? .automatic
+            engineSelection: try values.decodeIfPresent(OCREngineSelection.self, forKey: .engineSelection) ?? .automatic,
+            renderDPI: try values.decodeIfPresent(Int.self, forKey: .renderDPI) ?? 144,
+            enhanceContrast: try values.decodeIfPresent(Bool.self, forKey: .enhanceContrast) ?? false,
+            binarize: try values.decodeIfPresent(Bool.self, forKey: .binarize) ?? false,
+            adaptiveBinarize: try values.decodeIfPresent(
+                Bool.self,
+                forKey: .adaptiveBinarize
+            ) ?? false,
+            backgroundLightening: try values.decodeIfPresent(Bool.self, forKey: .backgroundLightening) ?? false,
+            reduceShadows: try values.decodeIfPresent(Bool.self, forKey: .reduceShadows) ?? false,
+            denoise: try values.decodeIfPresent(Bool.self, forKey: .denoise) ?? false,
+            sharpen: try values.decodeIfPresent(Bool.self, forKey: .sharpen) ?? false,
+            cropBorders: try values.decodeIfPresent(Bool.self, forKey: .cropBorders) ?? false,
+            manualRotationDegrees: try values.decodeIfPresent(Int.self, forKey: .manualRotationDegrees) ?? 0,
+            retryStrategyID: try values.decodeIfPresent(String.self, forKey: .retryStrategyID)
         )
     }
 
@@ -763,11 +815,23 @@ public actor OCRmyPDFProcessor: OCRProvider {
         ]
         if configuration.rotatePages { arguments.append("--rotate-pages") }
         if configuration.deskew { arguments.append("--deskew") }
-        if configuration.clean { arguments.append("--clean") }
+        if configuration.clean || configuration.denoise {
+            arguments.append("--clean")
+        }
+        if configuration.backgroundLightening || configuration.reduceShadows {
+            arguments.append("--remove-background")
+        }
+        if configuration.renderDPI > 144 {
+            arguments.append(contentsOf: [
+                "--oversample", String(configuration.renderDPI)
+            ])
+        }
         if recoveryAttempt {
             if !configuration.rotatePages { arguments.append("--rotate-pages") }
             if !configuration.deskew { arguments.append("--deskew") }
-            arguments.append(contentsOf: ["--oversample", "300"])
+            if configuration.renderDPI <= 144 {
+                arguments.append(contentsOf: ["--oversample", "300"])
+            }
         }
         arguments.append(contentsOf: [input.path, output.path])
         return arguments
