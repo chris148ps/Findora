@@ -345,6 +345,7 @@ public actor DocumentProcessor {
             analyses: initialPageAnalyses
         )
         var ocrPerformed = false
+        var ocrPageNumbers: Set<Int> = []
         var currentFileHash = inputHash
         var pageQualities: [OCRPageQuality] = []
 
@@ -382,6 +383,7 @@ public actor DocumentProcessor {
                     strategy: strategy.displayName
                 )
             }
+            ocrPageNumbers = retryOutcome.acceptedPageNumbers
             await logOCRRetryOutcome(retryOutcome, path: stable.url.path)
             try await database.saveOCRAttempts(
                 path: file.id,
@@ -574,6 +576,7 @@ public actor DocumentProcessor {
             embeddingModelID: embedder.modelID,
             embeddingModelVersion: embedder.modelVersion,
             ocrPerformed: ocrPerformed,
+            ocrPageNumbers: ocrPageNumbers,
             pageQualities: pageQualities,
             textLayerPresent: extractor.hasUsableTextLayer(pages),
             manualPageTexts: manualPageTexts

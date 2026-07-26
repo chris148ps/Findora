@@ -110,6 +110,12 @@ nicht an OCRmyPDF übergeben.
 
 ## Dokumentidentität und OCR-Modi
 
+Der Index speichert die tatsächlich verwendete Textquelle seitenweise.
+Gemischte PDFs behalten vorhandene Seiten als `extracted`; nur akzeptierte
+OCR-Seiten erhalten `ocr`. Dadurch zählt ein gemischtes PDF einmal als
+**Durch OCR ergänzt**, während PDF- und OCR-Seiten getrennt aggregiert werden.
+Retry-Versuche bleiben Diagnosezeilen und erhöhen keine Erfolgszähler.
+
 Der SHA-256 des unveränderten Originals ist die Dokumentidentität. Pfad,
 Dateiname und Zeitstempel sind nur Speicherortdaten. Umbenennen, Verschieben,
 identische Kopien und reine Metadatenänderungen verwenden vorhandene Seiten,

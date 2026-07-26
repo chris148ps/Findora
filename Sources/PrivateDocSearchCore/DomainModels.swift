@@ -238,6 +238,10 @@ public struct SearchEvidenceChunk: Sendable {
 public struct DocumentStatistics: Equatable, Sendable {
     public var totalPDFs = 0
     public var indexedPDFs = 0
+    public var fullySearchablePDFs = 0
+    public var ocrSupplementedPDFs = 0
+    public var indexedWithoutUsableTextPDFs = 0
+    public var otherIndexedPDFs = 0
     public var searchablePDFs = 0
     public var withoutTextLayerPDFs = 0
     public var ocrRequiredPDFs = 0
@@ -248,10 +252,16 @@ public struct DocumentStatistics: Equatable, Sendable {
     public var pausedJobs = 0
     public var skippedJobs = 0
     public var failedJobs = 0
+    public var unavailableJobs = 0
+    public var pagesWithPDFText = 0
+    public var pagesWithOCRText = 0
+    public var pagesWithManualText = 0
+    public var pagesWithoutUsableText = 0
     public var totalChunks = 0
     public var embeddedChunks = 0
     public var fallbackEmbeddedChunks = 0
     public var e5EmbeddedChunks = 0
+    public var otherEmbeddedChunks = 0
     public var duplicateLocations = 0
     public var missingOrMovedFiles = 0
     public var ocrQualityGoodPages = 0
@@ -282,7 +292,61 @@ public struct DocumentStatistics: Equatable, Sendable {
         return min(1, max(0, Double(processedJobs) / Double(totalJobs)))
     }
 
+    public var exclusiveIndexedPDFs: Int {
+        fullySearchablePDFs
+            + ocrSupplementedPDFs
+            + indexedWithoutUsableTextPDFs
+            + otherIndexedPDFs
+    }
+
+    public var exclusiveCurrentJobStates: Int {
+        indexedPDFs + pendingJobs + processingJobs + failedJobs + unavailableJobs
+    }
+
+    public var classifiedEmbeddings: Int {
+        e5EmbeddedChunks + fallbackEmbeddedChunks + otherEmbeddedChunks
+    }
+
     public init() {}
+}
+
+public struct StatusConsistencyIssue: Equatable, Sendable {
+    public let invariant: String
+    public let details: String
+
+    public init(invariant: String, details: String) {
+        self.invariant = invariant
+        self.details = details
+    }
+}
+
+public struct StatusConsistencyReport: Equatable, Sendable {
+    public let statistics: DocumentStatistics
+    public let issues: [StatusConsistencyIssue]
+
+    public init(
+        statistics: DocumentStatistics,
+        issues: [StatusConsistencyIssue]
+    ) {
+        self.statistics = statistics
+        self.issues = issues
+    }
+
+    public var isConsistent: Bool { issues.isEmpty }
+
+    public var summary: String {
+        if issues.isEmpty {
+            return """
+            Statusprüfung abgeschlossen. PDFs insgesamt: \(statistics.totalPDFs); \
+            summierte aktuelle Dokumentzustände: \(statistics.exclusiveCurrentJobStates); \
+            Indexklassifikation: \(statistics.exclusiveIndexedPDFs); \
+            Embeddings: \(statistics.embeddedChunks).
+            """
+        }
+        return "Inkonsistenz erkannt: " + issues
+            .map { "\($0.invariant): \($0.details)" }
+            .joined(separator: " | ")
+    }
 }
 
 public enum ProcessingSessionPhase: String, Codable, CaseIterable, Sendable {

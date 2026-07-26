@@ -30,3 +30,12 @@ SQLite-Transaktionen senden gezielte Statusereignisse, die UI bündelt diese auf
 ungefähr 300 ms. Der 30-Sekunden-Abgleich ist nur ein Sicherheitsnetz. Ein
 Abschluss bleibt sechs Sekunden sichtbar; ein Neustart rekonstruiert laufende
 oder pausierte Sitzungen.
+
+Die technischen Statuskarten verwenden eindeutige Einheiten und lokalisierte
+Hilfetexte. Die vier Hauptkennzahlen bleiben unverändert; Dokumente,
+Texterkennung, Suche/Index und Wartung sind getrennte Gruppen.
+
+Beim Erzeugen des Release-Bundles kopiert `scripts/build-app.sh` die
+`.lproj`-Verzeichnisse zusätzlich aus dem Swift-Package-Ressourcenbundle in
+`Contents/Resources`. Dadurch kann SwiftUI die gewählte Sprache auch im
+fertigen App-Hauptbundle auflösen; Deutsch bleibt die Entwicklungssprache.

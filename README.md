@@ -107,6 +107,12 @@ Die normale Ansicht zeigt bewusst nur **PDFs insgesamt**, **Indexiert**,
 Qualitätswerte stehen weiterhin im standardmäßig eingeklappten Bereich
 **Technische Details** zur Verfügung.
 
+Die technischen Zähler sind nach Dokumenten, Texterkennung, Suche/Index und
+Wartung gruppiert. Dokument- und Seitenwerte sind ausdrücklich gekennzeichnet;
+exklusive Indexklassen, mathematische Beziehungen, Resetverhalten und die
+Diagnose **Statuswerte prüfen** beschreibt
+[`DOCUMENT_STATUS.md`](DOCUMENT_STATUS.md).
+
 ## Modellauswahl
 
 Unter **Modelle** stehen nur fest versionierte, lizenzierte MLX-Modelle aus dem
@@ -236,6 +242,7 @@ nicht gelöscht.
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - [`OCR_PIPELINE.md`](OCR_PIPELINE.md)
+- [`DOCUMENT_STATUS.md`](DOCUMENT_STATUS.md)
 - [`INDEXING_PIPELINE.md`](INDEXING_PIPELINE.md)
 - [`SEARCH_PIPELINE.md`](SEARCH_PIPELINE.md)
 - [`MAINTENANCE.md`](MAINTENANCE.md)

@@ -137,3 +137,8 @@ gezielt neu gestartet werden. Vorher wird der aktuelle SHA-256 geprüft; die PDF
 wird nicht verändert. Die Analyse des betroffenen Dokuments wird neu berechnet,
 während manuelle Entscheidungen und manuell erfasster Seitentext erhalten
 bleiben.
+
+Alle Wartungszähler werden aus den aktuellen, zum SHA-256 passenden
+Analysezeilen neu aggregiert. Die Beziehungen zu Dokument-, OCR- und
+Suchindexwerten sowie das genaue Resetverhalten stehen in
+[`DOCUMENT_STATUS.md`](DOCUMENT_STATUS.md).

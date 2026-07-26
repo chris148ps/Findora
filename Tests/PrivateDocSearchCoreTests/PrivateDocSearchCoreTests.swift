@@ -1009,7 +1009,15 @@ func indexMaintenanceRebuildsFromStoredTextAndPreservesSettings() async throws {
     )
     await processor.processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
 
+    let beforeRebuild = try await database.statistics()
     try await processor.rebuildSearchIndex { _ in }
+    let afterRebuild = try await database.statistics()
+    #expect(afterRebuild.fullySearchablePDFs == beforeRebuild.fullySearchablePDFs)
+    #expect(afterRebuild.ocrSupplementedPDFs == beforeRebuild.ocrSupplementedPDFs)
+    #expect(afterRebuild.pagesWithPDFText == beforeRebuild.pagesWithPDFText)
+    #expect(afterRebuild.totalChunks == beforeRebuild.totalChunks)
+    #expect(afterRebuild.embeddedChunks == beforeRebuild.embeddedChunks)
+    #expect((try await database.checkStatusConsistency()).isConsistent)
     let search = HybridSearchService(database: database, embedder: embedder)
     #expect(!(try await search.search("WARTUNGSBEGRIFF")).isEmpty)
     #expect((try await database.repairIndex()).contains("Integrität"))
@@ -1474,6 +1482,7 @@ func automaticAnalysisResetPreservesManualWorkAndReconstructsBlankPages() async 
     #expect(storedManual.first?.kind == .manuallyEntered)
     #expect((try await database.statistics()).manuallyNotEmptyPages == 1)
     #expect((try await database.pendingFiles()).count == 2)
+    #expect((try await database.checkStatusConsistency()).isConsistent)
 
     await processor.processPending(
         ocrConfiguration: OCRConfiguration(isEnabled: false)
@@ -1544,7 +1553,14 @@ func fullResetClearsMaintenanceAndSessionsButPreservesSettingsAndModels() async 
 
     try await database.deleteDocumentIndex()
 
-    #expect((try await database.statistics()).totalPDFs == 0)
+    let resetStatistics = try await database.statistics()
+    #expect(resetStatistics.totalPDFs == 0)
+    #expect(resetStatistics.indexedPDFs == 0)
+    #expect(resetStatistics.totalChunks == 0)
+    #expect(resetStatistics.embeddedChunks == 0)
+    #expect(resetStatistics.pagesWithPDFText == 0)
+    #expect(resetStatistics.pagesWithOCRText == 0)
+    #expect((try await database.checkStatusConsistency()).isConsistent)
     #expect(try await database.emptyPageCandidates().isEmpty)
     #expect(try await database.emptyPDFCandidates().isEmpty)
     #expect(try await database.ocrReviewCandidates().isEmpty)
@@ -1687,6 +1703,151 @@ func visibleSelectionSupportsFilteredAllNoneAndInvertWithoutHiddenActions() {
             visible: visible
         ).isEmpty
     )
+}
+
+@Test
+func statusCountersUseExclusiveDocumentAndPageSemantics() async throws {
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+
+    let digitalURL = root.appending(path: "Digital.pdf")
+    let scanURL = root.appending(path: "Scan.pdf")
+    let mixedURL = root.appending(path: "Gemischt.pdf")
+    let emptyURL = root.appending(path: "Ohne Text.pdf")
+    let failureURL = root.appending(path: "OCR-Fehler.pdf")
+    try createTextPDF(at: digitalURL, pages: ["Digital eins", "Digital zwei"])
+    try createImagePDF(at: scanURL, text: "SYNTHETIC SCAN")
+    try createTextPDF(at: mixedURL, pages: ["Digitaler Teil", "Synthetische Bildseite"])
+    try createTextPDF(at: emptyURL, pages: [""])
+    try createImagePDF(at: failureURL, text: "SYNTHETIC FAILURE")
+
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    var files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    let embedder = TokenHashEmbedding(dimensions: 32)
+
+    func index(
+        _ url: URL,
+        pages: [ExtractedPage],
+        ocrPages: Set<Int> = [],
+        hadTextLayer: Bool
+    ) async throws {
+        let file = try #require(files.first { $0.url == url })
+        let hash = try SHA256Hasher().hash(fileAt: url)
+        let chunks = PageChunker().chunks(for: pages, documentHash: hash)
+        let embeddings = try await embedder.embed(documents: chunks.map(\.text))
+        let qualities = OCRQualityEvaluator().evaluate(
+            pages: pages.filter { ocrPages.contains($0.pageNumber) },
+            configuredLanguages: ["deu"],
+            meanConfidences: Dictionary(
+                uniqueKeysWithValues: ocrPages.map { ($0, 92.0) }
+            )
+        )
+        _ = try await database.indexDocument(
+            file: file,
+            hash: hash,
+            pages: pages,
+            chunks: chunks,
+            embeddings: embeddings,
+            embeddingModelID: embedder.modelID,
+            embeddingModelVersion: embedder.modelVersion,
+            ocrPerformed: !ocrPages.isEmpty,
+            ocrPageNumbers: ocrPages,
+            pageQualities: qualities,
+            textLayerPresent: hadTextLayer
+        )
+    }
+
+    try await index(
+        digitalURL,
+        pages: [
+            ExtractedPage(pageNumber: 1, text: "Digital eins"),
+            ExtractedPage(pageNumber: 2, text: "Digital zwei")
+        ],
+        hadTextLayer: true
+    )
+    try await index(
+        scanURL,
+        pages: [ExtractedPage(pageNumber: 1, text: "Erkannter Scantext")],
+        ocrPages: [1],
+        hadTextLayer: false
+    )
+    try await index(
+        mixedURL,
+        pages: [
+            ExtractedPage(pageNumber: 1, text: "Digitaler Teil"),
+            ExtractedPage(pageNumber: 2, text: "Erkannter OCR-Teil")
+        ],
+        ocrPages: [2],
+        hadTextLayer: true
+    )
+    try await index(
+        emptyURL,
+        pages: [ExtractedPage(pageNumber: 1, text: "")],
+        hadTextLayer: false
+    )
+    try await database.updateJob(path: failureURL.path, state: .ocrRunning)
+    try await database.updateJob(
+        path: failureURL.path,
+        state: .failed,
+        error: "Synthetischer OCR-Fehler"
+    )
+
+    var status = try await database.statistics()
+    #expect(status.totalPDFs == 5)
+    #expect(status.indexedPDFs == 4)
+    #expect(status.fullySearchablePDFs == 1)
+    #expect(status.ocrSupplementedPDFs == 2)
+    #expect(status.indexedWithoutUsableTextPDFs == 1)
+    #expect(status.otherIndexedPDFs == 0)
+    #expect(status.ocrFailedPDFs == 1)
+    #expect(status.pagesWithPDFText == 3)
+    #expect(status.pagesWithOCRText == 2)
+    #expect(status.pagesWithoutUsableText == 1)
+    #expect(status.ocrQualityGoodPages == 2)
+    #expect(status.exclusiveIndexedPDFs == status.indexedPDFs)
+    #expect(status.exclusiveCurrentJobStates == status.totalPDFs)
+    #expect(status.classifiedEmbeddings == status.embeddedChunks)
+    #expect((try await database.checkStatusConsistency()).isConsistent)
+
+    let duplicateURL = root.appending(path: "Digital-Kopie.pdf")
+    try FileManager.default.copyItem(at: digitalURL, to: duplicateURL)
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    try await index(
+        duplicateURL,
+        pages: [
+            ExtractedPage(pageNumber: 1, text: "Digital eins"),
+            ExtractedPage(pageNumber: 2, text: "Digital zwei")
+        ],
+        hadTextLayer: true
+    )
+    status = try await database.statistics()
+    #expect(status.totalPDFs == 6)
+    #expect(status.indexedPDFs == 5)
+    #expect(status.fullySearchablePDFs == 2)
+    #expect(status.duplicateLocations == 1)
+    #expect(status.pagesWithPDFText == 5)
+
+    try FileManager.default.removeItem(at: duplicateURL)
+    files = try await scanner.scan(root: root)
+    try await database.saveScan(files: files, root: root)
+    status = try await database.statistics()
+    #expect(status.totalPDFs == 5)
+    #expect(status.skippedJobs == 1)
+    #expect(status.missingOrMovedFiles == 1)
+    #expect(status.exclusiveCurrentJobStates == status.totalPDFs)
+
+    let reopened = SQLiteDatabase(url: paths.database)
+    try await reopened.initialize()
+    #expect(try await reopened.statistics() == status)
+    #expect((try await reopened.checkStatusConsistency()).isConsistent)
 }
 
 @MainActor

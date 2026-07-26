@@ -38,6 +38,10 @@ Abgedeckt sind:
 - Erkennung einer älteren installierten Modellversion;
 - ereignisgetriebener Dokumentenstatus unter 500 ms;
 - konsistente OCR-/Job-/Chunk-/Embedding-/Duplikatzähler;
+- exklusive Dokumentklassen für digitale, reine OCR-, gemischte und textlose
+  synthetische PDFs sowie getrennte PDF-/OCR-/Leerseitenzähler;
+- mathematische Statusdiagnose, Duplikatentfernung, wiederholten Scan und
+  identische Rekonstruktion nach Datenbank-Neustart;
 - persistierte Pause und identische Statusrekonstruktion nach Datenbank-Neustart;
 - genau vier primäre Dokumentenstatus-Kennzahlen;
 - visuelle Leerseitenerkennung für vollständig leere Seiten, Trennseiten,
@@ -136,6 +140,8 @@ Danach manuell:
     FTS-Suche sowie persistierte Modellzustände prüfen.
 25. Deutsch, Englisch, Systemsprache sowie System, Hell und Dunkel in allen
     Hauptansichten auf Lesbarkeit und Persistenz prüfen.
+26. Unter **Protokoll > Statuswerte prüfen** alle Invarianten ausführen und
+    Ergebnis in UI und `PrivateDocSearch.log` kontrollieren.
 
 Der Memory-Pressure-Pfad lässt sich ohne echten Speichermangel kontrolliert
 beim App-Start auslösen:

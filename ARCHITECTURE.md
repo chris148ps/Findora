@@ -172,6 +172,12 @@ Das Schema enthält:
 - `source_bookmarks`
 - `schema_migrations`
 
+Statuszähler werden nicht persistiert. `processing_jobs` liefert exklusive
+aktuelle Pfadzustände; `documents` und `pages.text_source` liefern die
+Dokument- und Seitenklassifikation, `chunks` und `chunk_embeddings` die
+Suchindexeinheiten. Eine einzelne SQLite-Snapshotabfrage rekonstruiert alle
+Werte. Details und Invarianten stehen in `DOCUMENT_STATUS.md`.
+
 Dokumentidentität und Dateipfad sind getrennt. Der SHA-256-Inhaltshash
 identifiziert Inhalte; `document_locations` erhält mehrere reale Pfade für
 doppelte Inhalte. Umbenennen und Verschieben aktualisieren nach Hashabgleich

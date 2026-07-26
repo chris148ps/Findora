@@ -52,6 +52,11 @@ for resource_bundle in "$binary_directory"/*.bundle(N); do
   ditto "$resource_bundle" "$bundle_path/Contents/Resources/${resource_bundle:t}"
 done
 
+app_resource_bundle="$binary_directory/PrivateDocSearch_PrivateDocSearchApp.bundle/Contents/Resources"
+for localization in "$app_resource_bundle"/*.lproj(N); do
+  ditto "$localization" "$bundle_path/Contents/Resources/${localization:t}"
+done
+
 if [[ ! -f "$bundle_path/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib" ]]; then
   print -u2 "MLX-Metal-Bibliothek fehlt im App-Bundle."
   exit 1

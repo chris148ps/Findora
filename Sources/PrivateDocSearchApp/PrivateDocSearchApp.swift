@@ -14,6 +14,7 @@ struct PrivateDocSearchApplication: App {
     var body: some Scene {
         WindowGroup("PrivateDocSearch", id: "main") {
             ContentView()
+                .id(state.interfaceLocale.identifier)
                 .environment(state)
                 .environment(\.locale, state.interfaceLocale)
                 .preferredColorScheme(state.preferredColorScheme)
@@ -146,6 +147,7 @@ final class AppState {
     var missingFileCandidates: [MissingFileCandidate] = []
     var isMaintainingDocuments = false
     var maintenanceMessage: String?
+    var statusDiagnosticMessage: String?
     var processingSession: ProcessingSessionSnapshot?
     var interfaceLanguage: InterfaceLanguage = .german
     var interfaceAppearance: InterfaceAppearance = .system
@@ -1145,6 +1147,28 @@ final class AppState {
     func refreshDatabaseState() async {
         do {
             await refreshDocumentStatus()
+            logEntries = try await database.recentErrors()
+        } catch {
+            report(error)
+        }
+    }
+
+    func checkStatusValues() async {
+        do {
+            let report = try await database.checkStatusConsistency()
+            statistics = report.statistics
+            statusDiagnosticMessage = report.summary
+            try await fileLogger.log(
+                report.isConsistent ? .info : .warning,
+                category: "Statusdiagnose",
+                message: report.summary
+            )
+            if !report.isConsistent {
+                try await database.recordError(
+                    category: "Statusdiagnose",
+                    message: report.summary
+                )
+            }
             logEntries = try await database.recentErrors()
         } catch {
             report(error)
@@ -2372,9 +2396,14 @@ struct StatusView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Dokumentenordner").font(.headline)
-                        Text(state.documentFolderPath ?? "Nicht ausgewählt")
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                        if let documentFolderPath = state.documentFolderPath {
+                            Text(documentFolderPath)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        } else {
+                            Text("Nicht ausgewählt")
+                                .foregroundStyle(.secondary)
+                        }
                         Label(
                             LocalizedStringKey(state.folderStatus),
                             systemImage: state.folderStatus == "Erreichbar"
@@ -2444,37 +2473,22 @@ struct StatusView: View {
                     isExpanded: $showsTechnicalDetails
                 ) {
                     VStack(alignment: .leading, spacing: 14) {
-                        LazyVGrid(
-                            columns: [GridItem(.adaptive(minimum: 170))],
-                            spacing: 10
-                        ) {
-                            MetricCard(title: "Mit Textschicht", value: state.statistics.searchablePDFs)
-                            MetricCard(title: "Ohne Textschicht", value: state.statistics.withoutTextLayerPDFs)
-                            MetricCard(title: "OCR erforderlich", value: state.statistics.ocrRequiredPDFs)
-                            MetricCard(title: "OCR erfolgreich", value: state.statistics.ocrProcessedPDFs)
-                            MetricCard(title: "OCR fehlgeschlagen", value: state.statistics.ocrFailedPDFs)
-                            MetricCard(title: "In Bearbeitung", value: state.statistics.processingJobs)
-                            MetricCard(title: "Pausiert", value: state.statistics.pausedJobs)
-                            MetricCard(title: "Übersprungen", value: state.statistics.skippedJobs)
-                            MetricCard(title: "Technische Fehler", value: state.statistics.failedJobs)
-                            MetricCard(title: "Chunks", value: state.statistics.totalChunks)
-                            MetricCard(title: "Embeddings", value: state.statistics.embeddedChunks)
-                            MetricCard(title: "Fallback-Embeddings", value: state.statistics.fallbackEmbeddedChunks)
-                            MetricCard(title: "E5-Embeddings", value: state.statistics.e5EmbeddedChunks)
-                            MetricCard(title: "Fehlende Dateien", value: state.statistics.missingOrMovedFiles)
-                            MetricCard(title: "OCR-Seiten gut", value: state.statistics.ocrQualityGoodPages)
-                            MetricCard(title: "OCR überprüfen", value: state.statistics.ocrQualityReviewPages)
-                            MetricCard(title: "Zu prüfende Seiten", value: state.statistics.emptyPageCandidates)
-                            MetricCard(title: "Bestätigte leere PDFs", value: state.statistics.fullyEmptyPDFs)
-                            MetricCard(title: "Sicher leere Seiten", value: state.statistics.safelyEmptyPages)
-                            MetricCard(title: "Vermutlich leere Seiten", value: state.statistics.probablyEmptyPages)
-                            MetricCard(title: "OCR-Nachbearbeitung aktiv", value: state.statistics.ocrRetryingPages)
-                            MetricCard(title: "OCR prüfen", value: state.statistics.ocrReviewPages)
-                            MetricCard(title: "Manuell nicht leer", value: state.statistics.manuallyNotEmptyPages)
-                            MetricCard(title: "OCR ohne Ergebnis", value: state.statistics.ocrNoResultPages)
-                            MetricCard(title: "Manuell korrigiert", value: state.statistics.manuallyCorrectedPages)
-                            MetricCard(title: "Manuell erfasst", value: state.statistics.manuallyEnteredPages)
-                        }
+                        TechnicalMetricGroup(
+                            title: "Dokumente",
+                            metrics: documentMetrics
+                        )
+                        TechnicalMetricGroup(
+                            title: "Texterkennung",
+                            metrics: textRecognitionMetrics
+                        )
+                        TechnicalMetricGroup(
+                            title: "Suche und Index",
+                            metrics: searchIndexMetrics
+                        )
+                        TechnicalMetricGroup(
+                            title: "Wartung",
+                            metrics: maintenanceMetrics
+                        )
                         Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 6) {
                             GridRow {
                                 Text("OCR-Engine").foregroundStyle(.secondary)
@@ -2482,15 +2496,27 @@ struct StatusView: View {
                             }
                             GridRow {
                                 Text("Embedding-Modell").foregroundStyle(.secondary)
-                                Text(state.activeEmbeddingModelID ?? "Fallback (nicht neuronal)")
+                                if let modelID = state.activeEmbeddingModelID {
+                                    Text(modelID)
+                                } else {
+                                    Text("Fallback (nicht neuronal)")
+                                }
                             }
                             GridRow {
                                 Text("Embedding-Version").foregroundStyle(.secondary)
-                                Text(state.activeEmbeddingModelVersion ?? "Integriert")
+                                if let version = state.activeEmbeddingModelVersion {
+                                    Text(version)
+                                } else {
+                                    Text("Integriert")
+                                }
                             }
                             GridRow {
                                 Text("Indexzustand").foregroundStyle(.secondary)
-                                Text(state.hasMixedEmbeddingIndex ? "Gemischte Embeddings" : "Konsistent")
+                                Text(
+                                    state.hasMixedEmbeddingIndex
+                                        ? LocalizedStringKey("Gemischte Embeddings")
+                                        : LocalizedStringKey("Konsistent")
+                                )
                                     .foregroundStyle(state.hasMixedEmbeddingIndex ? .orange : .primary)
                             }
                             GridRow {
@@ -2562,6 +2588,104 @@ struct StatusView: View {
         default: "Nächstes Dokument wird vorbereitet …"
         }
     }
+
+    private var documentMetrics: [TechnicalStatusMetric] {
+        let statistics = state.statistics
+        return [
+            .init("PDFs insgesamt", statistics.totalPDFs, "PDFs",
+                  "Aktuelle PDF-Pfade im letzten Scan, einschließlich derzeit nicht verfügbarer Dateien."),
+            .init("Indexiert", statistics.indexedPDFs, "PDFs",
+                  "Aktuelle PDF-Pfade mit erfolgreich abgeschlossenem Datenbankindex."),
+            .init("In Warteschlange", statistics.pendingJobs, "Jobs",
+                  "Aktuelle PDF-Jobs, die erkannt wurden, auf Stabilität warten oder auf OCR warten."),
+            .init("In Bearbeitung", statistics.processingJobs, "Jobs",
+                  "Aktuelle PDF-Jobs in Extraktion, OCR oder Indexierung."),
+            .init("Pausiert", statistics.pausedJobs, "Jobs",
+                  "Overlay: wartende oder laufende Jobs bei global pausierter Verarbeitung; nicht zur Zustandssumme addieren."),
+            .init("Übersprungen", statistics.skippedJobs, "frühere Jobs",
+                  "Nicht mehr im aktuellen Scan vorhandene, aus dem aktiven Bestand ausgeschlossene Jobs."),
+            .init("Technische Fehler", statistics.failedJobs, "Jobs",
+                  "Aktuelle PDF-Jobs, deren letzter Verarbeitungslauf fehlgeschlagen ist."),
+            .init("Fehlende Dateien", statistics.missingOrMovedFiles, "Pfade",
+                  "Nicht verfügbare aktuelle oder seit dem letzten Scan entfernte PDF-Pfade."),
+            .init("Duplikate", statistics.duplicateLocations, "PDF-Pfade",
+                  "Zusätzliche aktuelle PDF-Pfade mit demselben SHA-256-Inhalt.")
+        ]
+    }
+
+    private var textRecognitionMetrics: [TechnicalStatusMetric] {
+        let statistics = state.statistics
+        return [
+            .init("Bereits vollständig durchsuchbar", statistics.fullySearchablePDFs, "PDFs",
+                  "Indexierte PDFs mit bereits vorhandenem verwertbarem PDF-Text und ohne verwendeten OCR-Text."),
+            .init("Durch OCR ergänzt", statistics.ocrSupplementedPDFs, "PDFs",
+                  "Indexierte PDFs, bei denen mindestens eine Seite verwertbaren OCR-Text liefert."),
+            .init("Ohne verwertbaren Text", statistics.indexedWithoutUsableTextPDFs, "PDFs",
+                  "Indexierte PDFs ohne nichtleeren PDF-, OCR- oder manuellen Seitentext."),
+            .init("Weitere indexierte Sonderfälle", statistics.otherIndexedPDFs, "PDFs",
+                  "Indexierte PDFs mit ausschließlich manuellem oder älterem nicht eindeutig zuordenbarem Text."),
+            .init("OCR erforderlich – PDFs", statistics.ocrRequiredPDFs, "PDFs",
+                  "Noch nicht abgeschlossene PDF-Jobs, die auf OCR warten oder gerade OCR ausführen."),
+            .init("OCR fehlgeschlagen – PDFs", statistics.ocrFailedPDFs, "PDFs",
+                  "Nicht indexierte PDF-Jobs, deren letzter fehlgeschlagener Schritt OCR war."),
+            .init("Seiten mit PDF-Text", statistics.pagesWithPDFText, "Seiten",
+                  "Seiten aktueller indexierter PDFs mit verwertbarem eingebettetem PDF-Text."),
+            .init("Seiten mit OCR-Text", statistics.pagesWithOCRText, "Seiten",
+                  "Seiten aktueller indexierter PDFs mit verwertbarem OCR-Text; Retry-Versuche zählen nicht."),
+            .init("Seiten mit manuellem Text", statistics.pagesWithManualText, "Seiten",
+                  "Seiten aktueller indexierter PDFs mit manuell korrigiertem oder erfasstem Text."),
+            .init("Seiten ohne verwertbaren Text", statistics.pagesWithoutUsableText, "Seiten",
+                  "Seiten aktueller indexierter PDFs ohne nichtleeren gespeicherten Text."),
+            .init("OCR erfolgreich – Seiten", statistics.ocrQualityGoodPages, "Seiten",
+                  "OCR-Seiten, deren gespeichertes Ergebnis die Qualitätsprüfung bestanden hat."),
+            .init("OCR-Seiten zur Prüfung", statistics.ocrQualityReviewPages, "Seiten",
+                  "OCR-Seiten mit gespeichertem Ergebnis, das die Qualitätsprüfung zur Kontrolle markiert hat."),
+            .init("OCR wahrscheinlich fehlgeschlagen", statistics.ocrQualityFailedPages, "Seiten",
+                  "OCR-Seiten, deren Qualitätsprüfung ein wahrscheinlich unbrauchbares Ergebnis meldet.")
+        ]
+    }
+
+    private var searchIndexMetrics: [TechnicalStatusMetric] {
+        let statistics = state.statistics
+        return [
+            .init("Chunks", statistics.totalChunks, "Textabschnitte",
+                  "Aktuelle suchbare Textabschnitte eindeutiger Dokumentinhalte."),
+            .init("Embeddings gesamt", statistics.embeddedChunks, "Vektoren",
+                  "Persistierte Embedding-Vektoren für aktuelle Chunks; mehrere Modelltypen pro Chunk zählen getrennt."),
+            .init("E5-Embeddings", statistics.e5EmbeddedChunks, "Vektoren",
+                  "Persistierte Embedding-Vektoren eines E5-Modells."),
+            .init("Fallback-Embeddings", statistics.fallbackEmbeddedChunks, "Vektoren",
+                  "Persistierte deterministische Token-Hash-Fallback-Vektoren."),
+            .init("Weitere Embeddings", statistics.otherEmbeddedChunks, "Vektoren",
+                  "Persistierte Vektoren anderer, ausdrücklich separat klassifizierter Modelle.")
+        ]
+    }
+
+    private var maintenanceMetrics: [TechnicalStatusMetric] {
+        let statistics = state.statistics
+        return [
+            .init("Zu prüfende leere Seiten", statistics.emptyPageCandidates, "Seiten",
+                  "Aktuelle Seiten mit automatischer Leer- oder Unsicherheitsklassifikation ohne abschließende Entscheidung."),
+            .init("Bestätigte leere PDFs", statistics.fullyEmptyPDFs, "PDFs",
+                  "PDFs, deren sämtliche Seiten aktuell als leer klassifiziert sind."),
+            .init("Sicher leere Seiten", statistics.safelyEmptyPages, "Seiten",
+                  "Aktuelle Seiten mit hoher automatischer Leer-Konfidenz."),
+            .init("Vermutlich leere Seiten", statistics.probablyEmptyPages, "Seiten",
+                  "Aktuelle Seiten mit unsicherer automatischer Leer-Klassifikation."),
+            .init("OCR-Nachbearbeitung aktiv", statistics.ocrRetryingPages, "Jobs",
+                  "Aktuelle OCR-Jobs mit mindestens einem dokumentierten Retry-Fortschritt."),
+            .init("OCR-Prüffälle – Seiten", statistics.ocrReviewPages, "Seiten",
+                  "Aktuelle Seiten mit fachlichem OCR-Prüfbedarf."),
+            .init("Manuell als nicht leer bestätigt", statistics.manuallyNotEmptyPages, "Seiten",
+                  "Aktuelle Seiten mit manueller Entscheidung, dass Inhalt vorhanden ist."),
+            .init("OCR ohne Ergebnis – Seiten", statistics.ocrNoResultPages, "Seiten",
+                  "Aktuelle Seiten, für die OCR keinen verwertbaren Text geliefert hat."),
+            .init("Manuell korrigierte Seiten", statistics.manuallyCorrectedPages, "Seiten",
+                  "Aktuelle Seiten mit manuell korrigiertem OCR-Text."),
+            .init("Manuell erfasste Seiten", statistics.manuallyEnteredPages, "Seiten",
+                  "Aktuelle Seiten mit vollständig manuell erfasstem Text.")
+        ]
+    }
 }
 
 struct MetricCard: View {
@@ -2574,6 +2698,64 @@ struct MetricCard: View {
             Text(value.formatted()).font(.title.bold())
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct TechnicalStatusMetric: Identifiable {
+    let title: String
+    let value: Int
+    let unit: String
+    let explanation: String
+
+    var id: String { title }
+
+    init(_ title: String, _ value: Int, _ unit: String, _ explanation: String) {
+        self.title = title
+        self.value = value
+        self.unit = unit
+        self.explanation = explanation
+    }
+}
+
+private struct TechnicalMetricGroup: View {
+    let title: String
+    let metrics: [TechnicalStatusMetric]
+    @State private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(
+            isExpanded: $isExpanded
+        ) {
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 205))],
+                spacing: 10
+            ) {
+                ForEach(metrics) { metric in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(LocalizedStringKey(metric.title))
+                            .foregroundStyle(.secondary)
+                        Text(metric.value.formatted())
+                            .font(.title2.bold())
+                            .monospacedDigit()
+                        Text(LocalizedStringKey(metric.unit))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+                    .background(
+                        .background.secondary,
+                        in: RoundedRectangle(cornerRadius: 10)
+                    )
+                    .help(Text(LocalizedStringKey(metric.explanation)))
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            Text(LocalizedStringKey(title)).font(.headline)
+        }
         .padding()
         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
     }
@@ -4636,6 +4818,9 @@ struct LogView: View {
         VStack {
             HStack {
                 Button("Aktualisieren") { Task { await state.refreshDatabaseState() } }
+                Button("Statuswerte prüfen") {
+                    Task { await state.checkStatusValues() }
+                }
                 Button("Log exportieren …") { state.exportLog() }
                 TextField("Protokoll filtern", text: $filter)
                     .textFieldStyle(.roundedBorder)
@@ -4643,6 +4828,13 @@ struct LogView: View {
                 Spacer()
             }
             .padding([.horizontal, .top])
+            if let message = state.statusDiagnosticMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+                    .textSelection(.enabled)
+            }
             List {
                 ForEach(Array(filteredEntries.enumerated()), id: \.offset) { _, entry in
                     VStack(alignment: .leading, spacing: 4) {

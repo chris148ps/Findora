@@ -1189,6 +1189,7 @@ public actor SQLiteDatabase {
         embeddingModelID: String,
         embeddingModelVersion: String,
         ocrPerformed: Bool,
+        ocrPageNumbers: Set<Int>? = nil,
         pageQualities: [OCRPageQuality] = [],
         textLayerPresent: Bool = true,
         manualPageTexts: [Int: StoredManualPageText] = [:]
@@ -1264,6 +1265,8 @@ public actor SQLiteDatabase {
                 try execute("DELETE FROM pages WHERE document_id = ?", bindings: [.integer(documentID)])
                 for page in pages {
                     let manual = manualPageTexts[page.pageNumber]
+                    let isOCRPage = ocrPageNumbers?.contains(page.pageNumber)
+                        ?? ocrPerformed
                     try execute(
                         """
                         INSERT INTO pages (
@@ -1276,7 +1279,7 @@ public actor SQLiteDatabase {
                             .integer(Int64(page.pageNumber)),
                             .text(page.text),
                             .text(manual == nil
-                                ? ocrPerformed ? "ocr" : "extracted"
+                                ? isOCRPage ? "ocr" : "extracted"
                                 : "manual"),
                             manual?.originalOCRText.map(SQLiteValue.text) ?? .null,
                             .text(manual?.kind.rawValue ?? PageTextKind.automatic.rawValue)
@@ -1669,7 +1672,10 @@ public actor SQLiteDatabase {
     public func statistics() throws -> DocumentStatistics {
         let row = try query(
             """
-            WITH active_locations AS (
+            WITH current_jobs AS (
+                SELECT * FROM processing_jobs WHERE state != 'retired'
+            ),
+            active_locations AS (
                 SELECT * FROM document_locations WHERE deleted_at IS NULL
             ),
             active_documents AS (
@@ -1680,6 +1686,31 @@ public actor SQLiteDatabase {
                 FROM chunks c
                 JOIN active_documents d ON d.document_id = c.document_id
             ),
+            active_embeddings AS (
+                SELECT e.*
+                FROM chunk_embeddings e
+                JOIN active_chunks c ON c.id = e.chunk_id
+            ),
+            indexed_job_documents AS (
+                SELECT
+                    j.job_key,
+                    d.id AS document_id,
+                    d.text_layer_present,
+                    EXISTS (
+                        SELECT 1 FROM pages p
+                        WHERE p.document_id = d.id
+                          AND p.text_source = 'ocr'
+                          AND length(trim(p.text)) > 0
+                    ) AS has_ocr_text,
+                    EXISTS (
+                        SELECT 1 FROM pages p
+                        WHERE p.document_id = d.id
+                          AND length(trim(p.text)) > 0
+                    ) AS has_any_text
+                FROM current_jobs j
+                JOIN documents d ON d.content_hash = j.content_hash
+                WHERE j.state = 'indexed'
+            ),
             current_page_analysis AS (
                 SELECT a.*
                 FROM page_content_analysis a
@@ -1688,52 +1719,69 @@ public actor SQLiteDatabase {
                   AND j.content_hash = a.original_hash
             )
             SELECT
-                MAX(
-                    (SELECT COUNT(*) FROM active_locations),
-                    (SELECT COUNT(*) FROM processing_jobs WHERE state != 'retired')
-                ) AS total_pdfs,
-                (SELECT COUNT(*) FROM processing_jobs WHERE state = 'indexed')
+                (SELECT COUNT(*) FROM current_jobs) AS total_pdfs,
+                (SELECT COUNT(*) FROM current_jobs WHERE state = 'indexed')
                     AS indexed_pdfs,
-                (SELECT COUNT(*) FROM active_locations l
-                 JOIN documents d ON d.id = l.document_id
-                 WHERE d.text_layer_present = 1) AS searchable_pdfs,
-                (SELECT COUNT(*) FROM active_locations l
-                 JOIN documents d ON d.id = l.document_id
-                 WHERE d.text_layer_present = 0 OR d.ocr_status = 'pending')
-                    + (SELECT COUNT(*) FROM processing_jobs
-                       WHERE last_stage IN ('ocrQueued', 'ocrRunning')
-                         AND content_hash IS NULL)
+                (SELECT COUNT(*) FROM indexed_job_documents
+                 WHERE has_ocr_text = 0 AND text_layer_present = 1)
+                    AS fully_searchable_pdfs,
+                (SELECT COUNT(*) FROM indexed_job_documents
+                 WHERE has_ocr_text = 1)
+                    AS ocr_supplemented_pdfs,
+                (SELECT COUNT(*) FROM indexed_job_documents
+                 WHERE has_ocr_text = 0 AND has_any_text = 0)
+                    AS indexed_without_text_pdfs,
+                (SELECT COUNT(*) FROM indexed_job_documents
+                 WHERE has_ocr_text = 0 AND has_any_text = 1
+                   AND text_layer_present = 0)
+                    AS other_indexed_pdfs,
+                (SELECT COUNT(*) FROM current_jobs
+                 WHERE state IN ('ocrQueued', 'ocrRunning'))
                     AS ocr_required_pdfs,
-                (SELECT COUNT(*) FROM active_locations l
-                 JOIN documents d ON d.id = l.document_id
-                 WHERE d.ocr_status = 'completed') AS ocr_processed_pdfs,
-                (SELECT COUNT(*) FROM processing_jobs
+                (SELECT COUNT(*) FROM current_jobs
                  WHERE state = 'failed' AND last_stage = 'ocrRunning')
                     AS ocr_failed_pdfs,
-                (SELECT COUNT(*) FROM processing_jobs
+                (SELECT COUNT(*) FROM current_jobs
                  WHERE state IN ('discovered', 'waitingForStability', 'ocrQueued'))
                     AS pending_jobs,
-                (SELECT COUNT(*) FROM processing_jobs
+                (SELECT COUNT(*) FROM current_jobs
                  WHERE state IN ('extracting', 'ocrRunning', 'indexing'))
                     AS processing_jobs,
                 (SELECT COUNT(*) FROM processing_jobs WHERE state = 'retired')
                     AS skipped_jobs,
-                (SELECT COUNT(*) FROM processing_jobs WHERE state = 'failed')
+                (SELECT COUNT(*) FROM current_jobs WHERE state = 'failed')
                     AS failed_jobs,
+                (SELECT COUNT(*) FROM current_jobs WHERE state = 'unavailable')
+                    AS unavailable_jobs,
+                (SELECT COUNT(*) FROM indexed_job_documents j
+                 JOIN pages p ON p.document_id = j.document_id
+                 WHERE p.text_source = 'extracted' AND length(trim(p.text)) > 0)
+                    AS pages_with_pdf_text,
+                (SELECT COUNT(*) FROM indexed_job_documents j
+                 JOIN pages p ON p.document_id = j.document_id
+                 WHERE p.text_source = 'ocr' AND length(trim(p.text)) > 0)
+                    AS pages_with_ocr_text,
+                (SELECT COUNT(*) FROM indexed_job_documents j
+                 JOIN pages p ON p.document_id = j.document_id
+                 WHERE p.text_source = 'manual' AND length(trim(p.text)) > 0)
+                    AS pages_with_manual_text,
+                (SELECT COUNT(*) FROM indexed_job_documents j
+                 JOIN pages p ON p.document_id = j.document_id
+                 WHERE length(trim(p.text)) = 0)
+                    AS pages_without_usable_text,
                 (SELECT COUNT(*) FROM active_chunks) AS total_chunks,
-                (SELECT COUNT(*) FROM active_chunks c
-                 WHERE EXISTS (SELECT 1 FROM chunk_embeddings e WHERE e.chunk_id = c.id))
+                (SELECT COUNT(*) FROM active_embeddings)
                     AS embedded_chunks,
-                (SELECT COUNT(*) FROM active_chunks c
-                 WHERE EXISTS (
-                     SELECT 1 FROM chunk_embeddings e
-                     WHERE e.chunk_id = c.id AND e.model_id = 'builtin-token-hash'
-                 )) AS fallback_embedded_chunks,
-                (SELECT COUNT(*) FROM active_chunks c
-                 WHERE EXISTS (
-                     SELECT 1 FROM chunk_embeddings e
-                     WHERE e.chunk_id = c.id AND lower(e.model_id) LIKE '%e5%'
-                 )) AS e5_embedded_chunks,
+                (SELECT COUNT(*) FROM active_embeddings
+                 WHERE model_id = 'builtin-token-hash')
+                    AS fallback_embedded_chunks,
+                (SELECT COUNT(*) FROM active_embeddings
+                 WHERE lower(model_id) LIKE '%e5%')
+                    AS e5_embedded_chunks,
+                (SELECT COUNT(*) FROM active_embeddings
+                 WHERE model_id != 'builtin-token-hash'
+                   AND lower(model_id) NOT LIKE '%e5%')
+                    AS other_embedded_chunks,
                 MAX(
                     0,
                     (SELECT COALESCE(SUM(location_count - 1), 0)
@@ -1746,17 +1794,17 @@ public actor SQLiteDatabase {
                          HAVING COUNT(*) > 1
                      ))
                 ) AS duplicate_locations,
-                (SELECT COUNT(*) FROM document_locations WHERE deleted_at IS NOT NULL)
-                    + (SELECT COUNT(*) FROM processing_jobs WHERE state = 'unavailable')
+                (SELECT COUNT(*) FROM processing_jobs
+                 WHERE state IN ('retired', 'unavailable'))
                     AS missing_or_moved_files,
                 (SELECT COUNT(*) FROM ocr_page_quality q
-                 JOIN active_documents d ON d.document_id = q.document_id
+                 JOIN indexed_job_documents d ON d.document_id = q.document_id
                  WHERE q.status = 'good') AS ocr_quality_good,
                 (SELECT COUNT(*) FROM ocr_page_quality q
-                 JOIN active_documents d ON d.document_id = q.document_id
+                 JOIN indexed_job_documents d ON d.document_id = q.document_id
                  WHERE q.status = 'review') AS ocr_quality_review,
                 (SELECT COUNT(*) FROM ocr_page_quality q
-                 JOIN active_documents d ON d.document_id = q.document_id
+                 JOIN indexed_job_documents d ON d.document_id = q.document_id
                  WHERE q.status = 'likelyFailed') AS ocr_quality_failed,
                 (SELECT COUNT(*)
                  FROM page_content_analysis a
@@ -1819,19 +1867,34 @@ public actor SQLiteDatabase {
         var result = DocumentStatistics()
         result.totalPDFs = Int(row?.int64("total_pdfs") ?? 0)
         result.indexedPDFs = Int(row?.int64("indexed_pdfs") ?? 0)
-        result.searchablePDFs = Int(row?.int64("searchable_pdfs") ?? 0)
-        result.withoutTextLayerPDFs = max(0, result.totalPDFs - result.searchablePDFs)
+        result.fullySearchablePDFs = Int(row?.int64("fully_searchable_pdfs") ?? 0)
+        result.ocrSupplementedPDFs = Int(row?.int64("ocr_supplemented_pdfs") ?? 0)
+        result.indexedWithoutUsableTextPDFs =
+            Int(row?.int64("indexed_without_text_pdfs") ?? 0)
+        result.otherIndexedPDFs = Int(row?.int64("other_indexed_pdfs") ?? 0)
+        result.searchablePDFs = result.fullySearchablePDFs
+        result.withoutTextLayerPDFs = max(
+            0,
+            result.indexedPDFs - result.fullySearchablePDFs
+        )
         result.ocrRequiredPDFs = Int(row?.int64("ocr_required_pdfs") ?? 0)
-        result.ocrProcessedPDFs = Int(row?.int64("ocr_processed_pdfs") ?? 0)
+        result.ocrProcessedPDFs = result.ocrSupplementedPDFs
         result.ocrFailedPDFs = Int(row?.int64("ocr_failed_pdfs") ?? 0)
         result.pendingJobs = Int(row?.int64("pending_jobs") ?? 0)
         result.processingJobs = Int(row?.int64("processing_jobs") ?? 0)
         result.skippedJobs = Int(row?.int64("skipped_jobs") ?? 0)
         result.failedJobs = Int(row?.int64("failed_jobs") ?? 0)
+        result.unavailableJobs = Int(row?.int64("unavailable_jobs") ?? 0)
+        result.pagesWithPDFText = Int(row?.int64("pages_with_pdf_text") ?? 0)
+        result.pagesWithOCRText = Int(row?.int64("pages_with_ocr_text") ?? 0)
+        result.pagesWithManualText = Int(row?.int64("pages_with_manual_text") ?? 0)
+        result.pagesWithoutUsableText =
+            Int(row?.int64("pages_without_usable_text") ?? 0)
         result.totalChunks = Int(row?.int64("total_chunks") ?? 0)
         result.embeddedChunks = Int(row?.int64("embedded_chunks") ?? 0)
         result.fallbackEmbeddedChunks = Int(row?.int64("fallback_embedded_chunks") ?? 0)
         result.e5EmbeddedChunks = Int(row?.int64("e5_embedded_chunks") ?? 0)
+        result.otherEmbeddedChunks = Int(row?.int64("other_embedded_chunks") ?? 0)
         result.duplicateLocations = Int(row?.int64("duplicate_locations") ?? 0)
         result.missingOrMovedFiles = Int(row?.int64("missing_or_moved_files") ?? 0)
         result.ocrQualityGoodPages = Int(row?.int64("ocr_quality_good") ?? 0)
@@ -1922,6 +1985,61 @@ public actor SQLiteDatabase {
             result.lastFullScan = Date(timeIntervalSince1970: value)
         }
         return result
+    }
+
+    public func checkStatusConsistency() throws -> StatusConsistencyReport {
+        let snapshot = try statistics()
+        var issues: [StatusConsistencyIssue] = []
+
+        if snapshot.totalPDFs != snapshot.exclusiveCurrentJobStates {
+            issues.append(
+                StatusConsistencyIssue(
+                    invariant: "Aktuelle PDF-Zustände",
+                    details: "\(snapshot.totalPDFs) PDFs, aber "
+                        + "\(snapshot.exclusiveCurrentJobStates) exklusive Zustände."
+                )
+            )
+        }
+        if snapshot.indexedPDFs != snapshot.exclusiveIndexedPDFs {
+            issues.append(
+                StatusConsistencyIssue(
+                    invariant: "Indexklassifikation",
+                    details: "\(snapshot.indexedPDFs) indexiert, aber "
+                        + "\(snapshot.exclusiveIndexedPDFs) klassifiziert."
+                )
+            )
+        }
+        if snapshot.embeddedChunks != snapshot.classifiedEmbeddings {
+            issues.append(
+                StatusConsistencyIssue(
+                    invariant: "Embeddingtypen",
+                    details: "\(snapshot.embeddedChunks) Embeddings, aber "
+                        + "\(snapshot.classifiedEmbeddings) Typzuordnungen."
+                )
+            )
+        }
+
+        let namedValues: [(String, Int)] = [
+            ("PDFs insgesamt", snapshot.totalPDFs),
+            ("Indexiert", snapshot.indexedPDFs),
+            ("Bereits vollständig durchsuchbar", snapshot.fullySearchablePDFs),
+            ("Durch OCR ergänzt", snapshot.ocrSupplementedPDFs),
+            ("Ohne verwertbaren Text", snapshot.indexedWithoutUsableTextPDFs),
+            ("In Warteschlange", snapshot.pendingJobs),
+            ("In Bearbeitung", snapshot.processingJobs),
+            ("Fehlgeschlagen", snapshot.failedJobs),
+            ("Chunks", snapshot.totalChunks),
+            ("Embeddings", snapshot.embeddedChunks)
+        ]
+        for (name, value) in namedValues where value < 0 {
+            issues.append(
+                StatusConsistencyIssue(
+                    invariant: "Nichtnegative Zähler",
+                    details: "\(name) ist \(value)."
+                )
+            )
+        }
+        return StatusConsistencyReport(statistics: snapshot, issues: issues)
     }
 
     public func recordError(
