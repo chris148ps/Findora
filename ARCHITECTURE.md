@@ -1,10 +1,10 @@
-# PrivateDocSearch – Architektur und Umsetzungsplan
+# Findora – Architektur und Umsetzungsplan
 
 Stand: 24. Juli 2026
 
 ## Ziel und Leitplanken
 
-PrivateDocSearch ist eine eigenständige, native macOS-App. Sie verarbeitet
+Findora ist eine eigenständige, native macOS-App. Sie verarbeitet
 ausgewählte PDF-Bestände ausschließlich lokal. Dokumente werden weder
 umbenannt, verschoben noch gelöscht. Eine inhaltliche Änderung ist nur als
 sicher validierter, atomarer OCR-Ersatz erlaubt.
@@ -31,8 +31,8 @@ Inferenzpfad erzwingen. Eine Anhebung auf macOS 15 ist nicht erforderlich.
 Die Swift-Pakete und Targets folgen diesen Abhängigkeiten:
 
 ```text
-PrivateDocSearchApp (SwiftUI/AppKit)
-    ├── PrivateDocSearchCore
+FindoraApp (SwiftUI/AppKit)
+    ├── FindoraCore
     │   ├── FolderAccess
     │   ├── FileObservation
     │   ├── OCR
@@ -42,13 +42,13 @@ PrivateDocSearchApp (SwiftUI/AppKit)
     │   ├── Persistence
     │   ├── Models
     │   └── Logging
-    └── PrivateDocSearchMLX
+    └── FindoraMLX
         ├── MLXLLM
         ├── MLXEmbedders
         └── ModelRuntime
 ```
 
-`PrivateDocSearchCore` enthält keine UI-Abhängigkeit und lässt sich ohne
+`FindoraCore` enthält keine UI-Abhängigkeit und lässt sich ohne
 Modelldownload testen. Protokolle kapseln veränderliche Implementierungen:
 
 - `FolderAccessProviding`
@@ -141,15 +141,15 @@ standardmäßig nicht gleichzeitig.
 
 Die Datenbank liegt unter:
 
-`~/Library/Application Support/PrivateDocSearch/PrivateDocSearch.sqlite3`
+`~/Library/Application Support/Findora/Findora.sqlite3`
 
 Modelle liegen unter:
 
-`~/Library/Application Support/PrivateDocSearch/Models/`
+`~/Library/Application Support/Findora/Models/`
 
 Logs liegen unter:
 
-`~/Library/Logs/PrivateDocSearch/`
+`~/Library/Logs/Findora/`
 
 Die Datenbank nutzt WAL, Foreign Keys, versionierte Transaktionen und FTS5.
 Das Schema enthält:
@@ -171,6 +171,12 @@ Das Schema enthält:
 - `search_history`
 - `source_bookmarks`
 - `schema_migrations`
+
+Statuszähler werden nicht persistiert. `processing_jobs` liefert exklusive
+aktuelle Pfadzustände; `documents` und `pages.text_source` liefern die
+Dokument- und Seitenklassifikation, `chunks` und `chunk_embeddings` die
+Suchindexeinheiten. Eine einzelne SQLite-Snapshotabfrage rekonstruiert alle
+Werte. Details und Invarianten stehen in `DOCUMENT_STATUS.md`.
 
 Dokumentidentität und Dateipfad sind getrennt. Der SHA-256-Inhaltshash
 identifiziert Inhalte; `document_locations` erhält mehrere reale Pfade für
@@ -274,11 +280,20 @@ ausgegeben, sondern die definierte Keine-Belege-Meldung.
 Nach jedem Gate werden Build und Tests ausgeführt. Ein Gate gilt nicht als
 fertig, wenn nur ein UI-Platzhalter ohne funktionalen Dienst existiert.
 
+## Persistente UI-Zustände
+
+Fachliche Dokumentzustände bleiben in SQLite. Erfolgreiche Transaktionen
+publizieren gedrosselte Statusereignisse; ein 30-Sekunden-Abgleich ist nur ein
+Sicherheitsnetz. `processing_sessions` hält den sichtbaren Arbeitsfortschritt
+über Jobgrenzen und Neustarts stabil. `model_states` trennt Installation,
+Aktivierung und flüchtigen RAM-Ladezustand. Sprache und Erscheinungsbild liegen
+als Einstellungen in derselben lokalen Datenbank.
+
 ## Risiken
 
-- **Sandbox und Homebrew:** Eine sandboxed App kann externe Programme nicht
-  beliebig ausführen. Die interne Entwicklungsdistribution verwendet daher
-  zunächst Homebrew-OCR mit dokumentierter Einschränkung. Für eine
+- **Sandbox und Homebrew:** Apple Vision benötigt keine externen Prozesse.
+  Nur der ausdrücklich gewählte Tesseract- oder persistente OCR-Pfad verwendet
+  Homebrew-Werkzeuge nach Nutzerbestätigung. Für eine
   Mac-App-Store-Distribution müssen OCR-Komponenten gebündelt oder die
   Distributionsstrategie angepasst werden.
 - **OCR-Lizenzen:** OCRmyPDF selbst ist MPL-2.0; mitgelieferte Komponenten
@@ -304,4 +319,3 @@ fertig, wenn nur ein UI-Platzhalter ohne funktionalen Dienst existiert.
 - [Apple: App Sandbox file access](https://developer.apple.com/documentation/security/accessing-files-from-the-macos-app-sandbox)
 - [Apple: SMAppService](https://developer.apple.com/documentation/servicemanagement/smappservice)
 - [OCRmyPDF 17.8.1 cookbook](https://ocrmypdf.readthedocs.io/en/latest/cookbook.html)
-

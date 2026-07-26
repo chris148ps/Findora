@@ -2,7 +2,7 @@
 
 Stand: 24. Juli 2026
 
-PrivateDocSearch ist als lokale Einzelbenutzer-Anwendung entworfen.
+Findora ist als lokale Einzelbenutzer-Anwendung entworfen.
 
 ## Was lokal bleibt
 
@@ -16,6 +16,10 @@ PrivateDocSearch ist als lokale Einzelbenutzer-Anwendung entworfen.
 Es erfolgt keine Übertragung von Dokumentinhalten, Suchanfragen oder Antworten
 an OpenAI oder andere KI-Anbieter. Es gibt standardmäßig keine Telemetrie,
 Analyse-, Crash-Upload- oder Tracking-Funktion.
+
+Suchpläne und Folgefragen werden nur im Arbeitsspeicher der laufenden Sitzung
+gehalten. Der Chatverlauf ist auf sechs Schritte begrenzt, wird nicht
+persistiert und nicht automatisch exportiert.
 
 ## Netzwerkzugriff
 
@@ -31,14 +35,19 @@ Suchanfragen werden dabei nicht übertragen.
 ## Lokale Speicherung
 
 ```text
-~/Library/Application Support/PrivateDocSearch/
-~/Library/Logs/PrivateDocSearch/
+~/Library/Application Support/Findora/
+~/Library/Logs/Findora/
 ```
 
 Logs enthalten keine extrahierten Dokumenttexte, Suchauszüge, Prompts oder
-Antworten. Sie dürfen Dateiname, Pfad, Status und technische Fehlermeldungen
-enthalten. Pfade können private Informationen verraten; Logdateien sollten
-daher wie andere lokale Anwendungsdaten behandelt werden.
+Antworten. Sie enthalten auch keine Suchanfragen, erkannten Personen,
+Vertragsdaten oder Suchpläne. Sie dürfen Dateiname, Pfad, Status und technische
+Fehlermeldungen enthalten. Pfade können private Informationen verraten;
+Logdateien sollten daher wie andere lokale Anwendungsdaten behandelt werden.
+
+Leerseitenmetriken und manuelle Prüfentscheidungen werden ausschließlich in
+der lokalen SQLite-Datenbank gespeichert. Vorschaubilder werden bei Bedarf aus
+der lokalen PDF erzeugt und nicht exportiert.
 
 ## Löschen
 
@@ -46,3 +55,7 @@ Index, Modelle, Einstellungen und Logs können durch Löschen der oben genannten
 App-Verzeichnisse entfernt werden. Die privaten Original-PDFs werden dadurch
 nicht verändert oder gelöscht.
 
+Dokumentenwartung löscht keine Datei endgültig. Ausdrücklich bestätigte
+Dateiaktionen verwenden den macOS-Papierkorb. Beim Entfernen einzelner Seiten
+wird auch die vorherige vollständige PDF-Fassung in den Papierkorb verschoben,
+damit sie wiederherstellbar bleibt.

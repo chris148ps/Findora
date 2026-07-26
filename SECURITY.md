@@ -2,7 +2,7 @@
 
 ## Schutzgrenzen
 
-PrivateDocSearch schützt private Dokumente vor unbeabsichtigter externer
+Findora schützt private Dokumente vor unbeabsichtigter externer
 Übertragung und vor unsicheren OCR-Ersetzungen. Die App ist kein
 Mehrbenutzersystem und verschlüsselt den lokalen Index in Version 1 nicht.
 macOS-Dateirechte und FileVault bleiben die maßgeblichen Schutzmechanismen für
@@ -18,7 +18,7 @@ erreichbarer Stammordner wird nicht als Löschung aller Dokumente gewertet.
 Die interne Homebrew-OCR-Version wird ohne App Sandbox signiert, weil eine
 sandboxed App externe Homebrew-Programme nicht zuverlässig ausführen kann.
 Die kleinsten vorgesehenen Sandbox-Entitlements liegen separat in
-`Config/PrivateDocSearch-Sandbox.entitlements`; sie sind für eine spätere
+`Config/Findora-Sandbox.entitlements`; sie sind für eine spätere
 Version mit gebündeltem OCR-Helfer bestimmt.
 
 ## Sichere OCR-Ersetzung
@@ -66,4 +66,3 @@ geschwärzt werden.
 
 Sicherheitsprobleme sollten mit reproduzierbaren Schritten gemeldet werden,
 jedoch ohne private PDF-Inhalte oder ungeschwärzte Pfade anzuhängen.
-

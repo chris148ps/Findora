@@ -36,7 +36,7 @@ nur tatsächlich installierte Sprachen auswählen.
 - Unter **Einstellungen** denselben Stammordner erneut auswählen.
 - macOS-Datenschutzfreigaben für die App kontrollieren.
 
-PrivateDocSearch löscht bei einem unerreichbaren Stammordner keine
+Findora löscht bei einem unerreichbaren Stammordner keine
 Indexeinträge. Cloud-Platzhalter müssen lokal geladen sein, bevor OCR und
 Indexierung sie verarbeiten können.
 
@@ -86,8 +86,8 @@ App beenden und nur nach bewusstem Entschluss diese lokalen App-Daten
 entfernen:
 
 ```text
-~/Library/Application Support/PrivateDocSearch/
-~/Library/Logs/PrivateDocSearch/
+~/Library/Application Support/Findora/
+~/Library/Logs/Findora/
 ```
 
 Die ausgewählten Original-PDFs liegen nicht dort und dürfen nicht gelöscht
@@ -99,7 +99,18 @@ Memory-Pressure-Ereignisse, Pausierung/Fortsetzung, Modell-Entladung und
 technische Fehler stehen zeilenweise unter:
 
 ```text
-~/Library/Logs/PrivateDocSearch/PrivateDocSearch.log
+~/Library/Logs/Findora/Findora.log
 ```
 
 Dokumentinhalte werden dort nicht protokolliert.
+
+Erwartete interne Abbrüche, etwa beim Ersetzen eines Tasks, beim Reset oder
+beim App-Lifecycle, werden als Kategorie `cancelled` protokolliert und erzeugen
+keinen Fehlerdialog. Ein bewusster Benutzerabbruch darf nur eine kurze
+Statusmeldung auslösen. `recoverable`, `requiresAttention` und `fatal` bleiben
+getrennt; rohe Swift-/NSError-Texte werden nicht direkt angezeigt.
+
+Bleibt eine Wartungsliste nach einem Reset unerwartet gefüllt, zuerst
+**Aktualisieren** wählen. Listen berücksichtigen nur Analysezeilen, deren Pfad
+und SHA-256 zum aktuellen Job passen. **Inkonsistenzen reparieren** prüft
+SQLite/Fremdschlüssel, verändert aber keine PDF-Datei.

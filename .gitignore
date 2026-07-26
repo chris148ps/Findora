@@ -7,6 +7,6 @@ build/
 *.xccheckout
 *.xcworkspace/xcuserdata/
 *.xcodeproj/xcuserdata/
-PrivateDocSearch.app/
+Findora.app/
 *.log
 *.profraw

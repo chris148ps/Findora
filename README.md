@@ -1,24 +1,30 @@
-# PrivateDocSearch
+# Findora
 
-PrivateDocSearch ist eine native macOS-App für lokale OCR, Indexierung und
+Findora ist eine native macOS-App für lokale OCR, Indexierung und
 semantische Suche in privaten PDF-Beständen. Dokumente, Suchanfragen,
 Embeddings und Antworten bleiben auf dem Mac. Es werden weder Ollama noch ein
 externer KI-Server oder eine Cloud-KI benötigt.
+
+Die technische Identität verwendet durchgängig `Findora`: Bundle-ID
+`de.findora.app`, Swift-Module, Build-Targets sowie Daten-, Modell-,
+Bookmark- und Logpfade tragen denselben Produktnamen.
 
 ## Voraussetzungen
 
 - Apple-Silicon-Mac mit mindestens 8 GB Unified Memory
 - macOS 14 oder neuer
 - Xcode 26 mit installierter Metal-Toolchain
-- für die interne Version: OCRmyPDF über Homebrew
 
 ```bash
 xcodebuild -downloadComponent MetalToolchain
-brew install ocrmypdf tesseract-lang poppler
 ```
 
-PrivateDocSearch erkennt standardmäßig Homebrew unter `/opt/homebrew/bin` und
-`/usr/local/bin`. Die App installiert keine Systempakete selbst.
+Apple Vision ist die standardmäßige OCR-Engine und benötigt keine externe
+Installation. Nur für ausdrücklich gewähltes Tesseract oder dauerhaft mit
+Textschicht versehene PDFs werden OCRmyPDF, Tesseract und Poppler geprüft.
+Fehlende Komponenten installiert die App ausschließlich nach ausdrücklicher
+Bestätigung; sie verwendet feste Homebrew-Paketnamen und weder Shell noch
+`sudo`.
 
 ## Build
 
@@ -29,26 +35,26 @@ swift test
 
 MLX enthält Metal-Shader. Deshalb erzeugt `build-app.sh` den produktiven Build
 mit Xcode und nicht mit `swift build`. Das Ergebnis liegt unter
-`build/PrivateDocSearch.app`.
+`build/Findora.app`.
 
 ## Installation
 
 Für die interne, ad-hoc signierte Version:
 
-1. `build/PrivateDocSearch.app` nach `/Applications` kopieren.
+1. `build/Findora.app` nach `/Applications` kopieren.
 2. Die App aus dem Finder öffnen.
 3. Falls macOS die interne Signatur beanstandet, im Finder mit Rechtsklick
    **Öffnen** wählen.
 
-Diese interne Version ist nicht notarisiert und setzt OCRmyPDF über Homebrew
-voraus. Vor einer externen Verteilung sind Developer-ID-Signierung,
+Diese interne Version ist nicht notarisiert. Vor einer externen Verteilung
+sind Developer-ID-Signierung,
 Notarisierung und die Lizenz-/Bundle-Strategie für OCR-Abhängigkeiten separat
 abzuschließen.
 
 ## Erster Start und Ordnerberechtigung
 
 Unter **Einstellungen** mit **Ordner auswählen** genau den PDF-Stammordner
-freigeben. Die Auswahl erfolgt über den macOS-Dateidialog. PrivateDocSearch
+freigeben. Die Auswahl erfolgt über den macOS-Dateidialog. Findora
 speichert ein Security-Scoped Bookmark und stellt die Berechtigung nach einem
 Neustart wieder her. Ist ein Volume nicht verbunden oder die Berechtigung
 entzogen, wird das sichtbar gemeldet; der Index wird nicht als leer behandelt.
@@ -58,18 +64,31 @@ Arbeitsdateien werden nicht verfolgt. Der Ordner wird rekursiv durchsucht.
 
 ## OCR
 
-PrivateDocSearch prüft jede PDF seitenweise. Eine bereits brauchbare
-Textschicht bleibt unverändert. Für Scan-PDFs läuft OCRmyPDF standardmäßig mit
-Deutsch und Englisch, Rotation, Begradigung, ohne PDF/A-Konvertierung und ohne
-Bildoptimierung.
+Findora prüft jede PDF seitenweise. Eine bereits brauchbare
+Textschicht bleibt unverändert. Im empfohlenen Automatikmodus verwendet macOS
+zuerst Apple Vision. Scheitert Vision, versucht die App automatisch Tesseract.
 
-OCR schreibt nie direkt in das Original. Erst nach PDF-, Seitenzahl-,
-Textschicht- und Hashprüfung ersetzt die App die Datei atomar am selben Ort.
-Dateiname und Ordner bleiben gleich. Schlägt ein Schritt fehl, bleibt das
-Original erhalten.
+Standard ist die nicht-destruktive OCR: Vision liefert den Text ohne
+temporäre OCR-PDF direkt an die gemeinsame Qualitäts- und Indexpipeline.
+Tesseract verwendet eine temporäre OCR-PDF, die anschließend gelöscht wird.
+Text, Seiteninformationen und Qualitätswerte landen in beiden Fällen im
+gleichen SQLite-Schema; das Original bleibt unverändert. Optional kann der
+Nutzer die validierte OCRmyPDF-Ausgabe atomar am selben Ort übernehmen lassen.
+Bei jedem Fehler bleibt das Original unverändert. Ein Modus- oder
+Engine-Wechsel verarbeitet bekannte Dokumente nicht automatisch neu.
 
 Unter **OCR** lassen sich Sprachen und konservative Optionen ändern. OCR und
 Indexierung können pausiert und fehlgeschlagene Jobs erneut eingeplant werden.
+
+Reicht der erste OCR-Lauf nicht aus, probiert die App zentral begrenzt bis zu
+acht unterschiedliche Strategien in höchstens 120 Sekunden: Standard,
+300 dpi, Kontrast-/Hintergrundkorrektur, Binarisierung,
+Begradigung/Randbereinigung, Deutsch + Englisch, eine verfügbare alternative
+Engine und zuletzt 400 dpi. Nach jedem Lauf wird dieselbe Qualitätswertung
+verwendet; eine spätere schlechtere Variante ersetzt niemals die bisher beste.
+Unsichere Seiten erscheinen unter **Dokumentenwartung > OCR prüfen**. Dort
+können sie als nicht leer bestätigt, mit manuellen OCR-Einstellungen getestet
+oder textlich korrigiert beziehungsweise vollständig erfasst werden.
 
 ## Erstindexierung
 
@@ -80,7 +99,23 @@ Jobstatus erlaubt die Fortsetzung nach einem Neustart.
 Status, Warteschlange und technische Fehler erscheinen unter **Status** und
 **Logs**. Inhalte von Dokumenten werden nicht protokolliert.
 Das dauerhaft lesbare technische Protokoll liegt unter
-`~/Library/Logs/PrivateDocSearch/PrivateDocSearch.log`.
+`~/Library/Logs/Findora/Findora.log`.
+
+Der Dokumentenstatus aktualisiert sich während Scan, OCR, Indexierung,
+Embedding-Erstellung und Wartung automatisch. Datenbankereignisse werden
+gebündelt innerhalb von etwa 300 ms dargestellt; ein manueller Ansichtswechsel
+oder Neuladen ist nicht erforderlich.
+
+Die normale Ansicht zeigt bewusst nur **PDFs insgesamt**, **Indexiert**,
+**In Warteschlange** und **Duplikate**. OCR-, Embedding-, Fehler- und
+Qualitätswerte stehen weiterhin im standardmäßig eingeklappten Bereich
+**Technische Details** zur Verfügung.
+
+Die technischen Zähler sind nach Dokumenten, Texterkennung, Suche/Index und
+Wartung gruppiert. Dokument- und Seitenwerte sind ausdrücklich gekennzeichnet;
+exklusive Indexklassen, mathematische Beziehungen, Resetverhalten und die
+Diagnose **Statuswerte prüfen** beschreibt
+[`DOCUMENT_STATUS.md`](DOCUMENT_STATUS.md).
 
 ## Modellauswahl
 
@@ -90,7 +125,8 @@ Downloadgröße und RAM-Einstufung. Jede Datei wird per SHA-256 validiert.
 
 - Embeddings: multilingual E5 Small, 384 Dimensionen
 - Antworten: Qwen3 1.7B 4 Bit für 8-GB-Macs empfohlen
-- Qwen3 4B 4 Bit nur bei ausreichendem Speicher
+- Qwen3 4B 4 Bit bei ausreichendem Speicher
+- Qwen3 8B 4 Bit auf 8-GB-Macs nur experimentell
 
 Downloads lassen sich pausieren, fortsetzen und abbrechen. Ein
 Embedding-Modellwechsel erfordert eine Neuindexierung. Das Sprachmodell wird
@@ -99,23 +135,79 @@ entladen.
 
 ## Suche und Quellen
 
-Die Suche kombiniert SQLite FTS5 mit lokaler Vektorsuche und führt beide
-Ranglisten per Reciprocal Rank Fusion zusammen. Treffer zeigen Dateiname,
-Pfad, Seite, Auszug und Relevanz. Eine PDF kann im Finder, in der
-Standard-PDF-App oder in der internen PDFKit-Vorschau geöffnet werden.
+Natürliche Anfragen werden zuerst in einen strikt validierten lokalen Suchplan
+übersetzt. Regeln sichern Namen, Nummern, Daten und Beträge als
+Pflichtbedingungen; bei komplexen Anfragen ergänzt das lokale Antwortmodell
+Themen und Synonyme. Ungültiger Modelloutput fällt auf den sicheren
+regelbasierten Plan zurück und wird nie als SQL ausgeführt.
+
+Die Suche kombiniert SQLite FTS5 mit lokaler Vektorsuche, prüft
+Pflichtbedingungen und bewertet Person-/Themennähe erneut. Nur „Sehr passend“
+und „Passend“ erscheinen regulär. Unsichere Treffer bleiben getrennt und
+eingeklappt. Trefferkarten zeigen Dateiname, Pfad, Seite, hervorgehobenen
+Auszug, Relevanz, belegte Person und Thema, OCR-Qualität, Suchart und eine
+regelbasierte Begründung.
 
 Für eine formulierte Antwort werden nur die besten lokalen Fundstellen an das
 lokale Modell übergeben. Quellen-IDs werden von der App erzeugt und nachher
 gegen die Datenbank validiert. Fehlen ausreichende Belege, gibt die App keine
 scheinbar belegte Antwort aus.
 
+Die Suchansicht zeigt Nutzerfrage und Markdown-Antwort chatähnlich in einem
+präsenten, während der Trefferansicht sichtbaren Bereich. Quellenlinks öffnen
+die richtige PDF-Seite. Folgefragen verwenden nur einen auf sechs Schritte
+begrenzten Sitzungskontext; ein dauerhaftes Chatgedächtnis gibt es nicht.
+
+## Dokumentenwartung
+
+Unter **Dokumentenwartung** werden SHA-256-Duplikate, leere Seiten,
+vollständig leere PDFs, fehlende Dateien sowie Index- und
+Embedding-Werkzeuge getrennt verwaltet. Die visuelle Leerseitenanalyse läuft
+bei der normalen Dokumentenverarbeitung mit. Für ältere Indexeinträge kann sie
+gezielt ergänzt werden, ohne eine zweite OCR zu starten.
+
+Eine Seite gilt nie allein wegen fehlenden OCR-Texts als leer. Die davon
+unabhängige visuelle Prüfung berücksichtigt Rendering, Weiß- und Dunkelanteil,
+Varianz, Kanten, Kontrastinseln, zusammenhängende Strukturen, Randzonen,
+Text-/Bild-/Grafikobjekte und Annotationen. Schon ein relevantes Gegenmerkmal
+verhindert **Sicher leer**. Bildseiten, Barcodes, QR-Codes, Formularfelder,
+Stempel, Unterschriften, kontrastarme Inhalte und kleine Randnotizen werden
+deshalb als Inhalt oder als manuell zu prüfen eingestuft.
+
+Automatische Leereinstufungen sind keine Löschfreigabe. Nur ausdrücklich
+manuell als leer bestätigte Seiten sind auswählbar; auch eine ganze leere PDF
+erscheint erst nach Bestätigung jeder Seite als Papierkorb-Kandidat.
+
+Dateien werden ausschließlich nach ausdrücklicher Auswahl und Bestätigung
+verändert. Duplikate müssen denselben SHA-256 des Originaldokuments besitzen.
+Löschaktionen verwenden ausschließlich den macOS-Papierkorb. Beim Entfernen
+einzelner Seiten wird zuerst eine neue PDF erzeugt und vollständig validiert;
+erst danach folgt ein atomarer Austausch. Die ursprüngliche Fassung landet
+zur Wiederherstellung im Papierkorb. Details stehen in
+[`MAINTENANCE.md`](MAINTENANCE.md).
+
 ## Updates
 
 Version 1 enthält keinen automatischen App- oder Online-Katalog-Updater.
 App-Updates werden als vollständig neuer, signierter Build installiert.
-Modellupdates sind nur über einen neuen eingebauten, fest versionierten
-Katalog vorgesehen; eine aktive alte Modellversion bleibt bis zur
-erfolgreichen Prüfung einer neuen Version erhalten.
+Modellupdates sind ausschließlich über den Katalog einer neueren App-Version
+möglich. Die neue Version wird vollständig heruntergeladen, größen- und
+SHA-256-geprüft und erst danach aktiviert. Bei einem Fehler bleibt die alte
+Version erhalten. Für Embedding-Updates wird der Index aus dem gespeicherten
+Seitentext neu aufgebaut; Antwortmodell-Updates benötigen keine
+Neuindexierung.
+
+## Oberfläche, Sprache und Erscheinungsbild
+
+Unter **Einstellungen → Darstellung** stehen Deutsch, Englisch und die
+unterstützte Systemsprache sowie System, Hell und Dunkel zur Auswahl. Beide
+Entscheidungen werden in SQLite gespeichert und auf Hauptfenster,
+Menüleistenfenster und Einstellungen angewendet. Deutsch bleibt für bestehende
+Installationen ohne gespeicherte Wahl der Standard.
+
+Die Fortschrittsanzeige wird aus einer persistenten Verarbeitungssitzung
+gespeist. Sie bleibt deshalb zwischen Scan, OCR und Indexierung stabil,
+überlebt einen App-Neustart und zeigt den Abschluss noch kurz an.
 
 ## Fehlerbehebung
 
@@ -129,21 +221,22 @@ pdfinfo -v
 xcodebuild -showComponent MetalToolchain -json
 ```
 
-Bei fehlender Ordnerberechtigung den Stammordner erneut auswählen. Bei
-fehlenden OCR-Sprachen `tesseract-lang` installieren. Weitere Fälle stehen in
+Die externen Prüfkommandos sind nur für Tesseract/OCRmyPDF relevant. Bei
+fehlender Ordnerberechtigung den Stammordner erneut auswählen. Bei fehlenden
+OCR-Sprachen `tesseract-lang` installieren. Weitere Fälle stehen in
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ## Deinstallation
 
-1. PrivateDocSearch beenden.
+1. Findora beenden.
 2. Optional den Login-Start in **Einstellungen** vorher deaktivieren.
-3. `PrivateDocSearch.app` löschen.
+3. `Findora.app` löschen.
 4. Nur wenn Index, Modelle und Einstellungen ebenfalls entfernt werden
    sollen:
 
 ```text
-~/Library/Application Support/PrivateDocSearch/
-~/Library/Logs/PrivateDocSearch/
+~/Library/Application Support/Findora/
+~/Library/Logs/Findora/
 ```
 
 Private PDFs liegen außerhalb dieser Pfade und werden bei der Deinstallation
@@ -153,9 +246,14 @@ nicht gelöscht.
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - [`OCR_PIPELINE.md`](OCR_PIPELINE.md)
+- [`DOCUMENT_STATUS.md`](DOCUMENT_STATUS.md)
 - [`INDEXING_PIPELINE.md`](INDEXING_PIPELINE.md)
 - [`SEARCH_PIPELINE.md`](SEARCH_PIPELINE.md)
+- [`MAINTENANCE.md`](MAINTENANCE.md)
 - [`MODEL_MANAGER.md`](MODEL_MANAGER.md)
 - [`PRIVACY.md`](PRIVACY.md)
 - [`SECURITY.md`](SECURITY.md)
 - [`TESTING.md`](TESTING.md)
+- [`UI_LOCALIZATION.md`](UI_LOCALIZATION.md)
+- [`FINDORA_UI.md`](FINDORA_UI.md)
+- [`docs/CODEX_WORKFLOW.md`](docs/CODEX_WORKFLOW.md)

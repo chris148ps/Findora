@@ -1,0 +1,289 @@
+{
+  "schemaVersion": 1,
+  "models": [
+    {
+      "id": "mlx-community/multilingual-e5-small-mlx",
+      "kind": "embedding",
+      "displayName": "Multilingual E5 Small",
+      "family": "E5 / XLM-RoBERTa",
+      "parameters": "118M",
+      "quantization": "FP16",
+      "backend": "mlx",
+      "downloadSizeBytes": 252418075,
+      "estimatedRuntimeRAMBytes": 536870912,
+      "minimumSystemRAMBytes": 8589934592,
+      "recommendedSystemRAMBytes": 8589934592,
+      "defaultContextLength": 512,
+      "maximumContextLength": 512,
+      "downloadURL": "https://huggingface.co/mlx-community/multilingual-e5-small-mlx/tree/5030c7625865046d350eeea28f427d80353d0ac0",
+      "checksumSHA256": "82abf6126d67405ec1f29bec83adedb4a4356c248bfbabf40e1ef2ace3afe1d6",
+      "licenseName": "MIT",
+      "licenseURL": "https://huggingface.co/intfloat/multilingual-e5-small",
+      "modelVersion": "5030c7625865046d350eeea28f427d80353d0ac0",
+      "repositoryID": "mlx-community/multilingual-e5-small-mlx",
+      "files": [
+        {
+          "relativePath": "config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/multilingual-e5-small-mlx/resolve/5030c7625865046d350eeea28f427d80353d0ac0/config.json",
+          "sizeBytes": 2339,
+          "checksumSHA256": "e6cb8bbc6630ad19e64575d5bd5a3082790ac29db77e3f2429ee85bd0365ded1"
+        },
+        {
+          "relativePath": "special_tokens_map.json",
+          "downloadURL": "https://huggingface.co/mlx-community/multilingual-e5-small-mlx/resolve/5030c7625865046d350eeea28f427d80353d0ac0/special_tokens_map.json",
+          "sizeBytes": 965,
+          "checksumSHA256": "38d989b0fdad0fec0c67c14b1f3c8b68184022cf6d4adc5444526ced8653f738"
+        },
+        {
+          "relativePath": "tokenizer.json",
+          "downloadURL": "https://huggingface.co/mlx-community/multilingual-e5-small-mlx/resolve/5030c7625865046d350eeea28f427d80353d0ac0/tokenizer.json",
+          "sizeBytes": 17082822,
+          "checksumSHA256": "642eede941e22781e8b3c9a2dfe2015027b2fd855410b16cd66f07b0f3c76641"
+        },
+        {
+          "relativePath": "tokenizer_config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/multilingual-e5-small-mlx/resolve/5030c7625865046d350eeea28f427d80353d0ac0/tokenizer_config.json",
+          "sizeBytes": 1173,
+          "checksumSHA256": "ce30001b1b5e8e9cb010e74fdaff3025007f0330eb0fb7da81774f11efdd8845"
+        },
+        {
+          "relativePath": "weights.00.safetensors",
+          "downloadURL": "https://huggingface.co/mlx-community/multilingual-e5-small-mlx/resolve/5030c7625865046d350eeea28f427d80353d0ac0/weights.00.safetensors",
+          "sizeBytes": 235330776,
+          "checksumSHA256": "7c053992ab110056cb93c5991ececbeea6232adb666d144785e90628e06780d0"
+        }
+      ]
+    },
+    {
+      "id": "mlx-community/Qwen3-1.7B-4bit",
+      "kind": "answer",
+      "displayName": "Qwen 3 1.7B (4 Bit)",
+      "family": "Qwen",
+      "parameters": "1.7B",
+      "quantization": "4bit",
+      "backend": "mlx",
+      "downloadSizeBytes": 984013244,
+      "estimatedRuntimeRAMBytes": 2147483648,
+      "minimumSystemRAMBytes": 8589934592,
+      "recommendedSystemRAMBytes": 8589934592,
+      "defaultContextLength": 4096,
+      "maximumContextLength": 32768,
+      "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/tree/3b1b1768f8f8cf8351c712464f906e86c2b8269e",
+      "checksumSHA256": "b26278c464558e98a243ca91179df177c79030192a23055d1756d6f5a40c8437",
+      "licenseName": "Apache-2.0",
+      "licenseURL": "https://huggingface.co/Qwen/Qwen3-1.7B/blob/main/LICENSE",
+      "modelVersion": "3b1b1768f8f8cf8351c712464f906e86c2b8269e",
+      "repositoryID": "mlx-community/Qwen3-1.7B-4bit",
+      "files": [
+        {
+          "relativePath": "added_tokens.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/added_tokens.json",
+          "sizeBytes": 707,
+          "checksumSHA256": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680"
+        },
+        {
+          "relativePath": "config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/config.json",
+          "sizeBytes": 937,
+          "checksumSHA256": "507a6701220524eb8b283425bf0856a9ae4f21f4052e563896ddd668994b1dc7"
+        },
+        {
+          "relativePath": "merges.txt",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/merges.txt",
+          "sizeBytes": 1671853,
+          "checksumSHA256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        },
+        {
+          "relativePath": "model.safetensors",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/model.safetensors",
+          "sizeBytes": 968080210,
+          "checksumSHA256": "0e86d9677e519323849eac1bc272caae88567a481ff188c431f70be543d9995f"
+        },
+        {
+          "relativePath": "model.safetensors.index.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/model.safetensors.index.json",
+          "sizeBytes": 49731,
+          "checksumSHA256": "1e3058d4ba4b04e4de35b74467725cbef90ff022198404218e48f21adc9cfa15"
+        },
+        {
+          "relativePath": "special_tokens_map.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/special_tokens_map.json",
+          "sizeBytes": 613,
+          "checksumSHA256": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd"
+        },
+        {
+          "relativePath": "tokenizer.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/tokenizer.json",
+          "sizeBytes": 11422654,
+          "checksumSHA256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        {
+          "relativePath": "tokenizer_config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/tokenizer_config.json",
+          "sizeBytes": 9706,
+          "checksumSHA256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+        },
+        {
+          "relativePath": "vocab.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit/resolve/3b1b1768f8f8cf8351c712464f906e86c2b8269e/vocab.json",
+          "sizeBytes": 2776833,
+          "checksumSHA256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      ]
+    },
+    {
+      "id": "mlx-community/Qwen3-4B-4bit",
+      "kind": "answer",
+      "displayName": "Qwen 3 4B (4 Bit)",
+      "family": "Qwen",
+      "parameters": "4B",
+      "quantization": "4bit",
+      "backend": "mlx",
+      "downloadSizeBytes": 2278969756,
+      "estimatedRuntimeRAMBytes": 3758096384,
+      "minimumSystemRAMBytes": 8589934592,
+      "recommendedSystemRAMBytes": 17179869184,
+      "defaultContextLength": 4096,
+      "maximumContextLength": 32768,
+      "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/tree/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
+      "checksumSHA256": "5fa219c3185cfecd84a1644de4406e9434f371fd3a4fece5cb342c6ce9ed45f5",
+      "licenseName": "Apache-2.0",
+      "licenseURL": "https://huggingface.co/Qwen/Qwen3-4B/blob/main/LICENSE",
+      "modelVersion": "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
+      "repositoryID": "mlx-community/Qwen3-4B-4bit",
+      "files": [
+        {
+          "relativePath": "added_tokens.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/added_tokens.json",
+          "sizeBytes": 707,
+          "checksumSHA256": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680"
+        },
+        {
+          "relativePath": "config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/config.json",
+          "sizeBytes": 937,
+          "checksumSHA256": "b5efdcf3b0035a3638e7228dad4d85f5c4a23f156eb7cdb0b44c8366a5d34d9b"
+        },
+        {
+          "relativePath": "merges.txt",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/merges.txt",
+          "sizeBytes": 1671853,
+          "checksumSHA256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        },
+        {
+          "relativePath": "model.safetensors",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/model.safetensors",
+          "sizeBytes": 2263022529,
+          "checksumSHA256": "e240c0bdc0ebb0681bf0da0f98d9719fd6ebe269a3633f81542c13e81345651d"
+        },
+        {
+          "relativePath": "model.safetensors.index.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/model.safetensors.index.json",
+          "sizeBytes": 63924,
+          "checksumSHA256": "f7825defe5865d179c3b593173d37056be5f202dcb7153985cf74e75ecf1628b"
+        },
+        {
+          "relativePath": "special_tokens_map.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/special_tokens_map.json",
+          "sizeBytes": 613,
+          "checksumSHA256": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd"
+        },
+        {
+          "relativePath": "tokenizer.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/tokenizer.json",
+          "sizeBytes": 11422654,
+          "checksumSHA256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        {
+          "relativePath": "tokenizer_config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/tokenizer_config.json",
+          "sizeBytes": 9706,
+          "checksumSHA256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+        },
+        {
+          "relativePath": "vocab.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25/vocab.json",
+          "sizeBytes": 2776833,
+          "checksumSHA256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      ]
+    },
+    {
+      "id": "mlx-community/Qwen3-8B-4bit",
+      "kind": "answer",
+      "displayName": "Qwen 3 8B (4 Bit)",
+      "family": "Qwen",
+      "parameters": "8B",
+      "quantization": "4bit",
+      "backend": "mlx",
+      "downloadSizeBytes": 4623782544,
+      "estimatedRuntimeRAMBytes": 6979321856,
+      "minimumSystemRAMBytes": 8589934592,
+      "recommendedSystemRAMBytes": 17179869184,
+      "defaultContextLength": 4096,
+      "maximumContextLength": 32768,
+      "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/tree/545dc4251c05440727734bcd94334791f6ab0192",
+      "checksumSHA256": "58e14990c58a4ad1a9ede15ce2a13f0279a47b4ac8dccf0dd9ce2bb06bdf19a7",
+      "licenseName": "Apache-2.0",
+      "licenseURL": "https://huggingface.co/Qwen/Qwen3-8B/blob/main/LICENSE",
+      "modelVersion": "545dc4251c05440727734bcd94334791f6ab0192",
+      "repositoryID": "mlx-community/Qwen3-8B-4bit",
+      "files": [
+        {
+          "relativePath": "added_tokens.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/added_tokens.json",
+          "sizeBytes": 707,
+          "checksumSHA256": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680"
+        },
+        {
+          "relativePath": "config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/config.json",
+          "sizeBytes": 939,
+          "checksumSHA256": "e5485285fd7e289e76e9cffa112f6dc2e3426519082f7db9b69041589f81a218"
+        },
+        {
+          "relativePath": "merges.txt",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/merges.txt",
+          "sizeBytes": 1671853,
+          "checksumSHA256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        },
+        {
+          "relativePath": "model.safetensors",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/model.safetensors",
+          "sizeBytes": 4607835174,
+          "checksumSHA256": "f2d29621aab300336ad645567ff38c42aac755513006ef4e8a579cf7ef5256d8"
+        },
+        {
+          "relativePath": "model.safetensors.index.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/model.safetensors.index.json",
+          "sizeBytes": 64065,
+          "checksumSHA256": "3fb25463b4078b1fc27159daa605190029c2e965f533bf0b1b594f96cbfceb8a"
+        },
+        {
+          "relativePath": "special_tokens_map.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/special_tokens_map.json",
+          "sizeBytes": 613,
+          "checksumSHA256": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd"
+        },
+        {
+          "relativePath": "tokenizer.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/tokenizer.json",
+          "sizeBytes": 11422654,
+          "checksumSHA256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        {
+          "relativePath": "tokenizer_config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/tokenizer_config.json",
+          "sizeBytes": 9706,
+          "checksumSHA256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+        },
+        {
+          "relativePath": "vocab.json",
+          "downloadURL": "https://huggingface.co/mlx-community/Qwen3-8B-4bit/resolve/545dc4251c05440727734bcd94334791f6ab0192/vocab.json",
+          "sizeBytes": 2776833,
+          "checksumSHA256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      ]
+    }
+  ]
+}
