@@ -4,6 +4,7 @@
 
 ```bash
 swift test
+./scripts/check-product-name.sh
 ```
 
 Die automatisierten Tests verwenden ausschließlich künstlich erzeugte
@@ -98,7 +99,7 @@ geprüft mit:
 
 ```bash
 ./scripts/build-app.sh
-codesign --verify --deep --strict build/PrivateDocSearch.app
+codesign --verify --deep --strict build/Findora.app
 ```
 
 Danach manuell:
@@ -149,7 +150,7 @@ beim App-Start auslösen:
 ```bash
 PRIVATEDOCSEARCH_SIMULATE_MEMORY_PRESSURE=critical \
   PRIVATEDOCSEARCH_DISABLE_DOCUMENT_ACCESS=1 \
-  build/PrivateDocSearch.app/Contents/MacOS/PrivateDocSearch
+  build/Findora.app/Contents/MacOS/Findora
 ```
 
 Der Regressionstest leitet dasselbe Ereignis von einer Utility-Queue auf den

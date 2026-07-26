@@ -3,14 +3,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "PrivateDocSearch",
+    name: "Findora",
     defaultLocalization: "de",
     platforms: [
         .macOS(.v14)
     ],
     products: [
         .library(name: "PrivateDocSearchCore", targets: ["PrivateDocSearchCore"]),
-        .executable(name: "PrivateDocSearch", targets: ["PrivateDocSearchApp"])
+        .executable(name: "Findora", targets: ["PrivateDocSearchApp"])
     ],
     dependencies: [
         .package(

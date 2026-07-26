@@ -1,10 +1,10 @@
-# PrivateDocSearch – Architektur und Umsetzungsplan
+# Findora – Architektur und Umsetzungsplan
 
 Stand: 24. Juli 2026
 
 ## Ziel und Leitplanken
 
-PrivateDocSearch ist eine eigenständige, native macOS-App. Sie verarbeitet
+Findora ist eine eigenständige, native macOS-App. Sie verarbeitet
 ausgewählte PDF-Bestände ausschließlich lokal. Dokumente werden weder
 umbenannt, verschoben noch gelöscht. Eine inhaltliche Änderung ist nur als
 sicher validierter, atomarer OCR-Ersatz erlaubt.

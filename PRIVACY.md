@@ -2,7 +2,7 @@
 
 Stand: 24. Juli 2026
 
-PrivateDocSearch ist als lokale Einzelbenutzer-Anwendung entworfen.
+Findora ist als lokale Einzelbenutzer-Anwendung entworfen.
 
 ## Was lokal bleibt
 

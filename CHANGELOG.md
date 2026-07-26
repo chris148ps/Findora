@@ -1,6 +1,6 @@
 # Changelog
 
-Alle wesentlichen Änderungen an PrivateDocSearch werden hier dokumentiert.
+Alle wesentlichen Änderungen an Findora werden hier dokumentiert.
 Das Projekt verwendet vor einer externen Freigabe keine impliziten Releases
 oder Tags.
 

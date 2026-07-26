@@ -36,7 +36,7 @@ nur tatsächlich installierte Sprachen auswählen.
 - Unter **Einstellungen** denselben Stammordner erneut auswählen.
 - macOS-Datenschutzfreigaben für die App kontrollieren.
 
-PrivateDocSearch löscht bei einem unerreichbaren Stammordner keine
+Findora löscht bei einem unerreichbaren Stammordner keine
 Indexeinträge. Cloud-Platzhalter müssen lokal geladen sein, bevor OCR und
 Indexierung sie verarbeiten können.
 

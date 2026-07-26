@@ -2,7 +2,7 @@
 
 ## Drei getrennte Phasen
 
-PrivateDocSearch trennt verbindlich:
+Findora trennt verbindlich:
 
 1. **Suchplanung:** Nutzerabsicht und Bedingungen verstehen;
 2. **Suche:** belegbare Textstellen finden, filtern und bewerten;

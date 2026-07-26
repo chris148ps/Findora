@@ -1,9 +1,13 @@
-# PrivateDocSearch
+# Findora
 
-PrivateDocSearch ist eine native macOS-App für lokale OCR, Indexierung und
+Findora ist eine native macOS-App für lokale OCR, Indexierung und
 semantische Suche in privaten PDF-Beständen. Dokumente, Suchanfragen,
 Embeddings und Antworten bleiben auf dem Mac. Es werden weder Ollama noch ein
 externer KI-Server oder eine Cloud-KI benötigt.
+
+Früherer Entwicklungsname: PrivateDocSearch. Bundle-ID sowie bestehende
+Daten-, Modell-, Bookmark- und Logpfade bleiben zur verlustfreien
+Kompatibilität unverändert.
 
 ## Voraussetzungen
 
@@ -31,13 +35,13 @@ swift test
 
 MLX enthält Metal-Shader. Deshalb erzeugt `build-app.sh` den produktiven Build
 mit Xcode und nicht mit `swift build`. Das Ergebnis liegt unter
-`build/PrivateDocSearch.app`.
+`build/Findora.app`.
 
 ## Installation
 
 Für die interne, ad-hoc signierte Version:
 
-1. `build/PrivateDocSearch.app` nach `/Applications` kopieren.
+1. `build/Findora.app` nach `/Applications` kopieren.
 2. Die App aus dem Finder öffnen.
 3. Falls macOS die interne Signatur beanstandet, im Finder mit Rechtsklick
    **Öffnen** wählen.
@@ -50,7 +54,7 @@ abzuschließen.
 ## Erster Start und Ordnerberechtigung
 
 Unter **Einstellungen** mit **Ordner auswählen** genau den PDF-Stammordner
-freigeben. Die Auswahl erfolgt über den macOS-Dateidialog. PrivateDocSearch
+freigeben. Die Auswahl erfolgt über den macOS-Dateidialog. Findora
 speichert ein Security-Scoped Bookmark und stellt die Berechtigung nach einem
 Neustart wieder her. Ist ein Volume nicht verbunden oder die Berechtigung
 entzogen, wird das sichtbar gemeldet; der Index wird nicht als leer behandelt.
@@ -60,7 +64,7 @@ Arbeitsdateien werden nicht verfolgt. Der Ordner wird rekursiv durchsucht.
 
 ## OCR
 
-PrivateDocSearch prüft jede PDF seitenweise. Eine bereits brauchbare
+Findora prüft jede PDF seitenweise. Eine bereits brauchbare
 Textschicht bleibt unverändert. Im empfohlenen Automatikmodus verwendet macOS
 zuerst Apple Vision. Scheitert Vision, versucht die App automatisch Tesseract.
 
@@ -224,9 +228,9 @@ OCR-Sprachen `tesseract-lang` installieren. Weitere Fälle stehen in
 
 ## Deinstallation
 
-1. PrivateDocSearch beenden.
+1. Findora beenden.
 2. Optional den Login-Start in **Einstellungen** vorher deaktivieren.
-3. `PrivateDocSearch.app` löschen.
+3. `Findora.app` löschen.
 4. Nur wenn Index, Modelle und Einstellungen ebenfalls entfernt werden
    sollen:
 
@@ -251,3 +255,4 @@ nicht gelöscht.
 - [`SECURITY.md`](SECURITY.md)
 - [`TESTING.md`](TESTING.md)
 - [`UI_LOCALIZATION.md`](UI_LOCALIZATION.md)
+- [`FINDORA_UI.md`](FINDORA_UI.md)

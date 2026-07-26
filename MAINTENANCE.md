@@ -2,7 +2,7 @@
 
 ## Sicherheitsmodell
 
-PrivateDocSearch führt niemals eine automatische Löschung aus. Jede
+Findora führt niemals eine automatische Löschung aus. Jede
 verändernde Aktion benötigt eine konkrete Auswahl und einen
 Bestätigungsdialog. Ganze Dateien und die alte Fassung einer seitenweise
 bereinigten PDF werden ausschließlich in den macOS-Papierkorb verschoben.

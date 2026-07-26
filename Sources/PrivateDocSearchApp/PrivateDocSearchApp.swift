@@ -12,17 +12,28 @@ struct PrivateDocSearchApplication: App {
     @State private var state = AppState()
 
     var body: some Scene {
-        WindowGroup("PrivateDocSearch", id: "main") {
+        WindowGroup("Findora", id: "main") {
             ContentView()
                 .id(state.interfaceLocale.identifier)
                 .environment(state)
                 .environment(\.locale, state.interfaceLocale)
                 .preferredColorScheme(state.preferredColorScheme)
-                .frame(minWidth: 980, minHeight: 680)
+                .frame(minWidth: 1_050, minHeight: 700)
         }
         .defaultSize(width: 1180, height: 780)
+        .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button(
+                    state.interfaceLocale.language.languageCode?.identifier == "en"
+                        ? "About Findora"
+                        : "Über Findora"
+                ) {
+                    state.showsAbout = true
+                }
+            }
+        }
 
-        MenuBarExtra("PrivateDocSearch", systemImage: state.isProcessing ? "doc.text.magnifyingglass" : "magnifyingglass") {
+        MenuBarExtra("Findora", systemImage: state.isProcessing ? "doc.text.magnifyingglass" : "magnifyingglass") {
             MenuBarContent()
                 .environment(state)
                 .environment(\.locale, state.interfaceLocale)
@@ -148,6 +159,7 @@ final class AppState {
     var isMaintainingDocuments = false
     var maintenanceMessage: String?
     var statusDiagnosticMessage: String?
+    var showsAbout = false
     var processingSession: ProcessingSessionSnapshot?
     var interfaceLanguage: InterfaceLanguage = .german
     var interfaceAppearance: InterfaceAppearance = .system
@@ -172,6 +184,21 @@ final class AppState {
         case .system: nil
         case .light: .light
         case .dark: .dark
+        }
+    }
+
+    func localizedSectionTitle(_ section: AppSection) -> String {
+        guard interfaceLocale.language.languageCode?.identifier == "en" else {
+            return section.rawValue
+        }
+        return switch section {
+        case .search: "Search"
+        case .status: "Document status"
+        case .maintenance: "Document maintenance"
+        case .ocr: "OCR"
+        case .models: "Models"
+        case .settings: "Settings"
+        case .logs: "Log"
         }
     }
 
@@ -255,7 +282,7 @@ final class AppState {
                 semanticEnabled: false
             )
         } catch {
-            fatalError("PrivateDocSearch-Verzeichnisse konnten nicht angelegt werden: \(error)")
+            fatalError("Findora-Verzeichnisse konnten nicht angelegt werden: \(error)")
         }
 
         startMemoryPressureMonitoring()
@@ -267,7 +294,7 @@ final class AppState {
             try await fileLogger.log(
                 .info,
                 category: "App",
-                message: "PrivateDocSearch wird gestartet."
+                message: "Findora wird gestartet."
             )
             try await database.initialize()
             await startDocumentStatusMonitoring()
@@ -1523,7 +1550,7 @@ final class AppState {
 
     func exportLog() {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "PrivateDocSearch-Protokoll.txt"
+        panel.nameFieldStringValue = "Findora-Protokoll.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let text = logEntries.map { date, category, message, path in
             "\(date.formatted()) [\(category)] \(message)\(path.map { " — \($0)" } ?? "")"
@@ -1906,15 +1933,7 @@ struct ContentView: View {
     var body: some View {
         @Bindable var state = state
         NavigationSplitView {
-            List(AppSection.allCases, selection: $state.selectedSection) { section in
-                Label(
-                    LocalizedStringKey(section.rawValue),
-                    systemImage: section.symbol
-                )
-                    .tag(section)
-            }
-            .navigationTitle("PrivateDocSearch")
-            .frame(minWidth: 210)
+            FindoraSidebar(selection: $state.selectedSection)
         } detail: {
             Group {
                 switch state.selectedSection ?? .search {
@@ -1930,7 +1949,7 @@ struct ContentView: View {
             .environment(state)
         }
         .alert(
-            "PrivateDocSearch",
+            "Findora",
             isPresented: Binding(
                 get: { state.lastError != nil },
                 set: { if !$0 { state.lastError = nil } }
@@ -1943,6 +1962,109 @@ struct ContentView: View {
         .sheet(item: $state.previewSource) { source in
             PDFSourcePreview(source: source)
         }
+        .sheet(isPresented: $state.showsAbout) {
+            FindoraAboutView(
+                isEnglish: state.interfaceLocale.language.languageCode?
+                    .identifier == "en"
+            )
+        }
+    }
+}
+
+private struct FindoraSidebar: View {
+    @Binding var selection: AppSection?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.title2)
+                    .foregroundStyle(.tint)
+                    .accessibilityHidden(true)
+                Text("Findora")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+
+            Divider()
+
+            List(selection: $selection) {
+                sidebarSection([.search])
+                sidebarSection([.status, .maintenance])
+                sidebarSection([.ocr, .models])
+                sidebarSection([.settings, .logs])
+            }
+            .listStyle(.sidebar)
+        }
+        .navigationSplitViewColumnWidth(min: 245, ideal: 255, max: 280)
+        .accessibilityLabel("Findora-Navigation")
+    }
+
+    @ViewBuilder
+    private func sidebarSection(_ sections: [AppSection]) -> some View {
+        Section {
+            ForEach(sections) { section in
+                Label(
+                    LocalizedStringKey(section.rawValue),
+                    systemImage: section.symbol
+                )
+                .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                .contentShape(Rectangle())
+                .tag(section)
+                .listRowInsets(
+                    EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12)
+                )
+                .accessibilityLabel(LocalizedStringKey(section.rawValue))
+            }
+        }
+    }
+}
+
+private struct FindoraAboutView: View {
+    @Environment(\.dismiss) private var dismiss
+    let isEnglish: Bool
+
+    private var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "—"
+    }
+
+    private var build: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")
+            as? String ?? "—"
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "doc.text.magnifyingglass")
+                .font(.system(size: 48))
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+            Text("Findora")
+                .font(.largeTitle.bold())
+            Text("Version \(version) · Build \(build)")
+                .foregroundStyle(.secondary)
+            Text(
+                isEnglish
+                    ? "Documents, OCR, search, and AI analysis are processed locally on this Mac."
+                    : "Dokumente, OCR, Suche und KI-Auswertung werden lokal auf diesem Mac verarbeitet."
+            )
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 360)
+            Label(
+                isEnglish ? "No telemetry" : "Keine Telemetrie",
+                systemImage: "hand.raised.fill"
+            )
+                .foregroundStyle(.secondary)
+            Button(isEnglish ? "Close" : "Schließen") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(32)
+        .frame(minWidth: 440)
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -1965,7 +2087,7 @@ struct SearchView: View {
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text("Sie:").font(.caption.bold())
                                     Text(turn.question).lineLimit(2)
-                                    Text("PrivateDocSearch:").font(.caption.bold())
+                                    Text("Findora:").font(.caption.bold())
                                     Text(plainMarkdown(turn.answer))
                                         .lineLimit(4)
                                         .foregroundStyle(.secondary)
@@ -2033,7 +2155,7 @@ struct SearchView: View {
 
                         VStack(alignment: .leading, spacing: 10) {
                             HStack {
-                                Label("PrivateDocSearch", systemImage: "sparkles")
+                                Label("Findora", systemImage: "sparkles")
                                     .font(.headline)
                                 Spacer()
                                 if !state.answer.isEmpty {
@@ -2183,7 +2305,7 @@ struct SearchView: View {
             }
             .padding()
         }
-        .navigationTitle("Suche")
+        .navigationTitle(state.localizedSectionTitle(.search))
     }
 
     private func markdown(_ value: String) -> AttributedString {
@@ -2556,7 +2678,7 @@ struct StatusView: View {
             }
             .padding()
         }
-        .navigationTitle("Dokumentenstatus")
+        .navigationTitle(state.localizedSectionTitle(.status))
     }
 
     private func processingTitle(
@@ -2814,33 +2936,12 @@ struct MaintenanceView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Picker("Wartungsbereich", selection: $section) {
-                    ForEach(MaintenanceSection.allCases) {
-                        Text(LocalizedStringKey($0.rawValue)).tag($0)
-                    }
-                }
-                .pickerStyle(.segmented)
-                TextField("Liste durchsuchen", text: $filter)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 240)
-                Picker("Sortierung", selection: $sort) {
-                    ForEach(MaintenanceSort.allCases) {
-                        Text(LocalizedStringKey($0.rawValue)).tag($0)
-                    }
-                }
-                .frame(width: 150)
-                Picker("Status", selection: $statusFilter) {
-                    ForEach(availableStatusFilters) {
-                        Text(LocalizedStringKey($0.rawValue)).tag($0)
-                    }
-                }
-                .frame(width: 180)
-                Button("Aktualisieren") {
-                    Task { await state.refreshMaintenance() }
-                }
+            VStack(alignment: .leading, spacing: 12) {
+                maintenanceSectionPicker
+                maintenanceFilterBar
             }
-            .padding()
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
 
             Divider()
 
@@ -2888,7 +2989,7 @@ struct MaintenanceView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .navigationTitle("Dokumentenwartung")
+        .navigationTitle(state.localizedSectionTitle(.maintenance))
         .task { await state.refreshMaintenance() }
         .onChange(of: section) {
             statusFilter = .all
@@ -2968,13 +3069,128 @@ struct MaintenanceView: View {
         }
     }
 
+    private var maintenanceSectionPicker: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(MaintenanceSection.allCases) { item in
+                    Button {
+                        section = item
+                    } label: {
+                        Text(LocalizedStringKey(item.rawValue))
+                            .font(.callout.weight(.medium))
+                            .lineLimit(1)
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 32)
+                            .foregroundStyle(
+                                section == item ? Color.white : Color.primary
+                            )
+                            .background(
+                                section == item
+                                    ? Color.accentColor
+                                    : Color.secondary.opacity(0.10),
+                                in: Capsule()
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(LocalizedStringKey(item.rawValue))
+                    .accessibilityValue(
+                        section == item
+                            ? LocalizedStringKey("Ausgewählt")
+                            : LocalizedStringKey("Nicht ausgewählt")
+                    )
+                    .accessibilityHint(Text("Wartungsbereich anzeigen"))
+                    .help(Text(LocalizedStringKey(item.rawValue)))
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .accessibilityLabel(Text("Wartungsbereiche"))
+    }
+
+    private var maintenanceFilterBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                maintenanceSearchField
+                    .frame(minWidth: 200, idealWidth: 260, maxWidth: .infinity)
+                maintenanceSortPicker
+                    .frame(width: 150)
+                maintenanceStatusPicker
+                    .frame(width: 180)
+                maintenanceRefreshButton
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                maintenanceSearchField
+                HStack(spacing: 10) {
+                    maintenanceSortPicker
+                        .frame(minWidth: 130, maxWidth: .infinity)
+                    maintenanceStatusPicker
+                        .frame(minWidth: 150, maxWidth: .infinity)
+                    maintenanceRefreshButton
+                }
+            }
+        }
+    }
+
+    private var maintenanceSearchField: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            TextField("Liste durchsuchen", text: $filter)
+                .textFieldStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .frame(minHeight: 30)
+        .background(.background, in: RoundedRectangle(cornerRadius: 7))
+        .overlay {
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+        }
+        .accessibilityLabel(Text("Liste durchsuchen"))
+        .help(Text("Wartungsliste nach Dateiname, Pfad oder Status filtern"))
+    }
+
+    private var maintenanceSortPicker: some View {
+        Picker("Sortierung", selection: $sort) {
+            ForEach(MaintenanceSort.allCases) {
+                Text(LocalizedStringKey($0.rawValue)).tag($0)
+            }
+        }
+        .labelsHidden()
+        .accessibilityLabel(Text("Sortierung"))
+        .help(Text("Sortierreihenfolge auswählen"))
+    }
+
+    private var maintenanceStatusPicker: some View {
+        Picker("Status", selection: $statusFilter) {
+            ForEach(availableStatusFilters) {
+                Text(LocalizedStringKey($0.rawValue)).tag($0)
+            }
+        }
+        .labelsHidden()
+        .accessibilityLabel(Text("Statusfilter"))
+        .help(Text("Angezeigte Zustände einschränken"))
+    }
+
+    private var maintenanceRefreshButton: some View {
+        Button {
+            Task { await state.refreshMaintenance() }
+        } label: {
+            Label("Aktualisieren", systemImage: "arrow.clockwise")
+        }
+        .help(Text("Wartungsdaten aus SQLite aktualisieren"))
+        .accessibilityHint(Text("Lädt alle Wartungslisten neu"))
+    }
+
     private var duplicateList: some View {
         VStack(spacing: 0) {
             List {
                 if filteredDuplicateGroups.isEmpty {
-                    ContentUnavailableView(
-                        "Keine SHA-256-Duplikate",
-                        systemImage: "doc.on.doc"
+                    maintenanceEmptyState(
+                        "Keine Duplikate gefunden",
+                        symbol: "doc.on.doc",
+                        description: "Findora hat keine Dateien mit identischem SHA-256-Inhalt gefunden."
                     )
                 }
                 ForEach(filteredDuplicateGroups) { group in
@@ -3059,12 +3275,10 @@ struct MaintenanceView: View {
         VStack(spacing: 0) {
             List {
                 if filteredEmptyPages.isEmpty {
-                    ContentUnavailableView(
-                        "Keine zu prüfenden Seiten",
-                        systemImage: "doc.text.magnifyingglass",
-                        description: Text(
-                            "Neue PDFs werden während der normalen Verarbeitung analysiert."
-                        )
+                    maintenanceEmptyState(
+                        "Keine leeren Seiten gefunden",
+                        symbol: "doc.text.magnifyingglass",
+                        description: "Findora hat keine Seiten gefunden, die manuell geprüft werden müssen."
                     )
                 }
                 ForEach(filteredEmptyPages) { candidate in
@@ -3175,9 +3389,10 @@ struct MaintenanceView: View {
         VStack(spacing: 0) {
             List {
                 if filteredEmptyPDFs.isEmpty {
-                    ContentUnavailableView(
-                        "Keine bestätigten leeren PDFs",
-                        systemImage: "doc"
+                    maintenanceEmptyState(
+                        "Keine leeren PDFs gefunden",
+                        symbol: "doc",
+                        description: "Es gibt keine vollständig analysierten und bestätigten leeren PDFs."
                     )
                 }
                 ForEach(filteredEmptyPDFs) { candidate in
@@ -3235,9 +3450,10 @@ struct MaintenanceView: View {
         VStack(spacing: 0) {
             List {
                 if filteredOCRReviewCandidates.isEmpty {
-                    ContentUnavailableView(
-                        "Keine OCR-Prüfung erforderlich",
-                        systemImage: "checkmark.circle"
+                    maintenanceEmptyState(
+                        "Keine OCR-Prüffälle",
+                        symbol: "checkmark.circle",
+                        description: "Alle aktuell erkannten OCR-Seiten sind bearbeitet."
                     )
                 }
                 ForEach(filteredOCRReviewCandidates) { candidate in
@@ -3324,48 +3540,7 @@ struct MaintenanceView: View {
                     .padding(.vertical, 5)
                 }
             }
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(
-                        "\(selectedOCRReviewCandidates.count) ausgewählt · hohe Auflösungen werden einzeln verarbeitet"
-                    )
-                    Text(
-                        "Gemeinsame Strategie: 300 dpi + Kontrast · geschätzt bis ca. 45 MB Arbeitspeicher je Seite"
-                    )
-                    .font(.caption2)
-                }
-                .foregroundStyle(.secondary)
-                Spacer()
-                Button("Auswahl zurücksetzen") {
-                    selectedOCRReviewIDs.removeAll()
-                }
-                .disabled(selectedOCRReviewIDs.isEmpty)
-                Button("Ausgewählte als nicht leer markieren") {
-                    state.confirmNotEmpty(selectedOCRReviewCandidates)
-                }
-                .disabled(selectedOCRReviewCandidates.isEmpty)
-                Button("Ausgewählte automatisch nachbearbeiten") {
-                    state.retryOCR(selectedOCRReviewCandidates)
-                }
-                .disabled(
-                    selectedOCRReviewCandidates.isEmpty
-                        || state.isMaintainingDocuments
-                        || state.isProcessing
-                )
-                Button("Ausgewählte mit gleicher Strategie testen") {
-                    state.retryOCR(
-                        selectedOCRReviewCandidates,
-                        configuration: sharedBulkOCRConfiguration
-                    )
-                }
-                .disabled(
-                    selectedOCRReviewCandidates.isEmpty
-                        || state.isMaintainingDocuments
-                        || state.isProcessing
-                )
-            }
-            .padding()
-            .background(.bar)
+            ocrReviewActionBar
         }
     }
 
@@ -3373,11 +3548,11 @@ struct MaintenanceView: View {
         VStack(spacing: 0) {
             List {
                 if filteredMissingFiles.isEmpty {
-                    ContentUnavailableView {
-                        Label("Keine fehlenden Dateien", systemImage: "checkmark.circle")
-                    } description: {
-                        Text("Der gespeicherte Dokumentbestand ist erreichbar.")
-                    }
+                    maintenanceEmptyState(
+                        "Keine fehlenden Dateien",
+                        symbol: "checkmark.circle",
+                        description: "Der gespeicherte Dokumentbestand ist erreichbar."
+                    )
                 }
                 ForEach(filteredMissingFiles) { candidate in
                     HStack(alignment: .top, spacing: 12) {
@@ -3413,26 +3588,30 @@ struct MaintenanceView: View {
                     .padding(.vertical, 4)
                 }
             }
-            HStack {
-                Text("\(selectedMissingCount) ausgewählt")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("Ein Scan gleicht Pfade und Suchindex gezielt ab.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button("Jetzt prüfen") {
-                    Task { await state.scanNow() }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(state.documentFolderPath == nil || state.isProcessing)
-            }
-            .padding()
-            .background(.bar)
+            missingFilesActionBar
         }
     }
 
     private var indexView: some View {
         Form {
+            Section {
+                if state.hasMixedEmbeddingIndex {
+                    ContentUnavailableView {
+                        Label(
+                            "Gemischter Embedding-Index",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                    } description: {
+                        Text("E5- und Fallback-Vektoren sind gleichzeitig vorhanden. Die Suche verwendet nur das aktive Modell.")
+                    }
+                } else {
+                    ContentUnavailableView {
+                        Label("Index konsistent", systemImage: "checkmark.circle")
+                    } description: {
+                        Text("Findora hat keinen gemischten Embedding-Index erkannt.")
+                    }
+                }
+            }
             Section("Leerseitenanalyse") {
                 Button("Fehlende Analysen ergänzen") {
                     state.analyzeMissingPages()
@@ -3467,41 +3646,218 @@ struct MaintenanceView: View {
 
     private func maintenanceActionBar(
         selectionCount: Int,
-        title: String,
+        title: LocalizedStringKey,
         enabled: Bool,
         action: @escaping () -> Void,
         reset: @escaping () -> Void
     ) -> some View {
-        HStack {
-            Text("\(selectionCount) ausgewählt")
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                selectionCountLabel(selectionCount)
+                Spacer(minLength: 16)
+                actionBarButtons(
+                    title: title,
+                    selectionCount: selectionCount,
+                    enabled: enabled,
+                    action: action,
+                    reset: reset
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                selectionCountLabel(selectionCount)
+                actionBarButtons(
+                    title: title,
+                    selectionCount: selectionCount,
+                    enabled: enabled,
+                    action: action,
+                    reset: reset
+                )
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(minHeight: 58)
+        .background(.bar)
+        .overlay(alignment: .top) {
+            Divider()
+        }
+    }
+
+    private func maintenanceEmptyState(
+        _ title: LocalizedStringKey,
+        symbol: String,
+        description: LocalizedStringKey
+    ) -> some View {
+        ContentUnavailableView {
+            Label(title, systemImage: symbol)
+        } description: {
+            Text(description)
+        } actions: {
+            Button("Erneut prüfen") {
+                Task { await state.refreshMaintenance() }
+            }
+        }
+    }
+
+    private var ocrReviewActionBar: some View {
+        let candidates = selectedOCRReviewCandidates
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                ocrReviewSelectionDescription
+                Spacer(minLength: 16)
+                ocrReviewActionButtons(candidates)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                ocrReviewSelectionDescription
+                ocrReviewActionButtons(candidates)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.bar)
+        .overlay(alignment: .top) {
+            Divider()
+        }
+    }
+
+    private var ocrReviewSelectionDescription: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            selectionCountLabel(selectedOCRReviewCandidates.count)
+            Text("Hohe Auflösungen werden einzeln verarbeitet. Gemeinsame Strategie: 300 dpi + Kontrast, bis ca. 45 MB Arbeitsspeicher je Seite.")
+                .font(.caption2)
                 .foregroundStyle(.secondary)
-            Spacer()
+        }
+    }
+
+    private func ocrReviewActionButtons(
+        _ candidates: [OCRReviewCandidate]
+    ) -> some View {
+        HStack(spacing: 10) {
+            Button("Auswahl zurücksetzen") {
+                selectedOCRReviewIDs.removeAll()
+            }
+            .disabled(candidates.isEmpty)
+            Menu("Auswahl bearbeiten") {
+                Button("Als nicht leer markieren") {
+                    state.confirmNotEmpty(candidates)
+                }
+                Button("Automatisch nachbearbeiten") {
+                    state.retryOCR(candidates)
+                }
+                Button("Mit gleicher Strategie testen") {
+                    state.retryOCR(
+                        candidates,
+                        configuration: sharedBulkOCRConfiguration
+                    )
+                }
+            }
+            .disabled(
+                candidates.isEmpty
+                    || state.isMaintainingDocuments
+                    || state.isProcessing
+            )
+        }
+    }
+
+    private var missingFilesActionBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                selectionCountLabel(selectedMissingCount)
+                Text("Ein Scan gleicht Pfade und Suchindex gezielt ab.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 16)
+                scanNowButton
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                selectionCountLabel(selectedMissingCount)
+                Text("Ein Scan gleicht Pfade und Suchindex gezielt ab.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                scanNowButton
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.bar)
+        .overlay(alignment: .top) {
+            Divider()
+        }
+    }
+
+    private var scanNowButton: some View {
+        Button("Jetzt prüfen") {
+            Task { await state.scanNow() }
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(state.documentFolderPath == nil || state.isProcessing)
+    }
+
+    private var selectionControls: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                selectionCountLabel(currentSelectionCount)
+                Spacer(minLength: 12)
+                selectionToolButtons
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                selectionCountLabel(currentSelectionCount)
+                selectionToolButtons
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.background.secondary)
+    }
+
+    private var selectionToolButtons: some View {
+        HStack(spacing: 8) {
+            Button("Alle auswählen") { selectAllVisible() }
+                .disabled(selectableVisibleCount == 0)
+                .help(Text("Alle aktuell sichtbaren und zulässigen Einträge auswählen"))
+            Button("Keine auswählen") { clearCurrentSelection() }
+                .disabled(currentSelectionCount == 0)
+                .help(Text("Aktuelle Auswahl aufheben"))
+            Button("Auswahl umkehren") { invertVisibleSelection() }
+                .disabled(selectableVisibleCount == 0)
+                .help(Text("Auswahl der sichtbaren Einträge umkehren"))
+        }
+        .buttonStyle(.borderless)
+    }
+
+    private func selectionCountLabel(_ count: Int) -> some View {
+        Label(
+            "\(count) ausgewählt",
+            systemImage: count == 0 ? "checklist.unchecked" : "checklist.checked"
+        )
+        .font(.callout.weight(.medium))
+        .foregroundStyle(count == 0 ? .secondary : .primary)
+        .accessibilityLabel(Text("\(count) ausgewählt"))
+    }
+
+    private func actionBarButtons(
+        title: LocalizedStringKey,
+        selectionCount: Int,
+        enabled: Bool,
+        action: @escaping () -> Void,
+        reset: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 10) {
             Button("Auswahl zurücksetzen", action: reset)
                 .disabled(selectionCount == 0)
             Button(title, role: .destructive, action: action)
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
                 .disabled(
                     !enabled
                         || state.isMaintainingDocuments
                         || state.isProcessing
                 )
         }
-        .padding()
-        .background(.bar)
-    }
-
-    private var selectionControls: some View {
-        HStack {
-            Text("Sichtbare Einträge")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Button("Alle auswählen") { selectAllVisible() }
-            Button("Keine auswählen") { clearCurrentSelection() }
-            Button("Auswahl umkehren") { invertVisibleSelection() }
-            Spacer()
-        }
-        .buttonStyle(.borderless)
-        .padding(.horizontal)
-        .padding(.vertical, 8)
     }
 
     private var availableStatusFilters: [MaintenanceStatusFilter] {
@@ -3796,6 +4152,45 @@ struct MaintenanceView: View {
         filteredMissingFiles.filter {
             selectedMissingPaths.contains($0.absolutePath)
         }.count
+    }
+
+    private var currentSelectionCount: Int {
+        switch section {
+        case .duplicates:
+            selectedDuplicateLocations.count
+        case .emptyPages:
+            selectedEmptyPages.count
+        case .ocrReview:
+            selectedOCRReviewCandidates.count
+        case .emptyPDFs:
+            selectedEmptyPDFs.count
+        case .missingFiles:
+            selectedMissingCount
+        case .index:
+            0
+        }
+    }
+
+    private var selectableVisibleCount: Int {
+        switch section {
+        case .duplicates:
+            filteredDuplicateGroups.reduce(0) { count, group in
+                count + max(group.locations.count - 1, 0)
+            }
+        case .emptyPages:
+            filteredEmptyPages.filter {
+                $0.decision == .confirmedEmpty
+                    && $0.status.isEmptyCandidate
+            }.count
+        case .ocrReview:
+            filteredOCRReviewCandidates.count
+        case .emptyPDFs:
+            filteredEmptyPDFs.count
+        case .missingFiles:
+            filteredMissingFiles.count
+        case .index:
+            0
+        }
     }
 
     private var sharedBulkOCRConfiguration: OCRConfiguration {
@@ -4369,7 +4764,7 @@ struct OCRView: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("OCR")
+        .navigationTitle(state.localizedSectionTitle(.ocr))
         .onChange(of: state.ocrConfiguration.engineSelection) {
             state.ocrRequirementsChanged()
         }
@@ -4488,7 +4883,7 @@ struct ModelsView: View {
             }
             .padding()
         }
-        .navigationTitle("Modelle")
+        .navigationTitle(state.localizedSectionTitle(.models))
         .alert(
             "Index neu aufbauen?",
             isPresented: Binding(
@@ -4723,24 +5118,45 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section("Dokumente") {
-                LabeledContent("Ordner", value: state.documentFolderPath ?? "Nicht ausgewählt")
+                LabeledContent {
+                    if let path = state.documentFolderPath {
+                        Text(path)
+                    } else {
+                        Text("Nicht ausgewählt")
+                    }
+                } label: {
+                    Text("Ordner")
+                }
                 Button("Dokumentenordner auswählen …") { state.chooseFolder() }
-                Stepper("Scanintervall: \(state.scanIntervalMinutes) Minuten", value: $state.scanIntervalMinutes, in: 1...1440)
+                Stepper(
+                    value: $state.scanIntervalMinutes,
+                    in: 1...1440
+                ) {
+                    Text("Scanintervall: \(state.scanIntervalMinutes) Minuten")
+                }
             }
             Section("Lokales Sprachmodell") {
-                Stepper("Nach \(state.llmIdleMinutes) Minuten entladen", value: $state.llmIdleMinutes, in: 1...120)
+                Stepper(
+                    value: $state.llmIdleMinutes,
+                    in: 1...120
+                ) {
+                    Text("Nach \(state.llmIdleMinutes) Minuten entladen")
+                }
                 Toggle("Experimentelle Modelle anzeigen", isOn: $state.showExperimentalModels)
             }
             Section("Start und Hintergrund") {
                 Toggle(
-                    "Beim Anmelden starten",
                     isOn: Binding(
                         get: { state.launchAtLogin },
                         set: { state.setLaunchAtLogin($0) }
                     )
-                )
-                LabeledContent("Speicherdruck") {
+                ) {
+                    Text("Beim Anmelden starten")
+                }
+                LabeledContent {
                     Text(LocalizedStringKey(state.memoryPressure))
+                } label: {
+                    Text("Speicherdruck")
                 }
             }
             Section("Datenschutz") {
@@ -4773,7 +5189,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Einstellungen")
+        .navigationTitle(state.localizedSectionTitle(.settings))
         .confirmationDialog("Suchindex neu aufbauen?", isPresented: $confirmsRebuild) {
             Button("Neu aufbauen") { state.rebuildSearchIndex() }
             Button("Abbrechen", role: .cancel) {}
@@ -4852,7 +5268,7 @@ struct LogView: View {
                 }
             }
         }
-        .navigationTitle("Protokoll")
+        .navigationTitle(state.localizedSectionTitle(.logs))
     }
 
     private var filteredEntries: [(Date, String, String, String?)] {

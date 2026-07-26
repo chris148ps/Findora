@@ -1199,7 +1199,7 @@ func bundledCatalogDetectsAnOlderInstalledModelVersion() async throws {
 
 @Test(.timeLimit(.minutes(10)))
 func realMLXEmbeddingModelCanDownloadValidateAndRunWhenRequested() async throws {
-    let marker = URL(filePath: "/private/tmp/PrivateDocSearch-run-mlx-tests")
+    let marker = URL(filePath: "/private/tmp/Findora-run-mlx-tests")
     guard ProcessInfo.processInfo.environment["PRIVATEDOCSEARCH_RUN_MODEL_TESTS"] == "1"
             || FileManager.default.fileExists(atPath: marker.path) else {
         return
@@ -1241,7 +1241,7 @@ func realMLXEmbeddingModelCanDownloadValidateAndRunWhenRequested() async throws 
 
 @Test(.timeLimit(.minutes(20)))
 func realMLXAnswerModelCanDownloadValidateAndGenerateWhenRequested() async throws {
-    let marker = URL(filePath: "/private/tmp/PrivateDocSearch-run-llm-tests")
+    let marker = URL(filePath: "/private/tmp/Findora-run-llm-tests")
     guard FileManager.default.fileExists(atPath: marker.path) else {
         return
     }
