@@ -234,6 +234,7 @@ public actor DocumentProcessor {
 
     public func processPending(
         ocrConfiguration: OCRConfiguration,
+        removeMissingDocuments: Bool = true,
         onProgress: @Sendable (Progress) async -> Void
     ) async {
         do {
@@ -269,7 +270,9 @@ public actor DocumentProcessor {
                     }
                 }
             }
-            try await database.removeDocumentsWithoutActiveLocations()
+            if removeMissingDocuments {
+                try await database.removeDocumentsWithoutActiveLocations()
+            }
             await onProgress(Progress(currentFile: nil, completed: completed, total: files.count))
         } catch {
             try? await database.recordError(category: "Indexierung", message: error.localizedDescription)

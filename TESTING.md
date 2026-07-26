@@ -8,7 +8,8 @@ swift test
 ```
 
 Die automatisierten Tests verwenden ausschließlich künstlich erzeugte
-Textdateien und PDFs. Private Dokumente sind nicht erforderlich.
+Textdateien, PDFs, EML/MBOX/MSG-Container und temporäre SQLite-Datenbanken.
+Private Dokumente oder Mailarchive sind nicht erforderlich.
 
 Abgedeckt sind:
 
@@ -65,6 +66,11 @@ Abgedeckt sind:
   Rollback bei einem simulierten Mehrdateifehler;
 - Vollständigkeit, Revisionen und Hashes des Modellkatalogs;
 - Hardware-Einstufung des Katalogs.
+- MIME/RFC-2047/HTML-Normalisierung und Anhangsdekodierung;
+- gestreamte MBOX und synthetischer Unicode-Outlook-MSG-Container;
+- Mail-/Anhangsdeduplizierung und PDF/E-Mail/Anhang-Suchfilter;
+- sichere Speicherkopie, Hash-/SQLite-Prüfung, Umschaltung und Altbestand;
+- Richtlinien für im führenden Dokumentenordner entfernte PDFs.
 
 ## Reale MLX-Integration
 
@@ -143,6 +149,13 @@ Danach manuell:
     Hauptansichten auf Lesbarkeit und Persistenz prüfen.
 26. Unter **Protokoll > Statuswerte prüfen** alle Invarianten ausführen und
     Ergebnis in UI und `Findora.log` kontrollieren.
+27. Ohne Mailquelle starten: kein Dialog, keine Berechtigungsfrage und kein
+    Zugriff auf Mail/Outlook.
+28. MBOX, mehrere EML/MSG und einen Importordner manuell auswählen;
+    Vorabzusammenfassung, Neuimport und ausgeschaltete Überwachung prüfen.
+29. Daten- und Modellspeicher getrennt auf ein synthetisches APFS-Testvolume
+    migrieren und Altbestand erst nach Bestätigung entfernen.
+30. Konfiguriertes Testvolume aushängen; keine leere Datenbank darf entstehen.
 
 Der Memory-Pressure-Pfad lässt sich ohne echten Speichermangel kontrolliert
 beim App-Start auslösen:

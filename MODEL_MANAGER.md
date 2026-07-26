@@ -1,5 +1,12 @@
 # Lokaler Modellmanager
 
+Der Modellpfad ist unabhängig vom Datenspeicher auswählbar. Modelle,
+Tokenizer, Metadaten, Prüfsummen und partielle Downloads liegen gemeinsam im
+konfigurierten KI-Modellspeicher. Eine Migration pausiert aktive Nutzung,
+kopiert und hasht Dateien und aktiviert den neuen Ort erst nach vollständiger
+Validierung. Der Altbestand bleibt bis zur separaten Papierkorb-Bestätigung
+bestehen; siehe `STORAGE_ARCHITECTURE.md`.
+
 ## Fest eingebauter Katalog
 
 Der Modellkatalog ist als versionierte JSON-Ressource in der App gebündelt.

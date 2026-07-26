@@ -2,7 +2,7 @@
 
 ## Schutzgrenzen
 
-Findora schützt private Dokumente vor unbeabsichtigter externer
+Findora schützt private Dokumente und E-Mails vor unbeabsichtigter externer
 Übertragung und vor unsicheren OCR-Ersetzungen. Die App ist kein
 Mehrbenutzersystem und verschlüsselt den lokalen Index in Version 1 nicht.
 macOS-Dateirechte und FileVault bleiben die maßgeblichen Schutzmechanismen für
@@ -20,6 +20,15 @@ sandboxed App externe Homebrew-Programme nicht zuverlässig ausführen kann.
 Die kleinsten vorgesehenen Sandbox-Entitlements liegen separat in
 `Config/Findora-Sandbox.entitlements`; sie sind für eine spätere
 Version mit gebündeltem OCR-Helfer bestimmt.
+
+Mailquellen werden ausschließlich über `NSOpenPanel` hinzugefügt. Beim Start
+werden weder Mailprogramme gesucht noch interne Maildatenbanken geöffnet.
+MBOX/EML/MSG werden nicht verändert. Importfehlerprotokolle enthalten
+Kategorien, aber weder Betreff noch Absender, Text oder Anhangsnamen.
+
+Ein verschiebbarer Datenspeicher darf nicht auf einem erkannten Netzwerk-,
+Cloud-, schreibgeschützten oder ungeeigneten Dateisystemziel liegen. Die
+Umschaltung erfolgt erst nach Kopie, SHA-256-Prüfung und SQLite-`quick_check`.
 
 ## Sichere OCR-Ersetzung
 
@@ -44,7 +53,7 @@ Abhängigkeitsaudit erforderlich.
 
 ## Prompt Injection und Quellen
 
-PDF-Text ist nicht vertrauenswürdige Eingabe. Das Systemprompt weist das lokale
+PDF- und E-Mail-Text sind nicht vertrauenswürdige Eingaben. Das Systemprompt weist das lokale
 Sprachmodell an, Anweisungen in Dokumenten nicht auszuführen. Die App vergibt
 opaque Quellen-IDs und löst Dateiname sowie Seitenzahl erst nach der
 Generierung aus der Datenbank auf. Vom Modell erfundene IDs werden verworfen.

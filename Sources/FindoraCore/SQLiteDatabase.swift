@@ -6,7 +6,7 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 public actor SQLiteDatabase {
     private var connection: OpaquePointer?
     private var statusContinuation: AsyncStream<DocumentStatusChange>.Continuation?
-    public let url: URL
+    public nonisolated let url: URL
 
     public init(url: URL) {
         self.url = url
@@ -49,6 +49,7 @@ public actor SQLiteDatabase {
     public func saveScan(
         files: [DiscoveredPDF],
         root: URL,
+        removedDocumentPolicy: RemovedDocumentPolicy = .removeAfterSuccessfulScan,
         completedAt: Date = Date()
     ) throws {
         try ensureOpen()
@@ -143,67 +144,79 @@ public actor SQLiteDatabase {
                 """,
                 bindings: [.real(completedAt.timeIntervalSince1970)]
             )
-            try execute(
-                """
-                UPDATE document_locations
-                SET deleted_at = ?
-                WHERE substr(absolute_path, 1, length(?)) = ?
-                  AND deleted_at IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM current_scan_paths p
-                      WHERE p.absolute_path = document_locations.absolute_path
-                  )
-                """,
-                bindings: [
-                    .real(completedAt.timeIntervalSince1970),
-                    .text(rootPrefix),
-                    .text(rootPrefix)
-                ]
-            )
+            if removedDocumentPolicy != .keepIndexed {
+                try execute(
+                    """
+                    UPDATE document_locations
+                    SET deleted_at = ?
+                    WHERE substr(absolute_path, 1, length(?)) = ?
+                      AND deleted_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM current_scan_paths p
+                          WHERE p.absolute_path = document_locations.absolute_path
+                      )
+                    """,
+                    bindings: [
+                        .real(completedAt.timeIntervalSince1970),
+                        .text(rootPrefix),
+                        .text(rootPrefix)
+                    ]
+                )
+            }
+            let missingState = removedDocumentPolicy == .keepIndexed
+                ? ProcessingState.unavailable.rawValue
+                : ProcessingState.retired.rawValue
             try execute(
                 """
                 UPDATE processing_jobs
-                SET state = 'retired', last_stage = 'retired',
-                    last_error = NULL, updated_at = ?
+                SET state = ?, last_stage = ?,
+                    last_error = ?, updated_at = ?
                 WHERE substr(absolute_path, 1, length(?)) = ?
                   AND absolute_path NOT IN (SELECT absolute_path FROM current_scan_paths)
                 """,
                 bindings: [
+                    .text(missingState),
+                    .text(missingState),
+                    removedDocumentPolicy == .keepIndexed
+                        ? .text("Datei fehlt; Index bleibt gemäß Einstellung erhalten.")
+                        : .null,
                     .real(completedAt.timeIntervalSince1970),
                     .text(rootPrefix),
                     .text(rootPrefix)
                 ]
             )
-            try execute(
-                """
-                DELETE FROM ocr_page_attempts
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM processing_jobs j
-                    WHERE j.job_key = ocr_page_attempts.absolute_path
-                      AND j.state NOT IN ('retired', 'unavailable')
-                      AND (
-                          j.content_hash IS NULL
-                          OR j.content_hash = ocr_page_attempts.original_hash
-                      )
+            if removedDocumentPolicy == .removeAfterSuccessfulScan {
+                try execute(
+                    """
+                    DELETE FROM ocr_page_attempts
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM processing_jobs j
+                        WHERE j.job_key = ocr_page_attempts.absolute_path
+                          AND j.state NOT IN ('retired', 'unavailable')
+                          AND (
+                              j.content_hash IS NULL
+                              OR j.content_hash = ocr_page_attempts.original_hash
+                          )
+                    )
+                    """
                 )
-                """
-            )
-            try execute(
-                """
-                DELETE FROM page_content_analysis
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM processing_jobs j
-                    WHERE j.job_key = page_content_analysis.absolute_path
-                      AND j.state NOT IN ('retired', 'unavailable')
-                      AND (
-                          j.content_hash IS NULL
-                          OR j.content_hash = page_content_analysis.original_hash
-                      )
+                try execute(
+                    """
+                    DELETE FROM page_content_analysis
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM processing_jobs j
+                        WHERE j.job_key = page_content_analysis.absolute_path
+                          AND j.state NOT IN ('retired', 'unavailable')
+                          AND (
+                              j.content_hash IS NULL
+                              OR j.content_hash = page_content_analysis.original_hash
+                          )
+                    )
+                    """
                 )
-                """
-            )
+            }
 
             try setSetting(key: "documentRootPath", value: root.path)
             try setSetting(key: "lastFullScan", value: String(completedAt.timeIntervalSince1970))
@@ -1204,15 +1217,17 @@ public actor SQLiteDatabase {
                 """
                 INSERT INTO documents
                     (content_hash, page_count, text_layer_present, ocr_status,
-                     last_successful_processing, last_indexed_at, active_version)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
+                     last_successful_processing, last_indexed_at, active_version,
+                     content_type)
+                VALUES (?, ?, ?, ?, ?, ?, 1, 'pdf')
                 ON CONFLICT(content_hash) DO UPDATE SET
                     page_count = excluded.page_count,
                     text_layer_present = excluded.text_layer_present,
                     ocr_status = excluded.ocr_status,
                     last_successful_processing = excluded.last_successful_processing,
                     last_indexed_at = excluded.last_indexed_at,
-                    active_version = 1
+                    active_version = 1,
+                    content_type = 'pdf'
                 """,
                 bindings: [
                     .text(hash),
@@ -1502,10 +1517,18 @@ public actor SQLiteDatabase {
                 WHERE chunk_id IN (
                     SELECT c.id
                     FROM chunks c
+                    JOIN documents d ON d.id = c.document_id
                     WHERE NOT EXISTS (
                         SELECT 1 FROM document_locations l
                         WHERE l.document_id = c.document_id AND l.deleted_at IS NULL
                     )
+                      AND d.content_type = 'pdf'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM emails e WHERE e.document_id = d.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM email_attachments a WHERE a.document_id = d.id
+                      )
                 )
                 """
             )
@@ -1516,23 +1539,803 @@ public actor SQLiteDatabase {
                     SELECT 1 FROM document_locations l
                     WHERE l.document_id = documents.id AND l.deleted_at IS NULL
                 )
+                  AND content_type = 'pdf'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM emails e WHERE e.document_id = documents.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM email_attachments a
+                      WHERE a.document_id = documents.id
+                  )
                 """
             )
         }
         publishStatusChange(.locationsChanged)
     }
 
-    public func lexicalSearch(query searchText: String, limit: Int = 40) throws -> [SearchSource] {
+    public func upsertMailSource(
+        url: URL,
+        format: MailSourceFormat,
+        importMode: MailImportMode,
+        bookmarkData: Data?,
+        mailbox: String? = nil,
+        watchEnabled: Bool = false
+    ) throws -> Int64 {
+        let canonicalPath = url.standardizedFileURL.path
+        let sourceKey = SHA256Hasher().hash(
+            data: Data("\(format.rawValue)\u{1F}\(canonicalPath)".utf8)
+        )
+        let now = Date().timeIntervalSince1970
+        try execute(
+            """
+            INSERT INTO mail_import_sources (
+                source_key, display_name, source_format, source_path, bookmark_data,
+                import_mode, source_status, mailbox_name, watch_enabled,
+                last_access_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_key) DO UPDATE SET
+                display_name = excluded.display_name,
+                source_path = excluded.source_path,
+                bookmark_data = COALESCE(excluded.bookmark_data, mail_import_sources.bookmark_data),
+                import_mode = excluded.import_mode,
+                source_status = excluded.source_status,
+                mailbox_name = COALESCE(excluded.mailbox_name, mail_import_sources.mailbox_name),
+                watch_enabled = excluded.watch_enabled,
+                last_access_at = excluded.last_access_at,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .text(sourceKey),
+                .text(url.deletingPathExtension().lastPathComponent),
+                .text(format.rawValue),
+                .text(canonicalPath),
+                bookmarkData.map(SQLiteValue.blob) ?? .null,
+                .text(importMode.rawValue),
+                .text(importMode == .archived
+                    ? MailSourceStatus.archivedCopyAvailable.rawValue
+                    : MailSourceStatus.available.rawValue),
+                mailbox.map(SQLiteValue.text) ?? .null,
+                .integer(watchEnabled ? 1 : 0),
+                .real(now),
+                .real(now),
+                .real(now)
+            ]
+        )
+        let sourceID = try scalarInt64(
+            "SELECT id FROM mail_import_sources WHERE source_key = ?",
+            bindings: [.text(sourceKey)]
+        )
+        publishStatusChange(.settingsChanged)
+        return sourceID
+    }
+
+    public func beginMailSourceSynchronization(sourceID: Int64) throws {
+        try transaction {
+            try execute(
+                """
+                UPDATE email_source_links
+                SET source_present = 0
+                WHERE source_id = ?
+                """,
+                bindings: [.integer(sourceID)]
+            )
+            try execute(
+                """
+                UPDATE mail_import_sources
+                SET source_status = ?, error_count = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                bindings: [
+                    .text(MailSourceStatus.available.rawValue),
+                    .real(Date().timeIntervalSince1970),
+                    .integer(sourceID)
+                ]
+            )
+        }
+    }
+
+    public func importMail(
+        _ mail: ParsedMail,
+        sourceID: Int64,
+        sourceEntryKey: String,
+        chunks: [TextChunk],
+        embeddings: [[Float]],
+        indexedAttachments: [IndexedMailAttachment],
+        embeddingModelID: String,
+        embeddingModelVersion: String
+    ) throws -> MailDatabaseImportResult {
+        guard chunks.count == embeddings.count else {
+            throw FindoraError.database("Mail-Chunks und Embeddings stimmen nicht überein.")
+        }
+        for attachment in indexedAttachments
+        where attachment.chunks.count != attachment.embeddings.count {
+            throw FindoraError.database(
+                "Anhang-Chunks und Embeddings stimmen nicht überein."
+            )
+        }
+
+        let existingRows = try query(
+            "SELECT id, raw_sha256 FROM emails WHERE stable_identity = ?",
+            bindings: [.text(mail.stableIdentity)]
+        )
+        let existed = !existingRows.isEmpty
+        let unchanged = existingRows.first?.string("raw_sha256") == mail.rawSHA256
+        let now = Date().timeIntervalSince1970
+        let documentHash = SHA256Hasher().hash(
+            data: Data("email:\(mail.stableIdentity)".utf8)
+        )
+
+        try transaction {
+            try execute(
+                """
+                INSERT INTO documents (
+                    content_hash, page_count, text_layer_present, ocr_status,
+                    last_successful_processing, last_indexed_at, active_version,
+                    content_type
+                ) VALUES (?, 1, 1, 'not_required', ?, ?, 1, 'email')
+                ON CONFLICT(content_hash) DO UPDATE SET
+                    page_count = 1,
+                    text_layer_present = 1,
+                    last_successful_processing = excluded.last_successful_processing,
+                    last_indexed_at = excluded.last_indexed_at,
+                    active_version = 1,
+                    content_type = 'email'
+                """,
+                bindings: [.text(documentHash), .real(now), .real(now)]
+            )
+            let documentID = try scalarInt64(
+                "SELECT id FROM documents WHERE content_hash = ?",
+                bindings: [.text(documentHash)]
+            )
+            let referencesData = try JSONEncoder().encode(mail.references)
+            let references = String(data: referencesData, encoding: .utf8) ?? "[]"
+            try execute(
+                """
+                INSERT INTO emails (
+                    document_id, stable_identity, message_id, conversation_id, subject,
+                    sender_name, sender_address, sent_at, received_at, priority,
+                    in_reply_to, message_references, original_text, normalized_text,
+                    html_text, character_set, raw_sha256, source_status,
+                    attachment_count, processing_status, index_status, imported_at,
+                    last_synchronized_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(stable_identity) DO UPDATE SET
+                    document_id = excluded.document_id,
+                    message_id = excluded.message_id,
+                    conversation_id = excluded.conversation_id,
+                    subject = excluded.subject,
+                    sender_name = excluded.sender_name,
+                    sender_address = excluded.sender_address,
+                    sent_at = excluded.sent_at,
+                    received_at = excluded.received_at,
+                    priority = excluded.priority,
+                    in_reply_to = excluded.in_reply_to,
+                    message_references = excluded.message_references,
+                    original_text = excluded.original_text,
+                    normalized_text = excluded.normalized_text,
+                    html_text = excluded.html_text,
+                    character_set = excluded.character_set,
+                    raw_sha256 = excluded.raw_sha256,
+                    source_status = excluded.source_status,
+                    attachment_count = excluded.attachment_count,
+                    processing_status = excluded.processing_status,
+                    index_status = excluded.index_status,
+                    last_synchronized_at = excluded.last_synchronized_at
+                """,
+                bindings: [
+                    .integer(documentID),
+                    .text(mail.stableIdentity),
+                    mail.messageID.map(SQLiteValue.text) ?? .null,
+                    mail.conversationID.map(SQLiteValue.text) ?? .null,
+                    .text(mail.subject),
+                    mail.sender?.name.map(SQLiteValue.text) ?? .null,
+                    mail.sender.map { .text($0.address) } ?? .null,
+                    mail.sentAt.map { .real($0.timeIntervalSince1970) } ?? .null,
+                    mail.receivedAt.map { .real($0.timeIntervalSince1970) } ?? .null,
+                    .text(mail.priority.rawValue),
+                    mail.inReplyTo.map(SQLiteValue.text) ?? .null,
+                    .text(references),
+                    .text(mail.originalText),
+                    .text(mail.normalizedText),
+                    mail.html.map(SQLiteValue.text) ?? .null,
+                    mail.characterSet.map(SQLiteValue.text) ?? .null,
+                    .text(mail.rawSHA256),
+                    .text(MailSourceStatus.available.rawValue),
+                    .integer(Int64(mail.attachments.count)),
+                    .text(MailImportState.indexed.rawValue),
+                    .text(MailImportState.indexed.rawValue),
+                    .real(now),
+                    .real(now)
+                ]
+            )
+            let emailID = try scalarInt64(
+                "SELECT id FROM emails WHERE stable_identity = ?",
+                bindings: [.text(mail.stableIdentity)]
+            )
+
+            try execute(
+                "DELETE FROM email_recipients WHERE email_id = ?",
+                bindings: [.integer(emailID)]
+            )
+            if let sender = mail.sender {
+                try insertMailAddress(sender, role: .from, emailID: emailID)
+            }
+            for role in [MailRecipientRole.to, .cc, .bcc] {
+                for address in mail.recipients[role] ?? [] {
+                    try insertMailAddress(address, role: role, emailID: emailID)
+                }
+            }
+
+            try execute(
+                """
+                INSERT INTO email_source_links (
+                    email_id, source_id, source_entry_key, source_present,
+                    first_seen_at, last_seen_at, removed_at
+                ) VALUES (?, ?, ?, 1, ?, ?, NULL)
+                ON CONFLICT(source_id, source_entry_key) DO UPDATE SET
+                    email_id = excluded.email_id,
+                    source_present = 1,
+                    last_seen_at = excluded.last_seen_at,
+                    removed_at = NULL
+                """,
+                bindings: [
+                    .integer(emailID),
+                    .integer(sourceID),
+                    .text(sourceEntryKey),
+                    .real(now),
+                    .real(now)
+                ]
+            )
+
+            if !unchanged {
+                try deleteSearchRows(documentID: documentID)
+                try execute(
+                    """
+                    INSERT INTO pages (
+                        document_id, page_number, text, text_source,
+                        original_ocr_text, text_kind
+                    ) VALUES (?, 1, ?, 'email', NULL, 'automatic')
+                    """,
+                    bindings: [.integer(documentID), .text(mail.normalizedText)]
+                )
+                try insertSearchRows(
+                    documentID: documentID,
+                    documentHash: documentHash,
+                    chunks: chunks,
+                    embeddings: embeddings,
+                    modifiedAt: mail.sentAt ?? .now,
+                    embeddingModelID: embeddingModelID,
+                    embeddingModelVersion: embeddingModelVersion,
+                    indexedAt: now
+                )
+            }
+
+            try execute(
+                "DELETE FROM email_attachment_links WHERE email_id = ?",
+                bindings: [.integer(emailID)]
+            )
+            for (ordinal, indexed) in indexedAttachments.enumerated() {
+                let attachment = indexed.attachment
+                try execute(
+                    """
+                    INSERT INTO documents (
+                        content_hash, page_count, text_layer_present, ocr_status,
+                        last_successful_processing, last_indexed_at, active_version,
+                        content_type
+                    ) VALUES (?, ?, ?, 'not_required', ?, ?, 1, 'emailAttachment')
+                    ON CONFLICT(content_hash) DO NOTHING
+                    """,
+                    bindings: [
+                        .text(attachment.sha256),
+                        .integer(Int64(indexed.pages.count)),
+                        .integer(indexed.extractedText.isEmpty ? 0 : 1),
+                        .real(now),
+                        .real(now)
+                    ]
+                )
+                let attachmentDocumentID = try scalarInt64(
+                    "SELECT id FROM documents WHERE content_hash = ?",
+                    bindings: [.text(attachment.sha256)]
+                )
+                try execute(
+                    """
+                    INSERT INTO email_attachments (
+                        document_id, sha256, canonical_file_name, mime_type,
+                        byte_count, is_inline, archived_path, extracted_text,
+                        processing_status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(sha256) DO UPDATE SET
+                        canonical_file_name = excluded.canonical_file_name,
+                        mime_type = excluded.mime_type,
+                        byte_count = excluded.byte_count,
+                        is_inline = excluded.is_inline,
+                        archived_path = COALESCE(excluded.archived_path, email_attachments.archived_path),
+                        extracted_text = CASE
+                            WHEN excluded.extracted_text != '' THEN excluded.extracted_text
+                            ELSE email_attachments.extracted_text
+                        END,
+                        processing_status = excluded.processing_status,
+                        updated_at = excluded.updated_at
+                    """,
+                    bindings: [
+                        .integer(attachmentDocumentID),
+                        .text(attachment.sha256),
+                        .text(attachment.fileName),
+                        .text(attachment.mimeType),
+                        .integer(Int64(attachment.data.count)),
+                        .integer(attachment.isInline ? 1 : 0),
+                        indexed.archivedPath.map(SQLiteValue.text) ?? .null,
+                        .text(indexed.extractedText),
+                        .text(indexed.extractedText.isEmpty ? "metadataOnly" : "indexed"),
+                        .real(now),
+                        .real(now)
+                    ]
+                )
+                let attachmentID = try scalarInt64(
+                    "SELECT id FROM email_attachments WHERE sha256 = ?",
+                    bindings: [.text(attachment.sha256)]
+                )
+                try execute(
+                    """
+                    INSERT INTO email_attachment_links (
+                        email_id, attachment_id, ordinal, file_name, content_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    bindings: [
+                        .integer(emailID),
+                        .integer(attachmentID),
+                        .integer(Int64(ordinal)),
+                        .text(attachment.fileName),
+                        attachment.contentID.map(SQLiteValue.text) ?? .null
+                    ]
+                )
+
+                let existingChunks = try scalarInt64(
+                    "SELECT COUNT(*) FROM chunks WHERE document_id = ?",
+                    bindings: [.integer(attachmentDocumentID)]
+                )
+                if existingChunks == 0, !indexed.chunks.isEmpty {
+                    for page in indexed.pages {
+                        try execute(
+                            """
+                            INSERT OR REPLACE INTO pages (
+                                document_id, page_number, text, text_source,
+                                original_ocr_text, text_kind
+                            ) VALUES (?, ?, ?, 'attachment', NULL, 'automatic')
+                            """,
+                            bindings: [
+                                .integer(attachmentDocumentID),
+                                .integer(Int64(page.pageNumber)),
+                                .text(page.text)
+                            ]
+                        )
+                    }
+                    try insertSearchRows(
+                        documentID: attachmentDocumentID,
+                        documentHash: attachment.sha256,
+                        chunks: indexed.chunks,
+                        embeddings: indexed.embeddings,
+                        modifiedAt: mail.sentAt ?? .now,
+                        embeddingModelID: embeddingModelID,
+                        embeddingModelVersion: embeddingModelVersion,
+                        indexedAt: now
+                    )
+                }
+            }
+        }
+        publishStatusChange(.documentIndexed)
+        if unchanged { return .duplicate }
+        return existed ? .updated : .imported
+    }
+
+    public func finishMailSourceSynchronization(sourceID: Int64) throws {
+        let now = Date().timeIntervalSince1970
+        try transaction {
+            try execute(
+                """
+                UPDATE email_source_links
+                SET removed_at = ?
+                WHERE source_id = ? AND source_present = 0 AND removed_at IS NULL
+                """,
+                bindings: [.real(now), .integer(sourceID)]
+            )
+            try execute(
+                """
+                UPDATE emails
+                SET source_status = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM email_source_links l
+                        WHERE l.email_id = emails.id AND l.source_present = 1
+                    ) THEN 'available'
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM email_source_links l
+                        JOIN mail_import_sources s ON s.id = l.source_id
+                        WHERE l.email_id = emails.id AND s.import_mode = 'archived'
+                    ) THEN 'archivedCopyAvailable'
+                    ELSE 'removedFromSource'
+                END,
+                last_synchronized_at = ?
+                """,
+                bindings: [.real(now)]
+            )
+            try execute(
+                """
+                UPDATE mail_import_sources
+                SET last_imported_at = ?,
+                    last_synchronized_at = ?,
+                    source_status = CASE
+                        WHEN import_mode = 'archived' THEN 'archivedCopyAvailable'
+                        ELSE 'available'
+                    END,
+                    message_count = (
+                        SELECT COUNT(*) FROM email_source_links WHERE source_id = ?
+                    ),
+                    attachment_count = (
+                        SELECT COUNT(*)
+                        FROM email_attachment_links a
+                        JOIN email_source_links l ON l.email_id = a.email_id
+                        WHERE l.source_id = ?
+                    ),
+                    storage_bytes = (
+                        SELECT COALESCE(SUM(LENGTH(e.normalized_text)), 0)
+                        FROM emails e
+                        JOIN email_source_links l ON l.email_id = e.id
+                        WHERE l.source_id = ?
+                    ),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                bindings: [
+                    .real(now),
+                    .real(now),
+                    .integer(sourceID),
+                    .integer(sourceID),
+                    .integer(sourceID),
+                    .real(now),
+                    .integer(sourceID)
+                ]
+            )
+        }
+        publishStatusChange(.documentIndexed)
+    }
+
+    public func mailSources() throws -> [MailImportSource] {
+        try query(
+            """
+            SELECT id, display_name, source_format, source_path, archived_path, import_mode,
+                   source_status, mailbox_name, watch_enabled, last_imported_at,
+                   last_synchronized_at, message_count, attachment_count,
+                   error_count, storage_bytes
+            FROM mail_import_sources
+            ORDER BY display_name, id
+            """
+        ).compactMap { row in
+            guard let id = row.int64("id"),
+                  let displayName = row.string("display_name"),
+                  let formatRaw = row.string("source_format"),
+                  let format = MailSourceFormat(rawValue: formatRaw),
+                  let path = row.string("source_path"),
+                  let modeRaw = row.string("import_mode"),
+                  let mode = MailImportMode(rawValue: modeRaw),
+                  let statusRaw = row.string("source_status"),
+                  let status = MailSourceStatus(rawValue: statusRaw) else {
+                return nil
+            }
+            return MailImportSource(
+                id: id,
+                displayName: displayName,
+                format: format,
+                path: path,
+                archivedPath: row.string("archived_path"),
+                importMode: mode,
+                status: status,
+                mailbox: row.string("mailbox_name"),
+                watchEnabled: row.int64("watch_enabled") == 1,
+                lastImportedAt: row.double("last_imported_at").map(Date.init(timeIntervalSince1970:)),
+                lastSynchronizedAt: row.double("last_synchronized_at").map(Date.init(timeIntervalSince1970:)),
+                messageCount: Int(row.int64("message_count") ?? 0),
+                attachmentCount: Int(row.int64("attachment_count") ?? 0),
+                errorCount: Int(row.int64("error_count") ?? 0),
+                storageBytes: row.int64("storage_bytes") ?? 0
+            )
+        }
+    }
+
+    public func mailSource(id: Int64) throws -> MailImportSource? {
+        try mailSources().first(where: { $0.id == id })
+    }
+
+    public func mailSourceBookmarkData(sourceID: Int64) throws -> Data? {
+        try query(
+            "SELECT bookmark_data FROM mail_import_sources WHERE id = ?",
+            bindings: [.integer(sourceID)]
+        ).first?.data("bookmark_data")
+    }
+
+    public func setMailSourceWatchEnabled(
+        sourceID: Int64,
+        enabled: Bool
+    ) throws {
+        try execute(
+            """
+            UPDATE mail_import_sources
+            SET watch_enabled = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            bindings: [
+                .integer(enabled ? 1 : 0),
+                .real(Date().timeIntervalSince1970),
+                .integer(sourceID)
+            ]
+        )
+        publishStatusChange(.settingsChanged)
+    }
+
+    public func setMailSourceArchivedPath(
+        sourceID: Int64,
+        archivedPath: String
+    ) throws {
+        try execute(
+            """
+            UPDATE mail_import_sources
+            SET archived_path = ?, source_status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            bindings: [
+                .text(archivedPath),
+                .text(MailSourceStatus.archivedCopyAvailable.rawValue),
+                .real(Date().timeIntervalSince1970),
+                .integer(sourceID)
+            ]
+        )
+        publishStatusChange(.settingsChanged)
+    }
+
+    public func reassignMailSource(
+        sourceID: Int64,
+        url: URL,
+        bookmarkData: Data?
+    ) throws {
+        guard let source = try mailSource(id: sourceID) else {
+            throw FindoraError.database("Die E-Mail-Quelle wurde nicht gefunden.")
+        }
+        let canonicalPath = url.standardizedFileURL.path
+        let sourceKey = SHA256Hasher().hash(
+            data: Data("\(source.format.rawValue)\u{1F}\(canonicalPath)".utf8)
+        )
+        try execute(
+            """
+            UPDATE mail_import_sources
+            SET source_key = ?, display_name = ?, source_path = ?,
+                bookmark_data = ?, source_status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            bindings: [
+                .text(sourceKey),
+                .text(url.deletingPathExtension().lastPathComponent),
+                .text(canonicalPath),
+                bookmarkData.map(SQLiteValue.blob) ?? .null,
+                .text(MailSourceStatus.available.rawValue),
+                .real(Date().timeIntervalSince1970),
+                .integer(sourceID)
+            ]
+        )
+        publishStatusChange(.settingsChanged)
+    }
+
+    public func removeMailSource(sourceID: Int64) throws {
+        try transaction {
+            try execute(
+                "DELETE FROM mail_import_sources WHERE id = ?",
+                bindings: [.integer(sourceID)]
+            )
+            try execute(
+                """
+                UPDATE emails
+                SET source_status = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM email_source_links l
+                        WHERE l.email_id = emails.id AND l.source_present = 1
+                    ) THEN 'available'
+                    ELSE 'indexOnly'
+                END
+                """
+            )
+        }
+        publishStatusChange(.settingsChanged)
+    }
+
+    public func markMailSourceUnavailable(sourceID: Int64) throws {
+        try execute(
+            """
+            UPDATE mail_import_sources
+            SET source_status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            bindings: [
+                .text(MailSourceStatus.unavailable.rawValue),
+                .real(Date().timeIntervalSince1970),
+                .integer(sourceID)
+            ]
+        )
+        publishStatusChange(.settingsChanged)
+    }
+
+    public func recordMailImportError(sourceID: Int64, category: String) throws {
+        try transaction {
+            try execute(
+                """
+                UPDATE mail_import_sources
+                SET error_count = error_count + 1, updated_at = ?
+                WHERE id = ?
+                """,
+                bindings: [
+                    .real(Date().timeIntervalSince1970),
+                    .integer(sourceID)
+                ]
+            )
+            try execute(
+                """
+                INSERT INTO errors (category, message, path, created_at)
+                VALUES ('E-Mail-Import', ?, NULL, ?)
+                """,
+                bindings: [
+                    .text(category),
+                    .real(Date().timeIntervalSince1970)
+                ]
+            )
+        }
+        publishStatusChange(.errorRecorded)
+    }
+
+    public func databaseQuickCheck() throws -> String {
+        let rows = try query("PRAGMA quick_check")
+        return rows.first?.values.values.compactMap {
+            if case .text(let value) = $0 { return value }
+            return nil
+        }.first ?? "unbekannt"
+    }
+
+    public func logicalStorageUsage() throws -> (
+        textBytes: Int64,
+        embeddingBytes: Int64
+    ) {
+        let textBytes = try scalarInt64(
+            """
+            SELECT
+                COALESCE((SELECT SUM(LENGTH(text)) FROM pages), 0)
+              + COALESCE((SELECT SUM(LENGTH(original_text) + LENGTH(normalized_text))
+                          FROM emails), 0)
+              + COALESCE((SELECT SUM(LENGTH(extracted_text))
+                          FROM email_attachments), 0)
+            """
+        )
+        let embeddingBytes = try scalarInt64(
+            "SELECT COALESCE(SUM(LENGTH(vector)), 0) FROM chunk_embeddings"
+        )
+        return (textBytes, embeddingBytes)
+    }
+
+    public func checkpointAndClose() throws {
+        guard let connection else { return }
+        try execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        let result = sqlite3_close_v2(connection)
+        guard result == SQLITE_OK else {
+            throw databaseError("sqlite3_close_v2")
+        }
+        self.connection = nil
+    }
+
+    private func insertMailAddress(
+        _ address: MailAddress,
+        role: MailRecipientRole,
+        emailID: Int64
+    ) throws {
+        try execute(
+            """
+            INSERT INTO email_recipients (email_id, role, display_name, address)
+            VALUES (?, ?, ?, ?)
+            """,
+            bindings: [
+                .integer(emailID),
+                .text(role.rawValue),
+                address.name.map(SQLiteValue.text) ?? .null,
+                .text(address.address)
+            ]
+        )
+    }
+
+    private func deleteSearchRows(documentID: Int64) throws {
+        try execute(
+            """
+            DELETE FROM chunks_fts
+            WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?)
+            """,
+            bindings: [.integer(documentID)]
+        )
+        try execute(
+            "DELETE FROM chunks WHERE document_id = ?",
+            bindings: [.integer(documentID)]
+        )
+        try execute(
+            "DELETE FROM pages WHERE document_id = ?",
+            bindings: [.integer(documentID)]
+        )
+    }
+
+    private func insertSearchRows(
+        documentID: Int64,
+        documentHash: String,
+        chunks: [TextChunk],
+        embeddings: [[Float]],
+        modifiedAt: Date,
+        embeddingModelID: String,
+        embeddingModelVersion: String,
+        indexedAt: Double
+    ) throws {
+        for (index, chunk) in chunks.enumerated() {
+            try execute(
+                """
+                INSERT INTO chunks (
+                    id, document_id, document_hash, page_number, ordinal,
+                    chunk_text, modified_at, indexed_at, embedding_model_id,
+                    embedding_model_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                bindings: [
+                    .text(chunk.id),
+                    .integer(documentID),
+                    .text(documentHash),
+                    .integer(Int64(chunk.pageNumber)),
+                    .integer(Int64(chunk.ordinal)),
+                    .text(chunk.text),
+                    .real(modifiedAt.timeIntervalSince1970),
+                    .real(indexedAt),
+                    .text(embeddingModelID),
+                    .text(embeddingModelVersion)
+                ]
+            )
+            try execute(
+                "INSERT INTO chunks_fts (chunk_id, chunk_text) VALUES (?, ?)",
+                bindings: [.text(chunk.id), .text(chunk.text)]
+            )
+            try execute(
+                """
+                INSERT INTO chunk_embeddings (
+                    chunk_id, model_id, model_version, dimensions, vector
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                bindings: [
+                    .text(chunk.id),
+                    .text(embeddingModelID),
+                    .text(embeddingModelVersion),
+                    .integer(Int64(embeddings[index].count)),
+                    .blob(Self.encode(vector: embeddings[index]))
+                ]
+            )
+        }
+    }
+
+    public func lexicalSearch(
+        query searchText: String,
+        contentFilter: SearchContentFilter = .all,
+        limit: Int = 40
+    ) throws -> [SearchSource] {
         let matchQuery = Self.safeFTSQuery(searchText)
         guard !matchQuery.isEmpty else { return [] }
+        let filterSQL = Self.contentFilterSQL(contentFilter, alias: "m")
         let rows = try query(
             """
             SELECT c.document_id, c.id AS chunk_id, c.page_number, c.chunk_text,
-                   l.file_name, l.absolute_path, l.relative_path, bm25(chunks_fts) AS rank
+                   m.file_name, m.absolute_path, m.relative_path, m.content_type,
+                   m.mail_subject, m.mail_sender, m.mail_date, m.mailbox,
+                   m.parent_email_subject, m.parent_email_sender,
+                   m.parent_email_date, bm25(chunks_fts) AS rank
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.chunk_id
-            JOIN document_locations l ON l.document_id = c.document_id AND l.deleted_at IS NULL
-            WHERE chunks_fts MATCH ?
+            JOIN search_source_metadata m ON m.document_id = c.document_id
+            WHERE chunks_fts MATCH ? AND \(filterSQL)
             ORDER BY rank
             LIMIT ?
             """,
@@ -1544,16 +2347,21 @@ public actor SQLiteDatabase {
         }
     }
 
-    public func fileNameSearch(terms: [String], limit: Int = 40) throws -> [SearchSource] {
+    public func fileNameSearch(
+        terms: [String],
+        contentFilter: SearchContentFilter = .all,
+        limit: Int = 40
+    ) throws -> [SearchSource] {
         let normalized = terms
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .prefix(12)
         guard !normalized.isEmpty else { return [] }
         let conditions = Array(
-            repeating: "lower(l.file_name) LIKE lower(?) ESCAPE '\\'",
+            repeating: "lower(m.file_name) LIKE lower(?) ESCAPE '\\'",
             count: normalized.count
         ).joined(separator: " OR ")
+        let filterSQL = Self.contentFilterSQL(contentFilter, alias: "m")
         let bindings = normalized.map { term -> SQLiteValue in
             let escaped = term
                 .replacingOccurrences(of: "\\", with: "\\\\")
@@ -1564,17 +2372,20 @@ public actor SQLiteDatabase {
         let rows = try query(
             """
             SELECT c.document_id, c.id AS chunk_id, c.page_number, c.chunk_text,
-                   l.file_name, l.absolute_path, l.relative_path
-            FROM document_locations l
+                   m.file_name, m.absolute_path, m.relative_path, m.content_type,
+                   m.mail_subject, m.mail_sender, m.mail_date, m.mailbox,
+                   m.parent_email_subject, m.parent_email_sender,
+                   m.parent_email_date
+            FROM search_source_metadata m
             JOIN chunks c ON c.id = (
                 SELECT first_chunk.id
                 FROM chunks first_chunk
-                WHERE first_chunk.document_id = l.document_id
+                WHERE first_chunk.document_id = m.document_id
                 ORDER BY first_chunk.page_number, first_chunk.ordinal
                 LIMIT 1
             )
-            WHERE l.deleted_at IS NULL AND (\(conditions))
-            ORDER BY l.file_name
+            WHERE \(filterSQL) AND (\(conditions))
+            ORDER BY m.file_name
             LIMIT ?
             """,
             bindings: bindings
@@ -1586,16 +2397,21 @@ public actor SQLiteDatabase {
 
     public func vectorRows(
         modelID: String,
-        modelVersion: String
+        modelVersion: String,
+        contentFilter: SearchContentFilter = .all
     ) throws -> [(SearchSource, [Float])] {
+        let filterSQL = Self.contentFilterSQL(contentFilter, alias: "m")
         let rows = try query(
             """
             SELECT c.document_id, c.id AS chunk_id, c.page_number, c.chunk_text,
-                   l.file_name, l.absolute_path, l.relative_path, e.vector
+                   m.file_name, m.absolute_path, m.relative_path, m.content_type,
+                   m.mail_subject, m.mail_sender, m.mail_date, m.mailbox,
+                   m.parent_email_subject, m.parent_email_sender,
+                   m.parent_email_date, e.vector
             FROM chunk_embeddings e
             JOIN chunks c ON c.id = e.chunk_id
-            JOIN document_locations l ON l.document_id = c.document_id AND l.deleted_at IS NULL
-            WHERE e.model_id = ? AND e.model_version = ?
+            JOIN search_source_metadata m ON m.document_id = c.document_id
+            WHERE e.model_id = ? AND e.model_version = ? AND \(filterSQL)
             """,
             bindings: [.text(modelID), .text(modelVersion)]
         )
@@ -2618,6 +3434,25 @@ public actor SQLiteDatabase {
                 )
             }
         }
+        if current < 10 {
+            try transaction {
+                let hasDocumentSchema = try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'documents'
+                    """
+                ) > 0
+                if hasDocumentSchema {
+                    for statement in Self.migration10 {
+                        try execute(statement)
+                    }
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (10, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
     }
 
     private func ensureOpen() throws {
@@ -2633,10 +3468,18 @@ public actor SQLiteDatabase {
             WHERE chunk_id IN (
                 SELECT c.id
                 FROM chunks c
+                JOIN documents d ON d.id = c.document_id
                 WHERE NOT EXISTS (
                     SELECT 1 FROM document_locations l
                     WHERE l.document_id = c.document_id AND l.deleted_at IS NULL
                 )
+                  AND d.content_type = 'pdf'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM emails e WHERE e.document_id = d.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM email_attachments a WHERE a.document_id = d.id
+                  )
             )
             """
         )
@@ -2647,6 +3490,14 @@ public actor SQLiteDatabase {
                 SELECT 1 FROM document_locations l
                 WHERE l.document_id = documents.id AND l.deleted_at IS NULL
             )
+              AND content_type = 'pdf'
+              AND NOT EXISTS (
+                  SELECT 1 FROM emails e WHERE e.document_id = documents.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM email_attachments a
+                  WHERE a.document_id = documents.id
+              )
             """
         )
     }
@@ -2780,6 +3631,22 @@ public actor SQLiteDatabase {
         return terms.map { "\"\($0.replacingOccurrences(of: "\"", with: "\"\""))\"*" }.joined(separator: " OR ")
     }
 
+    private static func contentFilterSQL(
+        _ filter: SearchContentFilter,
+        alias: String
+    ) -> String {
+        switch filter {
+        case .all:
+            return "1 = 1"
+        case .documents:
+            return "\(alias).content_type = 'pdf'"
+        case .emails:
+            return "\(alias).content_type = 'email'"
+        case .attachments:
+            return "\(alias).content_type = 'emailAttachment'"
+        }
+    }
+
     private static func source(row: SQLiteRow, score: Double) -> SearchSource? {
         guard let documentID = row.int64("document_id"),
               let chunkID = row.string("chunk_id"),
@@ -2791,8 +3658,14 @@ public actor SQLiteDatabase {
             return nil
         }
         let excerpt = text.count > 480 ? String(text.prefix(477)) + "…" : text
+        let contentType = row.string("content_type")
+            .flatMap(FindoraContentType.init(rawValue:))
+            ?? .pdf
+        let sourceID = contentType == .email
+            ? "\(chunkID)|email|\(documentID)"
+            : "\(chunkID)|\(absolutePath)"
         return SearchSource(
-            id: "\(chunkID)|\(absolutePath)",
+            id: sourceID,
             documentID: documentID,
             chunkID: chunkID,
             fileName: fileName,
@@ -2800,7 +3673,15 @@ public actor SQLiteDatabase {
             relativePath: relativePath,
             pageNumber: Int(page),
             excerpt: excerpt,
-            score: score
+            score: score,
+            contentType: contentType,
+            mailSubject: row.string("mail_subject"),
+            mailSender: row.string("mail_sender"),
+            mailDate: row.double("mail_date").map(Date.init(timeIntervalSince1970:)),
+            mailbox: row.string("mailbox"),
+            parentEmailSubject: row.string("parent_email_subject"),
+            parentEmailSender: row.string("parent_email_sender"),
+            parentEmailDate: row.double("parent_email_date").map(Date.init(timeIntervalSince1970:))
         )
     }
 
@@ -3206,6 +4087,190 @@ public actor SQLiteDatabase {
         )
         """,
         "CREATE INDEX idx_processing_sessions_updated ON processing_sessions(updated_at DESC)"
+    ]
+
+    private static let migration10 = [
+        "ALTER TABLE documents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'pdf'",
+        """
+        CREATE TABLE mail_import_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_key TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            source_format TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            archived_path TEXT,
+            bookmark_data BLOB,
+            import_mode TEXT NOT NULL,
+            source_status TEXT NOT NULL,
+            mailbox_name TEXT,
+            watch_enabled INTEGER NOT NULL DEFAULT 0,
+            move_processed_enabled INTEGER NOT NULL DEFAULT 0,
+            source_fingerprint TEXT,
+            last_access_at REAL,
+            last_imported_at REAL,
+            last_synchronized_at REAL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            attachment_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            storage_bytes INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL UNIQUE REFERENCES documents(id) ON DELETE CASCADE,
+            stable_identity TEXT NOT NULL UNIQUE,
+            message_id TEXT,
+            conversation_id TEXT,
+            subject TEXT NOT NULL,
+            sender_name TEXT,
+            sender_address TEXT,
+            sent_at REAL,
+            received_at REAL,
+            priority TEXT NOT NULL,
+            in_reply_to TEXT,
+            message_references TEXT NOT NULL,
+            original_text TEXT NOT NULL,
+            normalized_text TEXT NOT NULL,
+            html_text TEXT,
+            character_set TEXT,
+            raw_sha256 TEXT NOT NULL,
+            source_status TEXT NOT NULL,
+            attachment_count INTEGER NOT NULL DEFAULT 0,
+            processing_status TEXT NOT NULL,
+            index_status TEXT NOT NULL,
+            imported_at REAL NOT NULL,
+            last_synchronized_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE email_recipients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            display_name TEXT,
+            address TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE email_source_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+            source_id INTEGER NOT NULL REFERENCES mail_import_sources(id) ON DELETE CASCADE,
+            source_entry_key TEXT NOT NULL,
+            source_present INTEGER NOT NULL DEFAULT 1,
+            first_seen_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            removed_at REAL,
+            UNIQUE(source_id, source_entry_key)
+        )
+        """,
+        """
+        CREATE TABLE email_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            sha256 TEXT NOT NULL UNIQUE,
+            canonical_file_name TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            byte_count INTEGER NOT NULL,
+            is_inline INTEGER NOT NULL DEFAULT 0,
+            archived_path TEXT,
+            extracted_text TEXT,
+            processing_status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE email_attachment_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+            attachment_id INTEGER NOT NULL REFERENCES email_attachments(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            file_name TEXT NOT NULL,
+            content_id TEXT,
+            UNIQUE(email_id, attachment_id, ordinal)
+        )
+        """,
+        """
+        CREATE TABLE storage_migrations (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            destination_path TEXT NOT NULL,
+            state TEXT NOT NULL,
+            copied_files INTEGER NOT NULL DEFAULT 0,
+            total_files INTEGER NOT NULL DEFAULT 0,
+            copied_bytes INTEGER NOT NULL DEFAULT 0,
+            total_bytes INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            completed_at REAL
+        )
+        """,
+        "CREATE INDEX idx_emails_message_id ON emails(message_id)",
+        "CREATE INDEX idx_emails_conversation ON emails(conversation_id)",
+        "CREATE INDEX idx_email_recipients_address ON email_recipients(address, role)",
+        "CREATE INDEX idx_email_source_links_source ON email_source_links(source_id, source_present)",
+        "CREATE INDEX idx_email_attachment_links_email ON email_attachment_links(email_id)",
+        "CREATE INDEX idx_documents_content_type ON documents(content_type)",
+        """
+        CREATE VIEW search_source_metadata AS
+        SELECT d.id AS document_id,
+               l.file_name AS file_name,
+               l.absolute_path AS absolute_path,
+               l.relative_path AS relative_path,
+               'pdf' AS content_type,
+               NULL AS mail_subject,
+               NULL AS mail_sender,
+               NULL AS mail_date,
+               NULL AS mailbox,
+               NULL AS parent_email_subject,
+               NULL AS parent_email_sender,
+               NULL AS parent_email_date
+        FROM documents d
+        JOIN document_locations l
+          ON l.document_id = d.id AND l.deleted_at IS NULL
+        UNION ALL
+        SELECT d.id,
+               e.subject,
+               COALESCE(s.archived_path, s.source_path, ''),
+               COALESCE(s.mailbox_name, s.display_name, 'Nur Indexdaten'),
+               'email',
+               e.subject,
+               e.sender_address,
+               COALESCE(e.sent_at, e.received_at),
+               COALESCE(s.mailbox_name, s.display_name),
+               NULL,
+               NULL,
+               NULL
+        FROM documents d
+        JOIN emails e ON e.document_id = d.id
+        LEFT JOIN email_source_links sl ON sl.email_id = e.id
+        LEFT JOIN mail_import_sources s ON s.id = sl.source_id
+        UNION ALL
+        SELECT d.id,
+               al.file_name,
+               COALESCE(a.archived_path, s.source_path, ''),
+               COALESCE(s.mailbox_name, s.display_name, 'E-Mail-Anhang'),
+               'emailAttachment',
+               NULL,
+               NULL,
+               NULL,
+               COALESCE(s.mailbox_name, s.display_name),
+               e.subject,
+               e.sender_address,
+               COALESCE(e.sent_at, e.received_at)
+        FROM documents d
+        JOIN email_attachments a ON a.document_id = d.id
+        JOIN email_attachment_links al ON al.attachment_id = a.id
+        JOIN emails e ON e.id = al.email_id
+        LEFT JOIN email_source_links sl ON sl.email_id = e.id
+        LEFT JOIN mail_import_sources s ON s.id = sl.source_id
+        """
     ]
 }
 

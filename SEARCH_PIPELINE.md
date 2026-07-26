@@ -1,5 +1,12 @@
 # Suchplanung, Retrieval und Antwort
 
+Die Kandidatenermittlung arbeitet gemeinsam über PDF, E-Mail und
+E-Mail-Anhang. `SearchContentFilter` wird vor dem Ranking in FTS-,
+Dateinamen- und Vektor-SQL angewendet. `SearchSource` bewahrt Inhaltstyp,
+Betreff, Absender, Datum, Mailbox und die Elternmail eines Anhangs auch nach
+dem Re-Ranking. Die fail-closed Quellenprüfung validiert Mailquellen damit
+genauso wie PDF-Seiten.
+
 ## Drei getrennte Phasen
 
 Findora trennt verbindlich:

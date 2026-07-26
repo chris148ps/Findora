@@ -7,14 +7,17 @@ Findora ist als lokale Einzelbenutzer-Anwendung entworfen.
 ## Was lokal bleibt
 
 - ausgewählte PDFs und extrahierter Text;
+- manuell ausgewählte Mailarchive, Mailmetadaten, normalisierter Mailtext und
+  indexierte Anhänge;
 - Suchanfragen und Suchverlauf;
 - Volltextindex und Embeddings;
 - an das lokale Sprachmodell übergebene Auszüge;
 - erzeugte Antworten;
 - Einstellungen, Jobstatus und technische Logs.
 
-Es erfolgt keine Übertragung von Dokumentinhalten, Suchanfragen oder Antworten
-an OpenAI oder andere KI-Anbieter. Es gibt standardmäßig keine Telemetrie,
+Es erfolgt keine Übertragung von Dokument-, E-Mail- oder Anhangsinhalten,
+Suchanfragen oder Antworten an OpenAI oder andere KI-Anbieter. Es gibt
+standardmäßig keine Telemetrie,
 Analyse-, Crash-Upload- oder Tracking-Funktion.
 
 Suchpläne und Folgefragen werden nur im Arbeitsspeicher der laufenden Sitzung
@@ -38,6 +41,11 @@ Suchanfragen werden dabei nicht übertragen.
 ~/Library/Application Support/Findora/
 ~/Library/Logs/Findora/
 ```
+
+Der Datenspeicher und der davon getrennte Modellspeicher können nach
+ausdrücklicher Auswahl auf ein geeignetes lokales Volume verschoben werden.
+Security-Scoped Bookmarks und letzte Pfade bleiben lokal.
+Mail-Ordnerüberwachung ist standardmäßig deaktiviert.
 
 Logs enthalten keine extrahierten Dokumenttexte, Suchauszüge, Prompts oder
 Antworten. Sie enthalten auch keine Suchanfragen, erkannten Personen,

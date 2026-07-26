@@ -1,7 +1,8 @@
 # Findora
 
 Findora ist eine native macOS-App für lokale OCR, Indexierung und
-semantische Suche in privaten PDF-Beständen. Dokumente, Suchanfragen,
+semantische Suche in privaten PDF- und E-Mail-Beständen. Dokumente,
+E-Mail-Inhalte, Suchanfragen,
 Embeddings und Antworten bleiben auf dem Mac. Es werden weder Ollama noch ein
 externer KI-Server oder eine Cloud-KI benötigt.
 
@@ -117,6 +118,25 @@ exklusive Indexklassen, mathematische Beziehungen, Resetverhalten und die
 Diagnose **Statuswerte prüfen** beschreibt
 [`DOCUMENT_STATUS.md`](DOCUMENT_STATUS.md).
 
+## E-Mail-Quellen
+
+Unter **E-Mail-Quellen** oder im Menü **Ablage** lassen sich Apple-Mail-MBOX,
+EML, Outlook-MSG und rekursive Importordner manuell auswählen. Findora greift
+beim Start nicht auf Mail oder Outlook zu und zeigt kein Mail-Onboarding.
+Vor dem Import werden Umfang und Speicherbedarf zusammengefasst; die Quelle
+kann referenziert oder zusätzlich verifiziert archiviert werden.
+Ordnerüberwachung ist standardmäßig aus. Details:
+[`MAIL_IMPORT.md`](MAIL_IMPORT.md).
+
+## Datenspeicher und Modellspeicher
+
+Unter **Einstellungen → Speicher** können Datenbank/Mailarchive und
+KI-Modelle unabhängig verschoben werden. Findora kopiert zunächst, validiert
+Größen und SHA-256, prüft SQLite und schaltet erst danach um. Der Altbestand
+bleibt bis zu einer eigenen Papierkorb-Bestätigung erhalten. Ein fehlendes
+externes Datenvolume erzeugt niemals automatisch eine leere Ersatzdatenbank.
+Details: [`STORAGE_ARCHITECTURE.md`](STORAGE_ARCHITECTURE.md).
+
 ## Modellauswahl
 
 Unter **Modelle** stehen nur fest versionierte, lizenzierte MLX-Modelle aus dem
@@ -141,7 +161,8 @@ Pflichtbedingungen; bei komplexen Anfragen ergänzt das lokale Antwortmodell
 Themen und Synonyme. Ungültiger Modelloutput fällt auf den sicheren
 regelbasierten Plan zurück und wird nie als SQL ausgeführt.
 
-Die Suche kombiniert SQLite FTS5 mit lokaler Vektorsuche, prüft
+Die Suche kombiniert SQLite FTS5 mit lokaler Vektorsuche über PDFs, E-Mails
+und indexierbare Anhänge, prüft
 Pflichtbedingungen und bewertet Person-/Themennähe erneut. Nur „Sehr passend“
 und „Passend“ erscheinen regulär. Unsichere Treffer bleiben getrennt und
 eingeklappt. Trefferkarten zeigen Dateiname, Pfad, Seite, hervorgehobenen
@@ -153,7 +174,8 @@ lokale Modell übergeben. Quellen-IDs werden von der App erzeugt und nachher
 gegen die Datenbank validiert. Fehlen ausreichende Belege, gibt die App keine
 scheinbar belegte Antwort aus.
 
-Die Suchansicht zeigt Nutzerfrage und Markdown-Antwort chatähnlich in einem
+Der Inhaltstyp lässt sich mit **Alle / Dokumente / E-Mails / Anhänge**
+filtern. Die Suchansicht zeigt Nutzerfrage und Markdown-Antwort chatähnlich in einem
 präsenten, während der Trefferansicht sichtbaren Bereich. Quellenlinks öffnen
 die richtige PDF-Seite. Folgefragen verwenden nur einen auf sechs Schritte
 begrenzten Sitzungskontext; ein dauerhaftes Chatgedächtnis gibt es nicht.

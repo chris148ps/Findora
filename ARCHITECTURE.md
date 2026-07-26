@@ -5,7 +5,8 @@ Stand: 24. Juli 2026
 ## Ziel und Leitplanken
 
 Findora ist eine eigenständige, native macOS-App. Sie verarbeitet
-ausgewählte PDF-Bestände ausschließlich lokal. Dokumente werden weder
+ausgewählte PDF- und exportierte E-Mail-Bestände ausschließlich lokal.
+Dokumente und Mailquellen werden weder
 umbenannt, verschoben noch gelöscht. Eine inhaltliche Änderung ist nur als
 sicher validierter, atomarer OCR-Ersatz erlaubt.
 
@@ -39,6 +40,8 @@ FindoraApp (SwiftUI/AppKit)
     │   ├── PDFExtraction
     │   ├── Indexing
     │   ├── Search
+    │   ├── MailImport
+    │   ├── StorageMigration
     │   ├── Persistence
     │   ├── Models
     │   └── Logging
@@ -151,6 +154,10 @@ Logs liegen unter:
 
 `~/Library/Logs/Findora/`
 
+Datenspeicher und Modellspeicher können unabhängig auf ein vom Benutzer
+gewähltes lokales Volume gelegt werden. Sicherheits- und Umschaltinvarianten
+stehen in `STORAGE_ARCHITECTURE.md`, das Schema in `DATABASE_SCHEMA.md`.
+
 Die Datenbank nutzt WAL, Foreign Keys, versionierte Transaktionen und FTS5.
 Das Schema enthält:
 
@@ -182,6 +189,10 @@ Dokumentidentität und Dateipfad sind getrennt. Der SHA-256-Inhaltshash
 identifiziert Inhalte; `document_locations` erhält mehrere reale Pfade für
 doppelte Inhalte. Umbenennen und Verschieben aktualisieren nach Hashabgleich
 den Pfad, ohne Chunks neu zu erzeugen.
+
+E-Mail-Identität, Quellenzuordnung und Anhangsidentität sind ebenfalls
+getrennt. `MailImportService` streamt Quellen; Mail, PDF und Anhang teilen
+sich Chunk-, FTS- und Embeddingpipeline.
 
 Embeddings werden als normalisierte Float32-BLOBs in SQLite gespeichert.
 Version 1 verwendet eine in-process, blockweise Kosinus-Suche. Das ist

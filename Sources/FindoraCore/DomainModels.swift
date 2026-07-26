@@ -1,5 +1,24 @@
 import Foundation
 
+public enum RemovedDocumentPolicy: String, Codable, CaseIterable, Identifiable, Sendable {
+    case removeAfterSuccessfulScan
+    case markMissing
+    case keepIndexed
+
+    public var id: Self { self }
+
+    public var displayName: String {
+        switch self {
+        case .removeAfterSuccessfulScan:
+            "Nach erfolgreichem Abgleich automatisch aus dem Index entfernen"
+        case .markMissing:
+            "Nur als „Datei fehlt“ markieren"
+        case .keepIndexed:
+            "Niemals automatisch entfernen"
+        }
+    }
+}
+
 public enum ProcessingState: String, Codable, Sendable {
     case discovered
     case waitingForStability
@@ -149,6 +168,14 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
     public let ocrQuality: String?
     public let textSource: String
     public let matchKinds: [SearchMatchKind]
+    public let contentType: FindoraContentType
+    public let mailSubject: String?
+    public let mailSender: String?
+    public let mailDate: Date?
+    public let mailbox: String?
+    public let parentEmailSubject: String?
+    public let parentEmailSender: String?
+    public let parentEmailDate: Date?
 
     public init(
         id: String,
@@ -166,7 +193,15 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
         reason: String = "",
         ocrQuality: String? = nil,
         textSource: String = "extracted",
-        matchKinds: [SearchMatchKind] = []
+        matchKinds: [SearchMatchKind] = [],
+        contentType: FindoraContentType = .pdf,
+        mailSubject: String? = nil,
+        mailSender: String? = nil,
+        mailDate: Date? = nil,
+        mailbox: String? = nil,
+        parentEmailSubject: String? = nil,
+        parentEmailSender: String? = nil,
+        parentEmailDate: Date? = nil
     ) {
         self.id = id
         self.documentID = documentID
@@ -184,6 +219,14 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
         self.ocrQuality = ocrQuality
         self.textSource = textSource
         self.matchKinds = matchKinds
+        self.contentType = contentType
+        self.mailSubject = mailSubject
+        self.mailSender = mailSender
+        self.mailDate = mailDate
+        self.mailbox = mailbox
+        self.parentEmailSubject = parentEmailSubject
+        self.parentEmailSender = parentEmailSender
+        self.parentEmailDate = parentEmailDate
     }
 }
 

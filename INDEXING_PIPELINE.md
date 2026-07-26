@@ -1,5 +1,17 @@
 # Indexierungs-Pipeline
 
+Schema-Migration 10 ergänzt `email` und `emailAttachment` als Inhaltstypen.
+Normalisierter Mailtext und extrahierter Anhangstext durchlaufen dieselben
+Seiten-, Chunk-, FTS- und Embeddingtabellen. Mailmetadaten und Beziehungen
+bleiben in den E-Mail-spezifischen Tabellen; siehe `MAIL_IMPORT.md` und
+`DATABASE_SCHEMA.md`.
+
+Der PDF-Ordner bleibt führende Quelle. Nach einem vollständig erfolgreichen
+Scan werden Umbenennen und Verschieben ausschließlich über SHA-256 erkannt.
+Tatsächlich fehlende PDFs werden gemäß Einstellung vollständig bereinigt, nur
+als fehlend markiert oder weiter im Index gehalten. Ein nicht erreichbarer
+Stammordner löst keine Bereinigung aus.
+
 ## Erkennung
 
 FSEvents stößt einen begrenzten Differenzscan an. Unabhängig davon läuft

@@ -40,6 +40,22 @@ Findora löscht bei einem unerreichbaren Stammordner keine
 Indexeinträge. Cloud-Platzhalter müssen lokal geladen sein, bevor OCR und
 Indexierung sie verarbeiten können.
 
+## E-Mail-Quelle ist nicht erreichbar
+
+Unter **E-Mail-Quellen** kann die Quelle neu zugeordnet oder erneut eingelesen
+werden. Bei archiviertem Modus nutzt Findora die geprüfte lokale Kopie.
+Referenzierte Indexdaten bleiben erhalten. Die App öffnet niemals selbständig
+interne Apple-Mail- oder Outlook-Datenbanken.
+
+## Konfigurierter Findora-Datenspeicher fehlt
+
+Findora zeigt den erwarteten Pfad und erzeugt keine leere Ersatzdatenbank.
+Volume erneut verbinden und **Datenträger erneut prüfen** wählen oder einen
+vorhandenen Ordner mit `Findora.sqlite3` bewusst neu zuordnen. Eine
+unterbrochene Migration lässt sich unter **Einstellungen → Speicher**
+fortsetzen, auf den Altbestand zurückführen oder hinsichtlich des
+Staging-Bestands verwerfen.
+
 ## Eine PDF bleibt in der Warteschlange
 
 Die Datei kann noch kopiert werden, gesperrt sein oder sich zwischen zwei

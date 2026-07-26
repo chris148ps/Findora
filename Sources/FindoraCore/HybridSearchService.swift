@@ -23,14 +23,24 @@ public actor HybridSearchService {
         self.semanticEnabled = semanticEnabled
     }
 
-    public func search(_ query: String, limit: Int = 12) async throws -> [SearchSource] {
+    public func search(
+        _ query: String,
+        contentFilter: SearchContentFilter = .all,
+        limit: Int = 12
+    ) async throws -> [SearchSource] {
         let plan = rulePlanner.plan(query: query)
-        return try await search(query, plan: plan, limit: limit).directMatches
+        return try await search(
+            query,
+            plan: plan,
+            contentFilter: contentFilter,
+            limit: limit
+        ).directMatches
     }
 
     public func search(
         _ query: String,
         plan: SearchPlan,
+        contentFilter: SearchContentFilter = .all,
         limit: Int = 12
     ) async throws -> SearchOutcome {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -41,9 +51,14 @@ public actor HybridSearchService {
         let lexicalQuery = plan.retrievalTerms.isEmpty
             ? trimmed
             : plan.retrievalTerms.joined(separator: " ")
-        async let lexical = database.lexicalSearch(query: lexicalQuery, limit: 80)
+        async let lexical = database.lexicalSearch(
+            query: lexicalQuery,
+            contentFilter: contentFilter,
+            limit: 80
+        )
         async let fileNames = database.fileNameSearch(
             terms: plan.hardTerms + plan.documentTypes + [trimmed],
+            contentFilter: contentFilter,
             limit: 40
         )
         let (lexicalResults, fileNameResults) = try await (lexical, fileNames)
@@ -54,7 +69,8 @@ public actor HybridSearchService {
             )
             let stored = try await database.vectorRows(
                 modelID: embedder.modelID,
-                modelVersion: embedder.modelVersion
+                modelVersion: embedder.modelVersion,
+                contentFilter: contentFilter
             )
             semantic = Array(
                 stored
@@ -258,7 +274,15 @@ public actor HybridSearchService {
             reason: reason,
             ocrQuality: bestChunk.ocrQuality,
             textSource: bestChunk.textSource,
-            matchKinds: kinds
+            matchKinds: kinds,
+            contentType: candidate.source.contentType,
+            mailSubject: candidate.source.mailSubject,
+            mailSender: candidate.source.mailSender,
+            mailDate: candidate.source.mailDate,
+            mailbox: candidate.source.mailbox,
+            parentEmailSubject: candidate.source.parentEmailSubject,
+            parentEmailSender: candidate.source.parentEmailSender,
+            parentEmailDate: candidate.source.parentEmailDate
         )
     }
 

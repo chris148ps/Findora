@@ -6,6 +6,7 @@ import FindoraCore
 import FindoraMLX
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct FindoraApplication: App {
@@ -30,6 +31,21 @@ struct FindoraApplication: App {
                 ) {
                     state.showsAbout = true
                 }
+            }
+            CommandGroup(after: .newItem) {
+                Divider()
+                Button("E-Mail-Dateien importieren …") {
+                    state.chooseMailFiles(format: .eml)
+                }
+                .disabled(state.isMailImporting || state.isStorageMigrationInProgress)
+                Button("Apple-Mail-Postfach importieren …") {
+                    state.chooseMailFiles(format: .mbox)
+                }
+                .disabled(state.isMailImporting || state.isStorageMigrationInProgress)
+                Button("E-Mail-Importordner hinzufügen …") {
+                    state.chooseMailImportFolder()
+                }
+                .disabled(state.isMailImporting || state.isStorageMigrationInProgress)
             }
         }
 
@@ -82,6 +98,7 @@ enum InterfaceAppearance: String, CaseIterable, Identifiable {
 
 enum AppSection: String, CaseIterable, Identifiable {
     case search = "Suche"
+    case mail = "E-Mail-Quellen"
     case status = "Dokumentenstatus"
     case maintenance = "Dokumentenwartung"
     case ocr = "OCR"
@@ -94,6 +111,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .search: "magnifyingglass"
+        case .mail: "envelope"
         case .status: "doc.text"
         case .maintenance: "wrench.and.screwdriver"
         case .ocr: "text.viewfinder"
@@ -102,6 +120,22 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .logs: "list.bullet.rectangle"
         }
     }
+}
+
+struct PendingMailImport: Identifiable {
+    let id = UUID()
+    let urls: [URL]
+    var estimate: MailImportEstimate
+    var mode: MailImportMode = .referenced
+    var watchFolders = false
+}
+
+struct PendingStorageChange: Identifiable {
+    let id = UUID()
+    let kind: StorageKind
+    let sourceURL: URL
+    let destinationParent: URL
+    let estimate: StorageMigrationEstimate
 }
 
 struct SearchSessionTurn: Identifiable {
@@ -129,6 +163,7 @@ final class AppState {
     var submittedQuestion = ""
     var currentSearchPlan: SearchPlan?
     var searchPlanningNotice: String?
+    var searchContentFilter: SearchContentFilter = .all
     var searchSession: [SearchSessionTurn] = []
     var previewSource: SearchSource?
     var isSearching = false
@@ -165,7 +200,25 @@ final class AppState {
     var interfaceAppearance: InterfaceAppearance = .system
     var isAnswerModelLoaded = false
     var isEmbeddingModelLoaded = false
-    let hardwareProfile: HardwareProfile
+    var mailSources: [MailImportSource] = []
+    var pendingMailImport: PendingMailImport?
+    var mailImportProgress: MailImportProgress?
+    var mailImportMessage: String?
+    var isMailImporting = false
+    var dataStoragePath = ""
+    var modelStoragePath = ""
+    var dataStorageAvailable = true
+    var modelStorageAvailable = true
+    var pendingStorageMigration: StorageMigrationRecord?
+    var lastStorageMigration: StorageMigrationRecord?
+    var pendingStorageChange: PendingStorageChange?
+    var storageMigrationProgress: StorageMigrationProgress?
+    var storageUsage: StorageUsageSnapshot?
+    var storageMessage: String?
+    var isStorageMigrationInProgress = false
+    var removedDocumentPolicy: RemovedDocumentPolicy = .removeAfterSuccessfulScan
+    var lastSynchronizationMessage: String?
+    var hardwareProfile: HardwareProfile
 
     var interfaceLocale: Locale {
         switch interfaceLanguage {
@@ -193,6 +246,7 @@ final class AppState {
         }
         return switch section {
         case .search: "Search"
+        case .mail: "Email sources"
         case .status: "Document status"
         case .maintenance: "Document maintenance"
         case .ocr: "OCR"
@@ -221,15 +275,22 @@ final class AppState {
         statistics.e5EmbeddedChunks > 0 && statistics.fallbackEmbeddedChunks > 0
     }
 
-    private let paths: AppPaths
-    private let database: SQLiteDatabase
+    private var paths: AppPaths
+    private var database: SQLiteDatabase
     private let fileLogger: AppFileLogger
-    private let maintenanceService: DocumentMaintenanceService
+    private var maintenanceService: DocumentMaintenanceService
     private let bookmarkStore = FolderBookmarkStore()
-    private let scanner: RecursivePDFScanner
+    private var scanner: RecursivePDFScanner
     private var processor: DocumentProcessor
     private var searchService: HybridSearchService
-    private let modelManager: LocalModelManager
+    private var modelManager: LocalModelManager
+    private var mailImportService: MailImportService
+    private let storageConfigurationStore: StorageConfigurationStore
+    private let storageMigrationService: StorageMigrationService
+    private var dataStorageAccess: ResolvedStorageLocation?
+    private var modelStorageAccess: ResolvedStorageLocation?
+    private var mailImportTask: Task<Void, Never>?
+    private var mailWatchLoop: Task<Void, Never>?
     private var answerGenerator: (any AnswerGenerating)?
     private var resolvedFolder: ResolvedFolder?
     private var scanLoop: Task<Void, Never>?
@@ -247,10 +308,31 @@ final class AppState {
 
     init() {
         do {
-            let paths = try AppPaths()
+            let storageStore = StorageConfigurationStore()
+            let storageSelection = try storageStore.startupSelection()
+            let paths = try AppPaths(
+                applicationSupport: storageSelection.dataURL,
+                modelStorage: storageSelection.modelURL,
+                createDataDirectories: storageSelection.dataIsAvailable,
+                createModelDirectory: storageSelection.modelsAreAvailable
+            )
             self.paths = paths
-            self.database = SQLiteDatabase(url: paths.database)
-            self.fileLogger = try AppFileLogger(logDirectory: paths.logs)
+            self.storageConfigurationStore = storageStore
+            self.storageMigrationService = StorageMigrationService(
+                configurationStore: storageStore
+            )
+            self.dataStorageAccess = storageSelection.dataAccess
+            self.modelStorageAccess = storageSelection.modelAccess
+            self.dataStoragePath = storageSelection.dataURL.path
+            self.modelStoragePath = storageSelection.modelURL.path
+            self.dataStorageAvailable = storageSelection.dataIsAvailable
+            self.modelStorageAvailable = storageSelection.modelsAreAvailable
+            self.pendingStorageMigration = try storageStore.pendingMigration()
+            self.lastStorageMigration = try storageStore.lastMigration()
+            let database = SQLiteDatabase(url: paths.database)
+            let fileLogger = try AppFileLogger(logDirectory: paths.logs)
+            self.database = database
+            self.fileLogger = fileLogger
             self.maintenanceService = DocumentMaintenanceService(database: database)
             self.scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
             let catalog = try ModelCatalog.bundled()
@@ -281,6 +363,11 @@ final class AppState {
                 embedder: embedder,
                 semanticEnabled: false
             )
+            self.mailImportService = MailImportService(
+                database: database,
+                embedder: embedder,
+                archiveRoot: paths.mailArchive
+            )
         } catch {
             fatalError("Findora-Verzeichnisse konnten nicht angelegt werden: \(error)")
         }
@@ -296,6 +383,17 @@ final class AppState {
                 category: "App",
                 message: "Findora wird gestartet."
             )
+            guard dataStorageAvailable else {
+                folderStatus = "Datenspeicher nicht erreichbar"
+                lastError = """
+                Der konfigurierte Findora-Datenspeicher ist nicht erreichbar. \
+                Es wurde keine neue Datenbank angelegt.
+
+                Erwarteter Speicherort:
+                \(dataStoragePath)
+                """
+                return
+            }
             try await database.initialize()
             await startDocumentStatusMonitoring()
             await runMemoryPressureDiagnosticIfRequested()
@@ -339,10 +437,18 @@ final class AppState {
                     configureFolderWatcher(for: folder.url)
                 }
             }
-            await refreshModels()
-            await restoreModelSelection()
-            await refreshModels()
+            if modelStorageAvailable {
+                await refreshModels()
+                await restoreModelSelection()
+                await refreshModels()
+            } else {
+                modelMessage =
+                    "Der konfigurierte KI-Modellspeicher ist nicht erreichbar. Die Volltextsuche bleibt verfügbar."
+            }
+            await refreshMailSources()
+            startMailWatchLoop()
             await refreshDatabaseState()
+            await refreshStorageUsage()
             startScanLoop()
             if resolvedFolder != nil, !documentAccessDisabled {
                 await scanNow()
@@ -377,8 +483,612 @@ final class AppState {
         }
     }
 
+    func chooseMailFiles(format: MailSourceFormat) {
+        guard !isMailImporting, !isStorageMigrationInProgress else { return }
+        let panel = NSOpenPanel()
+        panel.title = switch format {
+        case .mbox: "Apple-Mail-Postfach auswählen"
+        case .eml: "E-Mail-Dateien auswählen"
+        case .outlookMSG: "Outlook-Nachrichten auswählen"
+        case .importFolder: "E-Mail-Quelle auswählen"
+        }
+        panel.prompt = "Auswählen"
+        panel.canChooseDirectories = format == .mbox
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = format == .eml || format == .outlookMSG
+        panel.resolvesAliases = true
+        panel.treatsFilePackagesAsDirectories = false
+        let fileExtension = format == .outlookMSG ? "msg" : format.rawValue
+        if let type = UTType(filenameExtension: fileExtension) {
+            panel.allowedContentTypes = [type]
+        }
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        prepareMailImport(urls: panel.urls)
+    }
+
+    func chooseMailImportFolder() {
+        guard !isMailImporting, !isStorageMigrationInProgress else { return }
+        let panel = NSOpenPanel()
+        panel.title = "E-Mail-Importordner auswählen"
+        panel.prompt = "Ordner auswählen"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        prepareMailImport(urls: [url])
+    }
+
+    private func prepareMailImport(urls: [URL]) {
+        Task {
+            do {
+                let estimate = try await mailImportService.estimate(
+                    urls: urls,
+                    importMode: .referenced
+                )
+                pendingMailImport = PendingMailImport(
+                    urls: urls,
+                    estimate: estimate
+                )
+            } catch {
+                report(error, taskType: "E-Mail-Import vorbereiten")
+            }
+        }
+    }
+
+    func updatePendingMailImportMode(_ mode: MailImportMode) {
+        guard let pending = pendingMailImport else { return }
+        Task {
+            do {
+                let estimate = try await mailImportService.estimate(
+                    urls: pending.urls,
+                    importMode: mode
+                )
+                var updated = pending
+                updated.mode = mode
+                updated.estimate = estimate
+                pendingMailImport = updated
+            } catch {
+                report(error, taskType: "E-Mail-Speicherbedarf schätzen")
+            }
+        }
+    }
+
+    func setPendingMailWatch(_ enabled: Bool) {
+        pendingMailImport?.watchFolders = enabled
+    }
+
+    func confirmMailImport() {
+        guard let pending = pendingMailImport,
+              !isMailImporting,
+              !isStorageMigrationInProgress else { return }
+        pendingMailImport = nil
+        isMailImporting = true
+        mailImportMessage = nil
+        mailImportTask = Task {
+            defer {
+                isMailImporting = false
+                mailImportTask = nil
+            }
+            do {
+                let summary = try await mailImportService.importSources(
+                    urls: pending.urls,
+                    importMode: pending.mode,
+                    watchFolders: pending.watchFolders
+                ) { [weak self] progress in
+                    await MainActor.run {
+                        self?.mailImportProgress = progress
+                    }
+                }
+                mailImportMessage =
+                    "\(summary.imported) E-Mail(s) importiert, \(summary.updated) aktualisiert, "
+                    + "\(summary.duplicates) Dublette(n) übersprungen, \(summary.attachments) Anhang/Anhänge erkannt."
+                await refreshMailSources()
+                await refreshDatabaseState()
+            } catch is CancellationError {
+                mailImportMessage = "E-Mail-Import wurde abgebrochen und kann erneut gestartet werden."
+            } catch {
+                report(error, taskType: "E-Mail-Import")
+            }
+        }
+    }
+
+    func cancelMailImport() {
+        mailImportTask?.cancel()
+    }
+
+    func setMailImportPaused(_ paused: Bool) {
+        Task { await mailImportService.setPaused(paused) }
+    }
+
+    func refreshMailSources() async {
+        do {
+            mailSources = try await database.mailSources()
+        } catch {
+            report(error, taskType: "E-Mail-Quellen laden")
+        }
+    }
+
+    func synchronizeMailSource(_ source: MailImportSource) {
+        guard !isMailImporting, !isStorageMigrationInProgress else { return }
+        isMailImporting = true
+        mailImportTask = Task {
+            defer {
+                isMailImporting = false
+                mailImportTask = nil
+            }
+            do {
+                let summary = try await mailImportService.synchronizeSource(
+                    sourceID: source.id
+                ) { [weak self] progress in
+                    await MainActor.run {
+                        self?.mailImportProgress = progress
+                    }
+                }
+                mailImportMessage =
+                    "Abgleich abgeschlossen: \(summary.imported) neu, \(summary.updated) aktualisiert, \(summary.duplicates) Dublette(n)."
+                await refreshMailSources()
+                await refreshDatabaseState()
+            } catch {
+                report(error, taskType: "E-Mail-Quelle erneut einlesen")
+            }
+        }
+    }
+
+    func setMailSourceWatch(_ source: MailImportSource, enabled: Bool) {
+        Task {
+            do {
+                try await database.setMailSourceWatchEnabled(
+                    sourceID: source.id,
+                    enabled: enabled
+                )
+                await refreshMailSources()
+                startMailWatchLoop()
+            } catch {
+                report(error, taskType: "E-Mail-Ordnerüberwachung ändern")
+            }
+        }
+    }
+
+    func revealMailSource(_ source: MailImportSource) {
+        let path = FileManager.default.fileExists(atPath: source.path)
+            ? source.path
+            : source.archivedPath ?? source.path
+        NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: path)])
+    }
+
+    func reassignMailSource(_ source: MailImportSource) {
+        let panel = NSOpenPanel()
+        panel.title = "E-Mail-Quelle neu zuordnen"
+        panel.prompt = "Neu zuordnen"
+        panel.canChooseDirectories = source.format == .mbox || source.format == .importFolder
+        panel.canChooseFiles = source.format != .importFolder
+        panel.allowsMultipleSelection = false
+        panel.treatsFilePackagesAsDirectories = false
+        if source.format != .importFolder,
+           let type = UTType(
+               filenameExtension: source.format == .outlookMSG
+                   ? "msg" : source.format.rawValue
+           ) {
+            panel.allowedContentTypes = [type]
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            do {
+                let bookmark = try url.bookmarkData(
+                    options: [.withSecurityScope],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )
+                try await database.reassignMailSource(
+                    sourceID: source.id,
+                    url: url,
+                    bookmarkData: bookmark
+                )
+                await refreshMailSources()
+                if let updated = mailSources.first(where: { $0.id == source.id }) {
+                    synchronizeMailSource(updated)
+                }
+            } catch {
+                report(error, taskType: "E-Mail-Quelle neu zuordnen")
+            }
+        }
+    }
+
+    func removeMailSource(_ source: MailImportSource) {
+        Task {
+            do {
+                try await database.removeMailSource(sourceID: source.id)
+                mailImportMessage =
+                    "Die Quellenzuordnung wurde entfernt. Indexierte E-Mails und archivierte Originale wurden nicht gelöscht."
+                await refreshMailSources()
+                await refreshDatabaseState()
+            } catch {
+                report(error, taskType: "E-Mail-Quelle entfernen")
+            }
+        }
+    }
+
+    func chooseStorageLocation(kind: StorageKind) {
+        guard !isStorageMigrationInProgress, !isProcessing, !isMailImporting else {
+            storageMessage =
+                "Bitte laufende OCR-, Indexierungs- oder Importvorgänge zuerst beenden oder pausieren."
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "\(kind.displayName) – Zielordner auswählen"
+        panel.prompt = "Zielordner prüfen"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        let source = kind == .data ? paths.applicationSupport : paths.models
+        let exclusions = kind == .data ? [paths.models] : []
+        Task {
+            do {
+                let estimate = try await storageMigrationService.estimateMigration(
+                    sourceURL: source,
+                    destinationParent: destination,
+                    excludedRoots: exclusions
+                )
+                pendingStorageChange = PendingStorageChange(
+                    kind: kind,
+                    sourceURL: source,
+                    destinationParent: destination,
+                    estimate: estimate
+                )
+            } catch {
+                report(error, taskType: "Speicherziel prüfen")
+            }
+        }
+    }
+
+    func reconnectConfiguredStorage(kind: StorageKind) {
+        let panel = NSOpenPanel()
+        panel.title = "\(kind.displayName) zuordnen"
+        panel.prompt = "Speicher zuordnen"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if kind == .data,
+           !FileManager.default.fileExists(
+               atPath: url.appending(path: "Findora.sqlite3").path
+           ) {
+            lastError =
+                "Der gewählte Ordner enthält keine Findora.sqlite3-Datenbank und wurde nicht aktiviert."
+            return
+        }
+        Task {
+            do {
+                try storageConfigurationStore.saveLocation(kind: kind, url: url)
+                try await reloadStorageState()
+                lastError = nil
+                if kind == .data {
+                    await start()
+                }
+            } catch {
+                report(error, taskType: "Konfigurierten Speicher neu zuordnen")
+            }
+        }
+    }
+
+    func retryConfiguredDataStorage() {
+        Task {
+            do {
+                let selection = try storageConfigurationStore.startupSelection()
+                guard selection.dataIsAvailable else {
+                    lastError =
+                        "Der konfigurierte Datenspeicher ist weiterhin nicht erreichbar: \(dataStoragePath)"
+                    return
+                }
+                dataStorageAvailable = true
+                try await reloadStorageState()
+                lastError = nil
+                await start()
+            } catch {
+                dataStorageAvailable = false
+                report(error, taskType: "Datenspeicher erneut prüfen")
+            }
+        }
+    }
+
+    func confirmStorageMigration() {
+        guard let change = pendingStorageChange,
+              change.estimate.assessment.isAllowed,
+              !isStorageMigrationInProgress else { return }
+        pendingStorageChange = nil
+        isStorageMigrationInProgress = true
+        storageMessage = nil
+        Task {
+            let wasPaused = isPaused
+            do {
+                searchTask?.cancel()
+                mailImportTask?.cancel()
+                mailWatchLoop?.cancel()
+                modelDownloadTask?.cancel()
+                scanLoop?.cancel()
+                eventScanTask?.cancel()
+                folderWatcher?.stop()
+                await processor.setPaused(true)
+                await mailImportService.setPaused(true)
+                if change.kind == .data {
+                    try await database.checkpointAndClose()
+                } else {
+                    await unloadAnswerModel(reason: "Modellspeicher wird übertragen")
+                    answerGenerator = nil
+                    activeAnswerModelID = nil
+                    activeEmbeddingModelID = nil
+                    isAnswerModelLoaded = false
+                    isEmbeddingModelLoaded = false
+                }
+
+                let exclusions = change.kind == .data ? [paths.models] : []
+                _ = try await storageMigrationService.migrate(
+                    kind: change.kind,
+                    sourceURL: change.sourceURL,
+                    destinationParent: change.destinationParent,
+                    excludedRoots: exclusions
+                ) { [weak self] progress in
+                    await MainActor.run {
+                        self?.storageMigrationProgress = progress
+                    }
+                }
+                try await reloadStorageState()
+                isPaused = wasPaused
+                await processor.setPaused(wasPaused)
+                await mailImportService.setPaused(false)
+                if !wasPaused {
+                    startScanLoop()
+                    startMailWatchLoop()
+                    if let folder = resolvedFolder {
+                        configureFolderWatcher(for: folder.url)
+                    }
+                }
+                storageMessage =
+                    "\(change.kind.displayName) wurde kopiert, vollständig validiert und auf den neuen Ort umgeschaltet. Der alte Bestand bleibt erhalten."
+            } catch {
+                if change.kind == .data {
+                    try? await database.initialize()
+                    await startDocumentStatusMonitoring()
+                }
+                await processor.setPaused(wasPaused)
+                await mailImportService.setPaused(false)
+                isPaused = wasPaused
+                if !wasPaused {
+                    startScanLoop()
+                    startMailWatchLoop()
+                    if let folder = resolvedFolder {
+                        configureFolderWatcher(for: folder.url)
+                    }
+                }
+                report(error, taskType: "Speicher sicher übertragen")
+            }
+            isStorageMigrationInProgress = false
+        }
+    }
+
+    func movePreviousStorageToTrash() {
+        guard let migration = lastStorageMigration,
+              migration.phase == .completed else { return }
+        let oldURL = URL(filePath: migration.sourcePath)
+        let activeURL = migration.kind == .data
+            ? paths.applicationSupport
+            : paths.models
+        Task {
+            do {
+                try await storageMigrationService.moveOldStorageToTrash(
+                    oldURL: oldURL,
+                    activeURL: activeURL
+                )
+                storageMessage =
+                    "Der bestätigte Altbestand wurde in den macOS-Papierkorb verschoben."
+                lastStorageMigration = nil
+            } catch {
+                report(error, taskType: "Alten Speicher in Papierkorb verschieben")
+            }
+        }
+    }
+
+    func refreshStorageUsage() async {
+        guard dataStorageAvailable else { return }
+        do {
+            let logical = try await database.logicalStorageUsage()
+            storageUsage = try await storageMigrationService.storageUsage(
+                paths: paths,
+                databaseTextBytes: logical.textBytes,
+                embeddingBytes: logical.embeddingBytes
+            )
+        } catch {
+            report(error, taskType: "Speicherbelegung ermitteln")
+        }
+    }
+
+    func checkStorageIntegrity() {
+        Task {
+            do {
+                let result = try await database.databaseQuickCheck()
+                storageMessage = result.lowercased() == "ok"
+                    ? "SQLite-Integritätsprüfung erfolgreich."
+                    : "SQLite-Integritätsprüfung meldet: \(result)"
+            } catch {
+                report(error, taskType: "Speicherintegrität prüfen")
+            }
+        }
+    }
+
+    func revealStorage(kind: StorageKind) {
+        let url = kind == .data ? paths.applicationSupport : paths.models
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func cleanTemporaryStorage() {
+        Task {
+            do {
+                try await storageMigrationService.cleanTemporaryData(paths: paths)
+                storageMessage =
+                    "Temporäre Modelldownloads wurden in den macOS-Papierkorb verschoben."
+                await refreshStorageUsage()
+            } catch {
+                report(error, taskType: "Temporäre Daten bereinigen")
+            }
+        }
+    }
+
+    func continuePendingStorageMigration() {
+        guard let record = pendingStorageMigration else { return }
+        Task {
+            do {
+                if record.phase == .failed {
+                    try await storageMigrationService.discardFailedStaging(for: record)
+                }
+                let source = URL(filePath: record.sourcePath)
+                let parent = URL(filePath: record.destinationPath)
+                    .deletingLastPathComponent()
+                let exclusions = record.kind == .data ? [paths.models] : []
+                let estimate = try await storageMigrationService.estimateMigration(
+                    sourceURL: source,
+                    destinationParent: parent,
+                    excludedRoots: exclusions
+                )
+                pendingStorageChange = PendingStorageChange(
+                    kind: record.kind,
+                    sourceURL: source,
+                    destinationParent: parent,
+                    estimate: estimate
+                )
+            } catch {
+                report(error, taskType: "Speichermigration fortsetzen")
+            }
+        }
+    }
+
+    func discardPendingStorageMigration() {
+        guard let record = pendingStorageMigration else { return }
+        Task {
+            do {
+                try await storageMigrationService.discardFailedStaging(for: record)
+                storageConfigurationStore.clearMigrationRecord()
+                pendingStorageMigration = nil
+                storageMessage =
+                    "Der unvollständige Staging-Bestand wurde in den Papierkorb verschoben. Der bisherige aktive Speicher bleibt unverändert."
+            } catch {
+                report(error, taskType: "Unvollständige Migration verwerfen")
+            }
+        }
+    }
+
+    func returnToPreviousStorage() {
+        guard let record = pendingStorageMigration else { return }
+        do {
+            let oldURL = URL(filePath: record.sourcePath)
+            try storageConfigurationStore.saveLocation(kind: record.kind, url: oldURL)
+            storageConfigurationStore.clearMigrationRecord()
+            pendingStorageMigration = nil
+            storageMessage =
+                "Der bisherige Speicher ist wieder als aktiv hinterlegt. Es wurden keine Daten gelöscht."
+        } catch {
+            report(error, taskType: "Zum bisherigen Speicher zurückkehren")
+        }
+    }
+
+    private func reloadStorageState() async throws {
+        let selection = try storageConfigurationStore.startupSelection()
+        let newPaths = try AppPaths(
+            applicationSupport: selection.dataURL,
+            modelStorage: selection.modelURL,
+            createDataDirectories: selection.dataIsAvailable,
+            createModelDirectory: selection.modelsAreAvailable
+        )
+        let catalog = try ModelCatalog.bundled()
+
+        if database.url != newPaths.database {
+            let newDatabase = SQLiteDatabase(url: newPaths.database)
+            try await newDatabase.initialize()
+            database = newDatabase
+            maintenanceService = DocumentMaintenanceService(database: newDatabase)
+            scanner = RecursivePDFScanner(excludedRoots: [newPaths.applicationSupport])
+            processor = makeProcessor(embedder: TokenHashEmbedding())
+            searchService = HybridSearchService(
+                database: newDatabase,
+                embedder: TokenHashEmbedding(),
+                semanticEnabled: false
+            )
+            mailImportService = MailImportService(
+                database: newDatabase,
+                embedder: TokenHashEmbedding(),
+                archiveRoot: newPaths.mailArchive
+            )
+            await startDocumentStatusMonitoring()
+            await loadSettings()
+        }
+
+        paths = newPaths
+        modelManager = LocalModelManager(catalog: catalog, paths: newPaths)
+        hardwareProfile = HardwareProfile.current(storageURL: newPaths.applicationSupport)
+        dataStorageAccess?.stopAccess()
+        modelStorageAccess?.stopAccess()
+        dataStorageAccess = selection.dataAccess
+        modelStorageAccess = selection.modelAccess
+        dataStoragePath = selection.dataURL.path
+        modelStoragePath = selection.modelURL.path
+        dataStorageAvailable = selection.dataIsAvailable
+        modelStorageAvailable = selection.modelsAreAvailable
+        pendingStorageMigration = try storageConfigurationStore.pendingMigration()
+        lastStorageMigration = try storageConfigurationStore.lastMigration()
+
+        if modelStorageAvailable {
+            await refreshModels()
+            await restoreModelSelection()
+            await refreshModels()
+        }
+        await refreshMailSources()
+        await refreshDatabaseState()
+        await refreshStorageUsage()
+    }
+
+    private func startMailWatchLoop() {
+        mailWatchLoop?.cancel()
+        guard mailSources.contains(where: \.watchEnabled) else {
+            mailWatchLoop = nil
+            return
+        }
+        mailWatchLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard !Task.isCancelled, let self else { return }
+                let watched = self.mailSources.filter(\.watchEnabled)
+                for source in watched {
+                    guard !Task.isCancelled,
+                          !self.isStorageMigrationInProgress,
+                          !self.isMailImporting else { break }
+                    self.isMailImporting = true
+                    do {
+                        _ = try await self.mailImportService.synchronizeSource(
+                            sourceID: source.id
+                        ) { [weak self] progress in
+                            await MainActor.run {
+                                self?.mailImportProgress = progress
+                            }
+                        }
+                        await self.refreshMailSources()
+                        await self.refreshDatabaseState()
+                    } catch {
+                        try? await self.database.markMailSourceUnavailable(
+                            sourceID: source.id
+                        )
+                        await self.refreshMailSources()
+                    }
+                    self.isMailImporting = false
+                }
+            }
+        }
+    }
+
     func scanNow() async {
         guard !isPaused else { return }
+        guard !isStorageMigrationInProgress else { return }
         guard !isProcessing else { return }
         guard let folder = resolvedFolder else {
             report(FindoraError.noDocumentFolder)
@@ -396,10 +1106,18 @@ final class AppState {
                 total: files.count,
                 currentFile: nil
             )
-            try await database.saveScan(files: files, root: folder.url)
+            try await database.saveScan(
+                files: files,
+                root: folder.url,
+                removedDocumentPolicy: removedDocumentPolicy
+            )
             folderStatus = "Erreichbar"
             await updateProcessingSession(phase: .indexing)
-            await processor.processPending(ocrConfiguration: ocrConfiguration) {
+            await processor.processPending(
+                ocrConfiguration: ocrConfiguration,
+                removeMissingDocuments:
+                    removedDocumentPolicy == .removeAfterSuccessfulScan
+            ) {
                 [weak self] progress in
                 await self?.updateProcessingSession(
                     phase: .indexing,
@@ -409,6 +1127,8 @@ final class AppState {
                 )
             }
             await refreshDatabaseState()
+            lastSynchronizationMessage =
+                "Synchronisation abgeschlossen: \(files.count) PDF-Datei(en) im führenden Dokumentenordner abgeglichen."
             await updateProcessingSession(failed: statistics.failedJobs)
             await finishProcessingSession(phase: .completed)
         } catch is CancellationError {
@@ -483,6 +1203,10 @@ final class AppState {
                 try await database.setSetting(key: "showExperimentalModels", value: showExperimentalModels ? "1" : "0")
                 try await database.setSetting(key: "interfaceLanguage", value: interfaceLanguage.rawValue)
                 try await database.setSetting(key: "interfaceAppearance", value: interfaceAppearance.rawValue)
+                try await database.setSetting(
+                    key: "removedDocumentPolicy",
+                    value: removedDocumentPolicy.rawValue
+                )
                 startScanLoop()
                 modelMessage = "Einstellungen wurden lokal gespeichert."
             } catch {
@@ -1046,6 +1770,10 @@ final class AppState {
     func submitQuestion() {
         let value = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, !isSearching else { return }
+        guard !isStorageMigrationInProgress else {
+            answer = "Die Suche ist während der sicheren Speicherübertragung pausiert."
+            return
+        }
         guard !isProcessing else {
             answer = "OCR oder Indexierung läuft gerade. Pausiere die Verarbeitung oder warte bis zum Abschluss, bevor das lokale Sprachmodell geladen wird."
             return
@@ -1100,7 +1828,11 @@ final class AppState {
                 currentSearchPlan = plan
                 searchContext.record(plan)
 
-                let outcome = try await searchService.search(value, plan: plan)
+                let outcome = try await searchService.search(
+                    value,
+                    plan: plan,
+                    contentFilter: searchContentFilter
+                )
                 let sources = outcome.directMatches
                 searchResults = sources
                 possibleSearchResults = outcome.possibleMatches
@@ -1160,10 +1892,12 @@ final class AppState {
     }
 
     func open(_ source: SearchSource) {
+        guard !source.absolutePath.isEmpty else { return }
         NSWorkspace.shared.open(URL(filePath: source.absolutePath))
     }
 
     func reveal(_ source: SearchSource) {
+        guard !source.absolutePath.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: source.absolutePath)])
     }
 
@@ -1685,6 +2419,10 @@ final class AppState {
                let appearance = InterfaceAppearance(rawValue: value) {
                 interfaceAppearance = appearance
             }
+            if let value = try await database.setting(key: "removedDocumentPolicy"),
+               let policy = RemovedDocumentPolicy(rawValue: value) {
+                removedDocumentPolicy = policy
+            }
             isPaused = try await database.setting(key: "processingPaused") == "1"
             await processor.setPaused(isPaused)
         } catch {
@@ -1932,21 +2670,29 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var state = state
-        NavigationSplitView {
-            FindoraSidebar(selection: $state.selectedSection)
-        } detail: {
-            Group {
-                switch state.selectedSection ?? .search {
-                case .search: SearchView()
-                case .status: StatusView()
-                case .maintenance: MaintenanceView()
-                case .ocr: OCRView()
-                case .models: ModelsView()
-                case .settings: SettingsView()
-                case .logs: LogView()
+        Group {
+            if state.dataStorageAvailable {
+                NavigationSplitView {
+                    FindoraSidebar(selection: $state.selectedSection)
+                } detail: {
+                    Group {
+                        switch state.selectedSection ?? .search {
+                        case .search: SearchView()
+                        case .mail: MailSourcesView()
+                        case .status: StatusView()
+                        case .maintenance: MaintenanceView()
+                        case .ocr: OCRView()
+                        case .models: ModelsView()
+                        case .settings: SettingsView()
+                        case .logs: LogView()
+                        }
+                    }
+                    .environment(state)
                 }
+            } else {
+                MissingDataStorageView()
+                    .environment(state)
             }
-            .environment(state)
         }
         .alert(
             "Findora",
@@ -1960,13 +2706,45 @@ struct ContentView: View {
             Text(state.lastError ?? "")
         }
         .sheet(item: $state.previewSource) { source in
-            PDFSourcePreview(source: source)
+            SourcePreview(source: source)
+        }
+        .sheet(item: $state.pendingMailImport) { pending in
+            MailImportConfirmationView(importRequest: pending)
+        }
+        .sheet(item: $state.pendingStorageChange) { change in
+            StorageMigrationConfirmationView(change: change)
         }
         .sheet(isPresented: $state.showsAbout) {
             FindoraAboutView(
                 isEnglish: state.interfaceLocale.language.languageCode?
                     .identifier == "en"
             )
+        }
+    }
+}
+
+struct MissingDataStorageView: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("Findora-Datenspeicher nicht erreichbar", systemImage: "externaldrive.badge.exclamationmark")
+        } description: {
+            VStack(spacing: 8) {
+                Text("Es wurde keine neue leere Datenbank angelegt.")
+                Text("Erwarteter Speicherort:")
+                Text(state.dataStoragePath)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+            }
+        } actions: {
+            Button("Datenträger erneut prüfen") {
+                state.retryConfiguredDataStorage()
+            }
+            .buttonStyle(.borderedProminent)
+            Button("Anderen Speicherort zuordnen …") {
+                state.reconnectConfiguredStorage(kind: .data)
+            }
         }
     }
 }
@@ -1992,7 +2770,7 @@ private struct FindoraSidebar: View {
             Divider()
 
             List(selection: $selection) {
-                sidebarSection([.search])
+                sidebarSection([.search, .mail])
                 sidebarSection([.status, .maintenance])
                 sidebarSection([.ocr, .models])
                 sidebarSection([.settings, .logs])
@@ -2065,6 +2843,317 @@ private struct FindoraAboutView: View {
         .padding(32)
         .frame(minWidth: 440)
         .accessibilityElement(children: .contain)
+    }
+}
+
+struct MailSourcesView: View {
+    @Environment(AppState.self) private var state
+    @State private var pendingRemoval: MailImportSource?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("E-Mail-Import").font(.title2.bold())
+                        Text("Manuell ausgewählte Exporte werden ausschließlich lokal verarbeitet.")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Aktualisieren") {
+                        Task { await state.refreshMailSources() }
+                    }
+                }
+
+                HStack {
+                    Button("Apple-Mail-Postfach (.mbox) …") {
+                        state.chooseMailFiles(format: .mbox)
+                    }
+                    Button("E-Mail-Dateien (.eml) …") {
+                        state.chooseMailFiles(format: .eml)
+                    }
+                    Button("Outlook-Nachrichten (.msg) …") {
+                        state.chooseMailFiles(format: .outlookMSG)
+                    }
+                    Button("Importordner …") {
+                        state.chooseMailImportFolder()
+                    }
+                }
+                .disabled(state.isMailImporting || state.isStorageMigrationInProgress)
+
+                if let progress = state.mailImportProgress, state.isMailImporting {
+                    GroupBox("Import läuft") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ProgressView(
+                                value: Double(progress.processed),
+                                total: Double(max(progress.total ?? progress.processed + 1, 1))
+                            )
+                            Text(
+                                "\(progress.processed) von \(progress.total.map(String.init) ?? "…") · "
+                                + "\(progress.imported) neu · \(progress.duplicates) Dubletten · \(progress.failed) Fehler"
+                            )
+                            .font(.caption)
+                            if let subject = progress.currentSubject {
+                                Text(subject).lineLimit(1).foregroundStyle(.secondary)
+                            }
+                            HStack {
+                                Button("Pausieren") { state.setMailImportPaused(true) }
+                                Button("Fortsetzen") { state.setMailImportPaused(false) }
+                                Button("Abbrechen", role: .destructive) {
+                                    state.cancelMailImport()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let message = state.mailImportMessage {
+                    Label(message, systemImage: "checkmark.circle")
+                        .foregroundStyle(.secondary)
+                }
+
+                if state.mailSources.isEmpty {
+                    ContentUnavailableView(
+                        "Keine E-Mail-Quelle eingerichtet",
+                        systemImage: "envelope.badge",
+                        description: Text(
+                            "Sie können Apple-Mail-Postfächer, Outlook-Nachrichten oder einen Importordner manuell hinzufügen."
+                        )
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 280)
+                } else {
+                    ForEach(state.mailSources) { source in
+                        GroupBox {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text(source.displayName).font(.headline)
+                                    Spacer()
+                                    SearchBadge(
+                                        text: source.status.displayName,
+                                        color: source.status == .available
+                                            || source.status == .archivedCopyAvailable
+                                            ? .green : .orange
+                                    )
+                                }
+                                Text(source.path)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                Grid(alignment: .leading, horizontalSpacing: 20) {
+                                    GridRow {
+                                        Text("Typ").foregroundStyle(.secondary)
+                                        Text(source.format.displayName)
+                                        Text("Modus").foregroundStyle(.secondary)
+                                        Text(source.importMode.displayName)
+                                    }
+                                    GridRow {
+                                        Text("Nachrichten").foregroundStyle(.secondary)
+                                        Text(source.messageCount.formatted())
+                                        Text("Anhänge").foregroundStyle(.secondary)
+                                        Text(source.attachmentCount.formatted())
+                                    }
+                                }
+                                if source.format == .importFolder {
+                                    Toggle(
+                                        "Ordner auf neue E-Mail-Dateien überwachen",
+                                        isOn: Binding(
+                                            get: { source.watchEnabled },
+                                            set: { state.setMailSourceWatch(source, enabled: $0) }
+                                        )
+                                    )
+                                }
+                                HStack {
+                                    Button("Jetzt erneut einlesen") {
+                                        state.synchronizeMailSource(source)
+                                    }
+                                    Button("Quelle im Finder anzeigen") {
+                                        state.revealMailSource(source)
+                                    }
+                                    Button("Quelle neu zuordnen") {
+                                        state.reassignMailSource(source)
+                                    }
+                                    Button("Quelle entfernen", role: .destructive) {
+                                        pendingRemoval = source
+                                    }
+                                    Spacer()
+                                    if let date = source.lastSynchronizedAt {
+                                        Text("Letzter Abgleich: \(date.formatted())")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+            }
+            .padding()
+        }
+        .navigationTitle(state.localizedSectionTitle(.mail))
+        .confirmationDialog(
+            "E-Mail-Quelle entfernen?",
+            isPresented: Binding(
+                get: { pendingRemoval != nil },
+                set: { if !$0 { pendingRemoval = nil } }
+            )
+        ) {
+            Button("Quellenzuordnung entfernen", role: .destructive) {
+                if let source = pendingRemoval {
+                    state.removeMailSource(source)
+                }
+                pendingRemoval = nil
+            }
+            Button("Abbrechen", role: .cancel) {
+                pendingRemoval = nil
+            }
+        } message: {
+            Text(
+                "Indexierte E-Mails und archivierte Originale bleiben erhalten. Quelldateien werden nicht verändert."
+            )
+        }
+    }
+}
+
+struct MailImportConfirmationView: View {
+    @Environment(AppState.self) private var state
+    @Environment(\.dismiss) private var dismiss
+    let importRequest: PendingMailImport
+    @State private var mode: MailImportMode
+    @State private var watchFolders: Bool
+
+    init(importRequest: PendingMailImport) {
+        self.importRequest = importRequest
+        _mode = State(initialValue: importRequest.mode)
+        _watchFolders = State(initialValue: importRequest.watchFolders)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("E-Mail-Import bestätigen").font(.title2.bold())
+            Text("Vor dieser Bestätigung werden keine E-Mail-Inhalte verarbeitet.")
+                .foregroundStyle(.secondary)
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+                GridRow {
+                    Text("Ausgewählte Quellen")
+                    Text(importRequest.estimate.sourceCount.formatted())
+                }
+                GridRow {
+                    Text("Erkannte Dateien")
+                    Text(importRequest.estimate.estimatedMessages?.formatted() ?? "Unbekannt")
+                }
+                GridRow {
+                    Text("Quellgröße")
+                    Text(bytes(importRequest.estimate.sourceBytes))
+                }
+                GridRow {
+                    Text("Zusätzlicher Speicher (Schätzung)")
+                    Text(bytes(importRequest.estimate.estimatedAdditionalBytes))
+                }
+            }
+            Picker("Importmodus", selection: $mode) {
+                ForEach(MailImportMode.allCases) { mode in
+                    Text(mode.displayName).tag(mode)
+                }
+            }
+            .onChange(of: mode) { _, value in
+                state.updatePendingMailImportMode(value)
+            }
+            Toggle("Importordner nach neuen Dateien überwachen", isOn: $watchFolders)
+                .onChange(of: watchFolders) { _, value in
+                    state.setPendingMailWatch(value)
+                }
+            Text("Die Ordnerüberwachung ist standardmäßig aus. Quelldateien werden niemals automatisch gelöscht oder verschoben.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Abbrechen") {
+                    state.pendingMailImport = nil
+                    dismiss()
+                }
+                Button("Import starten") {
+                    state.confirmMailImport()
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+    }
+
+    private func bytes(_ value: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+    }
+}
+
+struct StorageMigrationConfirmationView: View {
+    @Environment(AppState.self) private var state
+    @Environment(\.dismiss) private var dismiss
+    let change: PendingStorageChange
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("\(change.kind.displayName) sicher übertragen")
+                .font(.title2.bold())
+            Text(change.destinationParent.path)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
+                GridRow {
+                    Text("Dateien")
+                    Text(change.estimate.fileCount.formatted())
+                }
+                GridRow {
+                    Text("Zu kopieren")
+                    Text(bytes(change.estimate.totalBytes))
+                }
+                GridRow {
+                    Text("Freier Speicher")
+                    Text(
+                        change.estimate.assessment.availableBytes.map(bytes)
+                            ?? "Nicht zuverlässig ermittelbar"
+                    )
+                }
+                GridRow {
+                    Text("Dateisystem")
+                    Text(change.estimate.assessment.fileSystemDescription)
+                }
+            }
+            ForEach(change.estimate.assessment.blockingReasons, id: \.self) {
+                Label($0, systemImage: "xmark.octagon.fill").foregroundStyle(.red)
+            }
+            ForEach(change.estimate.assessment.warnings, id: \.self) {
+                Label($0, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+            Text(
+                "Findora pausiert Verarbeitung und Suche, checkpointet SQLite, kopiert zunächst in einen Staging-Ordner, prüft Größen, SHA-256 und Datenbankintegrität und schaltet erst danach um. Der alte Bestand bleibt erhalten."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Abbrechen") {
+                    state.pendingStorageChange = nil
+                    dismiss()
+                }
+                Button("Daten sicher übertragen") {
+                    state.confirmStorageMigration()
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!change.estimate.assessment.isAllowed)
+            }
+        }
+        .padding(24)
+        .frame(width: 620)
+    }
+
+    private func bytes(_ value: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
     }
 }
 
@@ -2270,38 +3359,47 @@ struct SearchView: View {
 
             Divider()
 
-            HStack(alignment: .bottom, spacing: 10) {
-                TextField(
-                    state.searchSession.isEmpty
-                        ? "Frage zu deinen Unterlagen …"
-                        : "Folgefrage stellen …",
-                    text: $state.question,
-                    axis: .vertical
-                )
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...5)
-                .onSubmit { state.submitQuestion() }
-
-                Button {
-                    if state.isSearching {
-                        state.cancelSearch()
-                    } else {
-                        state.submitQuestion()
-                    }
-                } label: {
-                    if state.isSearching {
-                        Label("Abbrechen", systemImage: "stop.fill")
-                    } else {
-                        Label("Senden", systemImage: "paperplane.fill")
+            VStack(spacing: 8) {
+                Picker("Inhalt", selection: $state.searchContentFilter) {
+                    ForEach(SearchContentFilter.allCases) { filter in
+                        Text(filter.displayName).tag(filter)
                     }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(state.isSearching ? .red : .accentColor)
-                .disabled(
-                    (state.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        && !state.isSearching)
-                        || (state.isProcessing && !state.isSearching)
-                )
+                .pickerStyle(.segmented)
+
+                HStack(alignment: .bottom, spacing: 10) {
+                    TextField(
+                        state.searchSession.isEmpty
+                            ? "Frage zu deinen Unterlagen …"
+                            : "Folgefrage stellen …",
+                        text: $state.question,
+                        axis: .vertical
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...5)
+                    .onSubmit { state.submitQuestion() }
+
+                    Button {
+                        if state.isSearching {
+                            state.cancelSearch()
+                        } else {
+                            state.submitQuestion()
+                        }
+                    } label: {
+                        if state.isSearching {
+                            Label("Abbrechen", systemImage: "stop.fill")
+                        } else {
+                            Label("Senden", systemImage: "paperplane.fill")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(state.isSearching ? .red : .accentColor)
+                    .disabled(
+                        (state.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            && !state.isSearching)
+                            || (state.isProcessing && !state.isSearching)
+                    )
+                }
             }
             .padding()
         }
@@ -2352,6 +3450,7 @@ struct SourceCard: View {
                     Text(number.map { "\($0). \(source.fileName)" } ?? source.fileName)
                         .font(.headline)
                     Spacer()
+                    SearchBadge(text: source.contentType.displayName, color: .indigo)
                     Text(source.relevance.displayName)
                         .font(.caption.bold())
                         .foregroundStyle(
@@ -2363,8 +3462,13 @@ struct SourceCard: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Label("Seite \(source.pageNumber)", systemImage: "doc.text")
-                        .font(.caption)
+                    if source.contentType == .pdf {
+                        Label("Seite \(source.pageNumber)", systemImage: "doc.text")
+                            .font(.caption)
+                    } else if let date = source.mailDate {
+                        Text(date.formatted(date: .abbreviated, time: .shortened))
+                            .font(.caption)
+                    }
                 }
                 badgeRow
                 Text(highlightedExcerpt)
@@ -2375,9 +3479,15 @@ struct SourceCard: View {
                         .foregroundStyle(.secondary)
                 }
                 HStack {
-                    Button("Seite anzeigen") { state.showPage(source) }
-                    Button("PDF öffnen") { state.open(source) }
-                    Button("Im Finder anzeigen") { state.reveal(source) }
+                    Button(source.contentType == .pdf ? "Seite anzeigen" : "Quelle anzeigen") {
+                        state.showPage(source)
+                    }
+                    if !source.absolutePath.isEmpty {
+                        Button(source.contentType == .pdf ? "PDF öffnen" : "Original öffnen") {
+                            state.open(source)
+                        }
+                        Button("Im Finder anzeigen") { state.reveal(source) }
+                    }
                     Spacer()
                     Text(source.absolutePath)
                         .font(.caption2)
@@ -2398,10 +3508,18 @@ struct SourceCard: View {
             if let topic = source.matchedTopics.first {
                 SearchBadge(text: "Thema: \(topic)", color: .blue)
             }
-            SearchBadge(
-                text: source.textSource == "ocr" ? "OCR-Text" : "Digitale Textschicht",
-                color: .secondary
-            )
+            if source.contentType == .pdf {
+                SearchBadge(
+                    text: source.textSource == "ocr" ? "OCR-Text" : "Digitale Textschicht",
+                    color: .secondary
+                )
+            }
+            if let sender = source.mailSender, !sender.isEmpty {
+                SearchBadge(text: "Von: \(sender)", color: .teal)
+            }
+            if let parent = source.parentEmailSubject, !parent.isEmpty {
+                SearchBadge(text: "Mail: \(parent)", color: .cyan)
+            }
             if let quality = source.ocrQuality {
                 SearchBadge(text: qualityLabel(quality), color: .orange)
             }
@@ -2454,6 +3572,69 @@ struct SearchBadge: View {
             .padding(.vertical, 3)
             .foregroundStyle(color)
             .background(color.opacity(0.10), in: Capsule())
+    }
+}
+
+struct SourcePreview: View {
+    let source: SearchSource
+
+    var body: some View {
+        if source.contentType == .pdf {
+            PDFSourcePreview(source: source)
+        } else {
+            MailSourcePreview(source: source)
+        }
+    }
+}
+
+struct MailSourcePreview: View {
+    @Environment(\.dismiss) private var dismiss
+    let source: SearchSource
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label(source.contentType.displayName, systemImage: "envelope")
+                    .font(.headline)
+                Spacer()
+                Button("Schließen") { dismiss() }
+            }
+            Text(source.mailSubject ?? source.fileName)
+                .font(.title2.bold())
+            if let sender = source.mailSender ?? source.parentEmailSender {
+                LabeledContent("Absender", value: sender)
+            }
+            if let date = source.mailDate ?? source.parentEmailDate {
+                LabeledContent("Datum", value: date.formatted())
+            }
+            if let mailbox = source.mailbox {
+                LabeledContent("Mailbox / Quelle", value: mailbox)
+            }
+            if let parent = source.parentEmailSubject {
+                LabeledContent("Zugehörige E-Mail", value: parent)
+            }
+            Divider()
+            ScrollView {
+                Text(source.excerpt)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            HStack {
+                if !source.absolutePath.isEmpty {
+                    Button("Original öffnen") {
+                        NSWorkspace.shared.open(URL(filePath: source.absolutePath))
+                    }
+                    Button("Im Finder anzeigen") {
+                        NSWorkspace.shared.activateFileViewerSelecting([
+                            URL(filePath: source.absolutePath)
+                        ])
+                    }
+                }
+                Spacer()
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 680, minHeight: 480)
     }
 }
 
@@ -5098,6 +6279,8 @@ struct SettingsView: View {
     @State private var confirmsOCRReset = false
     @State private var confirmsIndexDeletion = false
     @State private var confirmsIndexDeletionFinally = false
+    @State private var confirmsOldStorageRemoval = false
+    @State private var confirmsTemporaryCleanup = false
 
     var body: some View {
         @Bindable var state = state
@@ -5134,6 +6317,150 @@ struct SettingsView: View {
                 ) {
                     Text("Scanintervall: \(state.scanIntervalMinutes) Minuten")
                 }
+                Picker(
+                    "Verhalten bei entfernten Dokumenten",
+                    selection: $state.removedDocumentPolicy
+                ) {
+                    ForEach(RemovedDocumentPolicy.allCases) { policy in
+                        Text(policy.displayName).tag(policy)
+                    }
+                }
+                Button("Jetzt synchronisieren") {
+                    Task { await state.scanNow() }
+                }
+                if let message = state.lastSynchronizationMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Section("E-Mail-Quellen") {
+                if state.mailSources.isEmpty {
+                    Text("Keine E-Mail-Quelle eingerichtet")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(
+                        "\(state.mailSources.count) Quelle(n), "
+                        + "\(state.mailSources.reduce(0) { $0 + $1.messageCount }) E-Mail(s)"
+                    )
+                }
+                Button("E-Mail-Quellen verwalten …") {
+                    state.selectedSection = .mail
+                }
+            }
+            Section("Speicher") {
+                LabeledContent("Findora-Datenspeicher") {
+                    VStack(alignment: .trailing) {
+                        Text(state.dataStoragePath).lineLimit(1)
+                        Text(state.dataStorageAvailable ? "Erreichbar" : "Nicht erreichbar")
+                            .font(.caption)
+                            .foregroundStyle(state.dataStorageAvailable ? .green : .red)
+                    }
+                }
+                Button("Datenspeicher ändern …") {
+                    state.chooseStorageLocation(kind: .data)
+                }
+                LabeledContent("KI-Modellspeicher") {
+                    VStack(alignment: .trailing) {
+                        Text(state.modelStoragePath).lineLimit(1)
+                        Text(state.modelStorageAvailable ? "Erreichbar" : "Nicht erreichbar")
+                            .font(.caption)
+                            .foregroundStyle(state.modelStorageAvailable ? .green : .red)
+                    }
+                }
+                Button("Modellspeicher ändern …") {
+                    state.chooseStorageLocation(kind: .models)
+                }
+                HStack {
+                    Button("Datenspeicher im Finder anzeigen") {
+                        state.revealStorage(kind: .data)
+                    }
+                    Button("Modellspeicher im Finder anzeigen") {
+                        state.revealStorage(kind: .models)
+                    }
+                }
+                if let usage = state.storageUsage {
+                    Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 5) {
+                        storageRow("Datenbank und Index", usage.databaseAndIndexBytes)
+                        storageRow("OCR- und E-Mail-Texte", usage.textBytes)
+                        storageRow("Embeddings", usage.embeddingBytes)
+                        storageRow("Vorschaudaten", usage.previewBytes)
+                        storageRow("Archivierte Mailquellen", usage.archivedSourceBytes)
+                        storageRow("Archivierte Anhänge", usage.archivedAttachmentBytes)
+                        storageRow("KI-Modelle", usage.modelBytes)
+                        storageRow("Temporäre Daten", usage.temporaryBytes)
+                        storageRow("Protokolle", usage.logBytes)
+                        Divider()
+                        storageRow("Gesamt", usage.totalBytes)
+                        storageRow("Frei am Datenziel", usage.availableDataBytes ?? 0)
+                        storageRow("Frei am Modellziel", usage.availableModelBytes ?? 0)
+                    }
+                    if usage.capacityLevel != .sufficient {
+                        Label(
+                            usage.capacityLevel == .critical
+                                ? "Freier Speicher ist kritisch."
+                                : "Freier Speicher ist knapp.",
+                            systemImage: "externaldrive.badge.exclamationmark"
+                        )
+                        .foregroundStyle(usage.capacityLevel == .critical ? .red : .orange)
+                    }
+                }
+                HStack {
+                    Button("Integrität prüfen") {
+                        state.checkStorageIntegrity()
+                    }
+                    Button("Temporäre Daten bereinigen") {
+                        confirmsTemporaryCleanup = true
+                    }
+                    Button("Speicherbelegung aktualisieren") {
+                        Task { await state.refreshStorageUsage() }
+                    }
+                }
+                if state.isStorageMigrationInProgress,
+                   let progress = state.storageMigrationProgress {
+                    ProgressView(
+                        value: Double(progress.copiedBytes),
+                        total: Double(max(progress.totalBytes, 1))
+                    )
+                    Text(
+                        "\(progress.phase.displayName): \(progress.copiedFiles) von \(progress.totalFiles) Dateien"
+                    )
+                    .font(.caption)
+                }
+                if let migration = state.pendingStorageMigration {
+                    Label(
+                        "Unvollständige Migration: \(migration.phase.displayName)",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(.orange)
+                    HStack {
+                        Button("Fortsetzen …") {
+                            state.continuePendingStorageMigration()
+                        }
+                        Button("Zum alten Speicher zurückkehren") {
+                            state.returnToPreviousStorage()
+                        }
+                        Button("Staging verwerfen", role: .destructive) {
+                            state.discardPendingStorageMigration()
+                        }
+                    }
+                }
+                if let message = state.storageMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
+                if let migration = state.lastStorageMigration,
+                   migration.phase == .completed,
+                   FileManager.default.fileExists(atPath: migration.sourcePath) {
+                    Button("Bestätigten Altbestand in Papierkorb verschieben …", role: .destructive) {
+                        confirmsOldStorageRemoval = true
+                    }
+                    Text(migration.sourcePath)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Text(
+                    "Datenbank und Modelle sind getrennt verschiebbar. Netzwerk-, Cloud- und ungeeignete Dateisystemziele werden vor dem Kopieren gesperrt."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             Section("Lokales Sprachmodell") {
                 Stepper(
@@ -5190,6 +6517,9 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle(state.localizedSectionTitle(.settings))
+        .task {
+            await state.refreshStorageUsage()
+        }
         .confirmationDialog("Suchindex neu aufbauen?", isPresented: $confirmsRebuild) {
             Button("Neu aufbauen") { state.rebuildSearchIndex() }
             Button("Abbrechen", role: .cancel) {}
@@ -5222,6 +6552,36 @@ struct SettingsView: View {
             Button("Abbrechen", role: .cancel) {}
         } message: {
             Text("Die Indexdaten können nur durch einen erneuten Scan und erneute Verarbeitung wiederhergestellt werden.")
+        }
+        .confirmationDialog(
+            "Alten Speicherbestand in den Papierkorb verschieben?",
+            isPresented: $confirmsOldStorageRemoval
+        ) {
+            Button("In den Papierkorb verschieben", role: .destructive) {
+                state.movePreviousStorageToTrash()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Nur der nach erfolgreicher Migration zurückbehaltene Altbestand wird entfernt. Der aktive Speicher bleibt geschützt.")
+        }
+        .confirmationDialog(
+            "Temporäre Daten bereinigen?",
+            isPresented: $confirmsTemporaryCleanup
+        ) {
+            Button("Temporäre Daten in Papierkorb verschieben", role: .destructive) {
+                state.cleanTemporaryStorage()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Nur unvollständige Modelldownloads werden entfernt. Dokumente, E-Mails, Index und installierte Modelle bleiben erhalten.")
+        }
+    }
+
+    private func storageRow(_ title: LocalizedStringKey, _ bytes: Int64) -> some View {
+        GridRow {
+            Text(title).foregroundStyle(.secondary)
+            Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))
+                .monospacedDigit()
         }
     }
 }
