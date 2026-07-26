@@ -31,10 +31,10 @@ Verbindlich:
 
 - Keine Original-PDFs verändern, sofern der Auftrag dies nicht ausdrücklich verlangt.
 - Keine produktiven Daten löschen.
-- Keine Veröffentlichung.
-- Kein Push.
-- Kein Tag.
-- Kein Release.
+- Keine Tags, Releases, Notarisierung oder externe Veröffentlichung ohne
+  ausdrücklichen Auftrag.
+- Pushes nur, wenn der Nutzer sie ausdrücklich autorisiert oder ein vollständig
+  mit GitHub synchronisiertes Ergebnis beauftragt hat.
 - Sicherheits- und Architekturvorgaben aus `AGENTS.md` beachten.
 - Bei größeren Änderungen Dokumentation aktualisieren.
 
@@ -56,7 +56,13 @@ git add -A
 git commit -m "<passende Commit-Nachricht>"
 ```
 
-**Kein `git push`.** Der Push erfolgt ausschließlich durch den Projektinhaber.
+Wenn der Nutzer den Push ausdrücklich autorisiert hat:
+
+```bash
+git push
+```
+
+Vorher Ziel-Repository, Branch und ausgehende Commits prüfen.
 
 ---
 
@@ -84,7 +90,8 @@ Immer enthalten:
 - Commit-SHA
 - Branch
 - offene Risiken
-- Hinweis, dass kein Push/Tag/Release erfolgt ist
+- Push-Ziel beziehungsweise Hinweis, dass kein Push erfolgt ist
+- Hinweis, dass kein Tag oder Release erfolgt ist
 
 ---
 
@@ -118,7 +125,7 @@ git add -A
 git commit -m "<Beschreibung>"
 ```
 
-Push nur manuell durch den Projektinhaber.
+Push nur nach ausdrücklicher Autorisierung des Nutzers.
 
 ---
 

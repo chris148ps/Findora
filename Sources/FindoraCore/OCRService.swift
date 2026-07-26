@@ -434,7 +434,7 @@ public struct OCRDependencyChecker: Sendable {
             ] as CFDictionary
             guard let attributed = CFAttributedStringCreate(
                 nil,
-                "PRIVATE DOC SEARCH OCR TEST 12345" as CFString,
+                "FINDORA OCR TEST 12345" as CFString,
                 attributes
             ) else { return false }
             let line = CTLineCreateWithAttributedString(attributed)
