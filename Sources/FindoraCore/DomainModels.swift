@@ -137,6 +137,7 @@ public enum SearchMatchKind: String, Codable, CaseIterable, Hashable, Sendable {
     case exact
     case semantic
     case fileName
+    case relation
     case sameChunk
     case sameDocument
 
@@ -145,6 +146,7 @@ public enum SearchMatchKind: String, Codable, CaseIterable, Hashable, Sendable {
         case .exact: "Exakter Treffer"
         case .semantic: "Semantischer Treffer"
         case .fileName: "Dateiname"
+        case .relation: "Verknüpfter Kontext"
         case .sameChunk: "Im selben Textabschnitt"
         case .sameDocument: "Im selben Dokument"
         }

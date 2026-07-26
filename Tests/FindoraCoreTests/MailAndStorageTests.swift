@@ -2,6 +2,7 @@ import AppKit
 import CoreText
 import Foundation
 import PDFKit
+@preconcurrency import SQLite3
 import Testing
 @testable import FindoraCore
 
@@ -309,6 +310,543 @@ func removedDocumentPoliciesEitherKeepIndexOrOnlyMarkLocationMissing() async thr
         modelVersion: "1"
     )
     #expect(coverage.totalChunks > 0)
+}
+
+@Test
+func communicationGraphLinksIdenticalPDFAttachmentsInBothImportOrders() async throws {
+    for mailFirst in [true, false] {
+        let root = try syntheticTemporaryDirectory(
+            mailFirst ? "graph-mail-first" : "graph-pdf-first"
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let support = root.appending(path: "Support")
+        let paths = try AppPaths(
+            applicationSupport: support,
+            logs: root.appending(path: "Logs")
+        )
+        let sourcePDF = root.appending(path: "attachment-source.pdf")
+        try writeSyntheticPDF(
+            text: "PRJ-1001 Synthetischer Nordhafen Auftrag identischer Anhang",
+            to: sourcePDF
+        )
+        let pdfData = try Data(contentsOf: sourcePDF)
+        try FileManager.default.removeItem(at: sourcePDF)
+        let importedPDF = root.appending(path: "PRJ-1001 Auftrag.pdf")
+        let eml = root.appending(path: "projekt.eml")
+        try syntheticGraphEML(
+            messageID: mailFirst ? "mail-first@test.invalid" : "pdf-first@test.invalid",
+            subject: "PRJ-1001 Nordhafen Auftrag",
+            sender: "Anna Beispiel <anna@synthetic-acme.test>",
+            recipients: "Bob Test <bob@synthetic-acme.test>",
+            body: "Synthetischer Auftrag Nordhafen PRJ-1001",
+            attachmentName: "PRJ-1001 Auftrag.pdf",
+            attachmentData: pdfData
+        ).write(to: eml)
+
+        let database = SQLiteDatabase(url: paths.database)
+        try await database.initialize()
+        let scanner = RecursivePDFScanner(excludedRoots: [support])
+        let processor = DocumentProcessor(
+            database: database,
+            stabilityChecker: FileStabilityChecker(delay: .zero),
+            embedder: TokenHashEmbedding(dimensions: 64)
+        )
+        let mailService = MailImportService(
+            database: database,
+            embedder: TokenHashEmbedding(dimensions: 64),
+            archiveRoot: paths.mailArchive
+        )
+
+        if mailFirst {
+            let summary = try await mailService.importSources(
+                urls: [eml],
+                importMode: .referenced
+            ) { _ in }
+            #expect(summary.imported == 1)
+            try pdfData.write(to: importedPDF)
+            try await database.saveScan(
+                files: try await scanner.scan(root: root),
+                root: root
+            )
+            await processor.processPending(
+                ocrConfiguration: OCRConfiguration(isEnabled: false)
+            ) { _ in }
+        } else {
+            try pdfData.write(to: importedPDF)
+            try await database.saveScan(
+                files: try await scanner.scan(root: root),
+                root: root
+            )
+            await processor.processPending(
+                ocrConfiguration: OCRConfiguration(isEnabled: false)
+            ) { _ in }
+            let summary = try await mailService.importSources(
+                urls: [eml],
+                importMode: .referenced
+            ) { _ in }
+            #expect(summary.imported == 1)
+        }
+
+        let pdfSources = try await database.fileNameSearch(
+            terms: ["PRJ-1001 Auftrag.pdf"],
+            contentFilter: .documents
+        )
+        let pdfSource = try #require(pdfSources.first)
+        let context = try await database.communicationGraphContext(
+            documentID: pdfSource.documentID
+        )
+        #expect(context.linkedEmails.contains {
+            $0.kind == .identicalAttachment
+                && $0.status == .automatic
+                && $0.confidence == 1
+        })
+        #expect(context.partners.contains { $0.primaryAddress == "anna@synthetic-acme.test" })
+        #expect(context.projects.contains { $0.reference == "1001" })
+        let emailSource = try #require(
+            try await database.fileNameSearch(
+                terms: ["PRJ-1001 Nordhafen Auftrag"],
+                contentFilter: .emails
+            ).first
+        )
+        let emailContext = try await database.communicationGraphContext(
+            documentID: emailSource.documentID
+        )
+        #expect(emailContext.linkedDocuments.contains {
+            $0.kind == .identicalAttachment && $0.status == .automatic
+        })
+
+        let projectMatches = try await HybridSearchService(
+            database: database,
+            embedder: TokenHashEmbedding(dimensions: 64),
+            semanticEnabled: false
+        ).search("PRJ-1001")
+        #expect(Set(projectMatches.map(\.contentType)).contains(.email))
+        #expect(projectMatches.contains { $0.matchKinds.contains(.relation) })
+    }
+}
+
+@Test
+func communicationGraphKeepsFilenameOnlyAndSemanticMatchesAsSuggestions() async throws {
+    let root = try syntheticTemporaryDirectory("graph-suggestions")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let support = root.appending(path: "Support")
+    let paths = try AppPaths(
+        applicationSupport: support,
+        logs: root.appending(path: "Logs")
+    )
+    let diskPDF = root.appending(path: "Gleicher Name.pdf")
+    try writeSyntheticPDF(
+        text: "Nordhafen Sanierung Fenster Planung Kosten Mai",
+        to: diskPDF
+    )
+    let differentPDF = root.appending(path: "different.pdf")
+    try writeSyntheticPDF(
+        text: "Vollständig anderer synthetischer Inhalt ohne Übereinstimmung",
+        to: differentPDF
+    )
+    let differentData = try Data(contentsOf: differentPDF)
+    try FileManager.default.removeItem(at: differentPDF)
+    let eml = root.appending(path: "vorschlag.eml")
+    try syntheticGraphEML(
+        messageID: "suggestion@test.invalid",
+        subject: "Nordhafen Sanierung",
+        sender: "Carla Kontakt <carla@synthetic-acme.test>",
+        recipients: "Dora Kontakt <dora@synthetic-beta.test>",
+        body: "Nordhafen Sanierung Fenster Budget Termin April",
+        attachmentName: "Gleicher Name.pdf",
+        attachmentData: differentData
+    ).write(to: eml)
+
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [support])
+    try await database.saveScan(
+        files: try await scanner.scan(root: root),
+        root: root
+    )
+    await DocumentProcessor(
+        database: database,
+        stabilityChecker: FileStabilityChecker(delay: .zero),
+        embedder: TokenHashEmbedding(dimensions: 64)
+    ).processPending(ocrConfiguration: OCRConfiguration(isEnabled: false)) { _ in }
+    let summary = try await MailImportService(
+        database: database,
+        embedder: TokenHashEmbedding(dimensions: 64),
+        archiveRoot: paths.mailArchive
+    ).importSources(urls: [eml], importMode: .referenced) { _ in }
+    #expect(summary.imported == 1)
+
+    let source = try #require(
+        try await database.fileNameSearch(
+            terms: ["Gleicher Name.pdf"],
+            contentFilter: .documents
+        ).first
+    )
+    let context = try await database.communicationGraphContext(
+        documentID: source.documentID
+    )
+    #expect(context.linkedEmails.contains {
+        $0.kind == .fileNameSimilarity && $0.status == .suggested
+    })
+    #expect(!context.linkedEmails.contains {
+        $0.kind == .identicalAttachment && $0.status == .automatic
+    })
+    #expect(context.linkedEmails.contains {
+        $0.kind == .contentSimilarity && $0.status == .suggested
+    })
+    let partners = try await database.communicationPartners()
+    #expect(partners.count == 2)
+    let organizations = try await database.organizations()
+    #expect(organizations.count == 2)
+    #expect(try await database.communicationProjects().contains {
+        $0.status == .suggested
+    })
+    let partnerMatches = try await HybridSearchService(
+        database: database,
+        embedder: TokenHashEmbedding(dimensions: 64),
+        semanticEnabled: false
+    ).search("Carla Kontakt")
+    #expect(partnerMatches.contains { $0.contentType == .email })
+    #expect(partnerMatches.contains { $0.contentType != .email })
+}
+
+@Test
+func communicationGraphSeparatesMultipleContactsAndProjects() async throws {
+    let root = try syntheticTemporaryDirectory("graph-multiple")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let first = root.appending(path: "first.eml")
+    let second = root.appending(path: "second.eml")
+    try syntheticGraphEML(
+        messageID: "first-project@test.invalid",
+        subject: "PRJ-2001 Synthetisches Projekt Alpha",
+        sender: "Erika Alpha <erika@synthetic-acme.test>",
+        recipients: "Findora Test <findora@example.invalid>",
+        body: "Projekt PRJ-2001 nur synthetische Daten"
+    ).write(to: first)
+    try syntheticGraphEML(
+        messageID: "second-project@test.invalid",
+        subject: "PRJ-2002 Synthetisches Projekt Beta",
+        sender: "Felix Beta <felix@synthetic-acme.test>",
+        recipients: "Findora Test <findora@example.invalid>",
+        body: "Projekt PRJ-2002 nur synthetische Daten"
+    ).write(to: second)
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let summary = try await MailImportService(
+        database: database,
+        embedder: TokenHashEmbedding(dimensions: 64),
+        archiveRoot: paths.mailArchive
+    ).importSources(urls: [first, second], importMode: .referenced) { _ in }
+    #expect(summary.imported == 2)
+    let partners = try await database.communicationPartners()
+    #expect(partners.contains { $0.primaryAddress == "erika@synthetic-acme.test" })
+    #expect(partners.contains { $0.primaryAddress == "felix@synthetic-acme.test" })
+    let organizations = try await database.organizations()
+    #expect(organizations.contains {
+        $0.domain == "synthetic-acme.test" && $0.partnerCount == 2
+    })
+    let projects = try await database.communicationProjects()
+    #expect(projects.contains { $0.reference == "2001" })
+    #expect(projects.contains { $0.reference == "2002" })
+}
+
+@Test
+func databaseMigrationsPreserveDocumentsOCRMailAndEmbeddingsAcrossVersions() async throws {
+    for legacyVersion in [10, 11] {
+        let root = try syntheticTemporaryDirectory("migration-v\(legacyVersion)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = try AppPaths(
+            applicationSupport: root.appending(path: "Support"),
+            logs: root.appending(path: "Logs")
+        )
+        let databaseURL = paths.database
+        var database: SQLiteDatabase? = SQLiteDatabase(url: databaseURL)
+        try await database?.initialize()
+
+        let pdf = root.appending(path: "PRJ-3001 Erhalten.pdf")
+        try writeSyntheticPDF(text: "Erhaltener synthetischer OCR Text PRJ-3001", to: pdf)
+        let data = try Data(contentsOf: pdf)
+        let hash = SHA256Hasher().hash(data: data)
+        let page = ExtractedPage(
+            pageNumber: 1,
+            text: "Erhaltener synthetischer OCR Text PRJ-3001"
+        )
+        let chunks = PageChunker().chunks(for: [page], documentHash: hash)
+        let embedder = TokenHashEmbedding(dimensions: 64)
+        let embeddings = try await embedder.embed(documents: chunks.map(\.text))
+        let attributes = try pdf.resourceValues(
+            forKeys: [.fileSizeKey, .contentModificationDateKey]
+        )
+        _ = try await database?.indexDocument(
+            file: DiscoveredPDF(
+                url: pdf,
+                relativePath: pdf.lastPathComponent,
+                fileName: pdf.lastPathComponent,
+                size: Int64(attributes.fileSize ?? data.count),
+                modifiedAt: attributes.contentModificationDate ?? .now,
+                resourceIdentifier: nil,
+                volumeIdentifier: nil
+            ),
+            hash: hash,
+            pages: [page],
+            chunks: chunks,
+            embeddings: embeddings,
+            embeddingModelID: embedder.modelID,
+            embeddingModelVersion: embedder.modelVersion,
+            ocrPerformed: true,
+            ocrPageNumbers: [1]
+        )
+        let eml = root.appending(path: "preserved.eml")
+        try syntheticGraphEML(
+            messageID: "preserved-v\(legacyVersion)@test.invalid",
+            subject: "PRJ-3001 Erhaltene Mail",
+            sender: "Migration Test <migration@synthetic-acme.test>",
+            recipients: "Findora Test <findora@example.invalid>",
+            body: "Erhaltene synthetische Maildaten PRJ-3001"
+        ).write(to: eml)
+        let mailSummary = try await MailImportService(
+            database: try #require(database),
+            embedder: embedder,
+            archiveRoot: paths.mailArchive
+        ).importSources(urls: [eml], importMode: .referenced) { _ in }
+        #expect(mailSummary.imported == 1)
+
+        let vectorsBefore = try await database?.vectorRows(
+            modelID: embedder.modelID,
+            modelVersion: embedder.modelVersion
+        ).count
+        try await database?.checkpointAndClose()
+        database = nil
+        try downgradeSyntheticDatabase(at: databaseURL, to: legacyVersion)
+
+        let migrated = SQLiteDatabase(url: databaseURL)
+        try await migrated.initialize()
+        let version = try await migrated.databaseVersionSnapshot(
+            embeddingModelID: embedder.modelID,
+            embeddingModelVersion: embedder.modelVersion
+        )
+        #expect(version.schemaVersion == FindoraAnalysisVersions.schema)
+        #expect(version.expectedSchemaVersion == FindoraAnalysisVersions.schema)
+        let preservedOCR = try await migrated.lexicalSearch(
+            query: "synthetischer OCR Text",
+            contentFilter: .documents
+        )
+        let preservedMail = try await migrated.lexicalSearch(
+            query: "synthetische Maildaten",
+            contentFilter: .emails
+        )
+        let vectorsAfter = try await migrated.vectorRows(
+            modelID: embedder.modelID,
+            modelVersion: embedder.modelVersion
+        ).count
+        #expect(!preservedOCR.isEmpty)
+        #expect(!preservedMail.isEmpty)
+        #expect(vectorsAfter == vectorsBefore)
+        #expect(try await migrated.databaseQuickCheck() == "ok")
+        #expect(try await migrated.databaseIntegrityCheck() == "ok")
+        try await migrated.checkpointAndClose()
+    }
+}
+
+@Test
+func interruptedSchemaMigrationRollsBackAndCanResumeCleanly() async throws {
+    let root = try syntheticTemporaryDirectory("migration-interrupted")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let databaseURL = root.appending(path: "Findora.sqlite3")
+    let current = SQLiteDatabase(url: databaseURL)
+    try await current.initialize()
+    try await current.checkpointAndClose()
+    try downgradeSyntheticDatabase(at: databaseURL, to: 10)
+    try executeSyntheticSQL(
+        "CREATE TABLE projects (id INTEGER PRIMARY KEY, sentinel TEXT)",
+        at: databaseURL
+    )
+
+    let interrupted = SQLiteDatabase(url: databaseURL)
+    await #expect(throws: Error.self) {
+        try await interrupted.initialize()
+    }
+    try? await interrupted.checkpointAndClose()
+    let versionAfterFailure = try syntheticScalarInt(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        at: databaseURL
+    )
+    #expect(versionAfterFailure == 10)
+    #expect(
+        try syntheticScalarInt(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='organizations'",
+            at: databaseURL
+        ) == 0
+    )
+
+    try executeSyntheticSQL("DROP TABLE projects", at: databaseURL)
+    let resumed = SQLiteDatabase(url: databaseURL)
+    try await resumed.initialize()
+    #expect(
+        try await resumed.databaseVersionSnapshot().schemaVersion
+            == FindoraAnalysisVersions.schema
+    )
+    #expect(try await resumed.databaseQuickCheck() == "ok")
+    #expect(try await resumed.databaseIntegrityCheck() == "ok")
+    try await resumed.checkpointAndClose()
+}
+
+@Test
+func incrementalAnalysisUpgradeOnlyFillsMissingGraphVersionsAndCanPause() async throws {
+    let root = try syntheticTemporaryDirectory("incremental-upgrade")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let databaseURL = root.appending(path: "Findora.sqlite3")
+    var database: SQLiteDatabase? = SQLiteDatabase(url: databaseURL)
+    try await database?.initialize()
+    let eml = root.appending(path: "upgrade.eml")
+    try syntheticGraphEML(
+        messageID: "upgrade@test.invalid",
+        subject: "PRJ-4001 Upgrade",
+        sender: "Upgrade Person <upgrade@synthetic-acme.test>",
+        recipients: "Findora Test <findora@example.invalid>",
+        body: "Nur fehlende lokale Analysen PRJ-4001"
+    ).write(to: eml)
+    _ = try await MailImportService(
+        database: try #require(database),
+        embedder: TokenHashEmbedding(dimensions: 64),
+        archiveRoot: root.appending(path: "Mail")
+    ).importSources(urls: [eml], importMode: .referenced) { _ in }
+    try await database?.checkpointAndClose()
+    database = nil
+    try executeSyntheticSQL(
+        """
+        UPDATE document_analysis_versions
+        SET people_analysis_version = NULL, project_analysis_version = NULL
+        WHERE document_id = (SELECT MIN(document_id) FROM document_analysis_versions)
+        """,
+        at: databaseURL
+    )
+
+    let reopened = SQLiteDatabase(url: databaseURL)
+    try await reopened.initialize()
+    let queued = try await reopened.prepareIncrementalAnalysisUpgrades()
+    #expect(queued == 2)
+    try await reopened.setAnalysisUpgradePaused(true)
+    #expect(try await reopened.runIncrementalAnalysisUpgradeBatch() == 0)
+    try await reopened.setAnalysisUpgradePaused(false)
+    #expect(try await reopened.runIncrementalAnalysisUpgradeBatch() == 2)
+    let snapshot = try await reopened.databaseVersionSnapshot()
+    #expect(snapshot.pendingUpgrades == 0)
+    #expect(
+        snapshot.versions.first(where: { $0.kind == .peopleAnalysis })?
+            .missingDocuments == 0
+    )
+    #expect(
+        snapshot.versions.first(where: { $0.kind == .projectAnalysis })?
+            .missingDocuments == 0
+    )
+    #expect(try await reopened.databaseQuickCheck() == "ok")
+    try await reopened.checkpointAndClose()
+}
+
+private func syntheticGraphEML(
+    messageID: String,
+    subject: String,
+    sender: String,
+    recipients: String,
+    body: String,
+    attachmentName: String? = nil,
+    attachmentData: Data? = nil
+) -> Data {
+    var message = """
+    Message-ID: <\(messageID)>
+    Subject: \(subject)
+    From: \(sender)
+    To: \(recipients)
+    Date: Sat, 26 Jul 2026 12:30:00 +0200
+    """
+    if let attachmentName, let attachmentData {
+        message += """
+
+        Content-Type: multipart/mixed; boundary="graph-boundary"
+
+        --graph-boundary
+        Content-Type: text/plain; charset=utf-8
+
+        \(body)
+        --graph-boundary
+        Content-Type: application/pdf; name="\(attachmentName)"
+        Content-Disposition: attachment; filename="\(attachmentName)"
+        Content-Transfer-Encoding: base64
+
+        \(attachmentData.base64EncodedString())
+        --graph-boundary--
+        """
+    } else {
+        message += """
+
+        Content-Type: text/plain; charset=utf-8
+
+        \(body)
+        """
+    }
+    return Data(message.replacingOccurrences(of: "\n", with: "\r\n").utf8)
+}
+
+private func downgradeSyntheticDatabase(at url: URL, to version: Int) throws {
+    precondition(version == 10 || version == 11)
+    var statements = [
+        "DROP TABLE IF EXISTS analysis_upgrade_jobs",
+        "DROP TABLE IF EXISTS document_analysis_versions"
+    ]
+    if version == 10 {
+        statements += [
+            "DROP TABLE IF EXISTS document_relations",
+            "DROP TABLE IF EXISTS mail_relations",
+            "DROP TABLE IF EXISTS project_email_links",
+            "DROP TABLE IF EXISTS project_document_links",
+            "DROP TABLE IF EXISTS communication_partner_email_links",
+            "DROP TABLE IF EXISTS communication_partner_aliases",
+            "DROP TABLE IF EXISTS projects",
+            "DROP TABLE IF EXISTS communication_partners",
+            "DROP TABLE IF EXISTS organizations"
+        ]
+    }
+    statements.append("DELETE FROM schema_migrations WHERE version > \(version)")
+    try executeSyntheticSQL(statements.joined(separator: ";"), at: url)
+}
+
+private func executeSyntheticSQL(_ sql: String, at url: URL) throws {
+    var connection: OpaquePointer?
+    guard sqlite3_open(url.path, &connection) == SQLITE_OK, let connection else {
+        throw FindoraError.database("Synthetische Testdatenbank konnte nicht geöffnet werden.")
+    }
+    defer { sqlite3_close(connection) }
+    var errorMessage: UnsafeMutablePointer<CChar>?
+    let result = sqlite3_exec(connection, sql, nil, nil, &errorMessage)
+    guard result == SQLITE_OK else {
+        let message = errorMessage.map { String(cString: $0) } ?? "SQLite-Testfehler"
+        sqlite3_free(errorMessage)
+        throw FindoraError.database(message)
+    }
+}
+
+private func syntheticScalarInt(_ sql: String, at url: URL) throws -> Int {
+    var connection: OpaquePointer?
+    guard sqlite3_open_v2(url.path, &connection, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+          let connection else {
+        throw FindoraError.database("Synthetische Testdatenbank konnte nicht gelesen werden.")
+    }
+    defer { sqlite3_close(connection) }
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(connection, sql, -1, &statement, nil) == SQLITE_OK,
+          let statement else {
+        throw FindoraError.database("Synthetische Testabfrage ist ungültig.")
+    }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_step(statement) == SQLITE_ROW else {
+        throw FindoraError.database("Synthetische Testabfrage lieferte keine Zeile.")
+    }
+    return Int(sqlite3_column_int64(statement, 0))
 }
 
 private func syntheticTemporaryDirectory(_ name: String) throws -> URL {

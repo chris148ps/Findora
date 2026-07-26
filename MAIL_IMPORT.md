@@ -29,6 +29,12 @@ einer Mail wird einmal gespeichert; mehrere Quellen erhalten eigene
 `email_source_links`. Anhänge werden vor Speicherung mit SHA-256 identifiziert,
 aber jede Mail-Anhang-Beziehung bleibt separat erhalten.
 
+Nach jedem Import aktualisiert Findora den lokalen Kommunikationsgraphen.
+Identische PDF-Anhänge werden über SHA-256 mit bereits vorhandenen PDFs
+verknüpft, ohne eine zweite Inhaltskopie anzulegen. Das gilt ebenso, wenn das
+PDF erst nach der Mail erscheint. Gleiche Dateinamen mit abweichendem Inhalt
+bleiben ausschließlich prüfbare Vorschläge.
+
 ## Referenzieren oder archivieren
 
 Vor dem Import zeigt Findora Quellanzahl, erkannte Dateien, Quellgröße und
@@ -59,4 +65,3 @@ Der Filter **Alle / Dokumente / E-Mails / Anhänge** wirkt bereits in FTS-,
 Dateinamen- und Vektorabfragen. Treffer tragen Typ, Betreff, Absender, Datum,
 Mailbox und bei Anhängen die zugehörige Mail. Die Quellenvalidierung bleibt
 fail-closed: Nur tatsächliche Suchergebnisse sind zitierbar.
-

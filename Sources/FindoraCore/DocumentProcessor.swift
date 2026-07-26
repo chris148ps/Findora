@@ -273,6 +273,9 @@ public actor DocumentProcessor {
             if removeMissingDocuments {
                 try await database.removeDocumentsWithoutActiveLocations()
             }
+            if completed > 0 {
+                try await database.refreshCommunicationGraph()
+            }
             await onProgress(Progress(currentFile: nil, completed: completed, total: files.count))
         } catch {
             try? await database.recordError(category: "Indexierung", message: error.localizedDescription)

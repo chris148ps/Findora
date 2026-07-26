@@ -178,6 +178,9 @@ Das Schema enthält:
 - `search_history`
 - `source_bookmarks`
 - `schema_migrations`
+- `organizations`, `communication_partners`, `projects`
+- `document_relations`, `mail_relations`
+- `document_analysis_versions`, `analysis_upgrade_jobs`
 
 Statuszähler werden nicht persistiert. `processing_jobs` liefert exklusive
 aktuelle Pfadzustände; `documents` und `pages.text_source` liefern die
@@ -193,6 +196,13 @@ den Pfad, ohne Chunks neu zu erzeugen.
 E-Mail-Identität, Quellenzuordnung und Anhangsidentität sind ebenfalls
 getrennt. `MailImportService` streamt Quellen; Mail, PDF und Anhang teilen
 sich Chunk-, FTS- und Embeddingpipeline.
+
+Migrationen 11 und 12 ergänzen den lokalen Kommunikationsgraphen sowie
+unabhängige Analyseversionen je Dokument. Fehlende Personen- und
+Projektanalysen werden inkrementell über fortsetzbare Jobs ergänzt; OCR,
+Embeddings und vollständige Neuindexierungen bleiben ausdrücklich gestartete
+Wartungsaktionen. Details stehen in `docs/COMMUNICATION_GRAPH.md` und
+`docs/DATABASE_MIGRATIONS.md`.
 
 Embeddings werden als normalisierte Float32-BLOBs in SQLite gespeichert.
 Version 1 verwendet eine in-process, blockweise Kosinus-Suche. Das ist

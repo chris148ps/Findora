@@ -69,6 +69,16 @@ Abgedeckt sind:
 - MIME/RFC-2047/HTML-Normalisierung und Anhangsdekodierung;
 - gestreamte MBOX und synthetischer Unicode-Outlook-MSG-Container;
 - Mail-/Anhangsdeduplizierung und PDF/E-Mail/Anhang-Suchfilter;
+- Mail zuerst/PDF später und PDF zuerst/Mail später;
+- identischer PDF-Anhang per SHA-256 sowie gleicher Dateiname mit
+  abweichendem Inhalt nur als Vorschlag;
+- mehrere Kontakte, Organisationen und Projekte, unsichere lokale
+  Ähnlichkeit und Partner-/Projektsuche;
+- Upgrade von Schema 10 und 11 ohne Verlust von Dokumenten, OCR, Mail oder
+  Embeddings;
+- transaktionaler Rollback und Fortsetzung nach unterbrochener Migration;
+- pausierbare inkrementelle Analyse-Upgrades sowie `quick_check` und
+  `integrity_check`;
 - sichere Speicherkopie, Hash-/SQLite-Prüfung, Umschaltung und Altbestand;
 - Richtlinien für im führenden Dokumentenordner entfernte PDFs.
 

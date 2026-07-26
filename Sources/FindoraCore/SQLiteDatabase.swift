@@ -1429,6 +1429,16 @@ public actor SQLiteDatabase {
                     .text(file.id)
                 ]
             )
+            try recordIndexedAnalysisVersions(
+                documentID: documentID,
+                ocrVersion: ocrPerformed
+                    ? FindoraAnalysisVersions.ocr
+                    : "not-required",
+                parserVersion: FindoraAnalysisVersions.parser,
+                embeddingModelID: embeddingModelID,
+                embeddingModelVersion: embeddingModelVersion,
+                now: now
+            )
             return documentID
         }
         publishStatusChange(.documentIndexed)
@@ -1510,6 +1520,7 @@ public actor SQLiteDatabase {
     }
 
     public func removeDocumentsWithoutActiveLocations() throws {
+        let before = try scalarInt64("SELECT COUNT(*) FROM documents")
         try transaction {
             try execute(
                 """
@@ -1549,6 +1560,10 @@ public actor SQLiteDatabase {
                   )
                 """
             )
+            let after = try scalarInt64("SELECT COUNT(*) FROM documents")
+            if after != before {
+                try refreshCommunicationGraphInTransaction()
+            }
         }
         publishStatusChange(.locationsChanged)
     }
@@ -1809,6 +1824,14 @@ public actor SQLiteDatabase {
                     indexedAt: now
                 )
             }
+            try recordIndexedAnalysisVersions(
+                documentID: documentID,
+                ocrVersion: "not-required",
+                parserVersion: FindoraAnalysisVersions.parser,
+                embeddingModelID: embeddingModelID,
+                embeddingModelVersion: embeddingModelVersion,
+                now: now
+            )
 
             try execute(
                 "DELETE FROM email_attachment_links WHERE email_id = ?",
@@ -1921,6 +1944,16 @@ public actor SQLiteDatabase {
                         indexedAt: now
                     )
                 }
+                if !indexed.chunks.isEmpty || existingChunks > 0 {
+                    try recordIndexedAnalysisVersions(
+                        documentID: attachmentDocumentID,
+                        ocrVersion: nil,
+                        parserVersion: FindoraAnalysisVersions.parser,
+                        embeddingModelID: embeddingModelID,
+                        embeddingModelVersion: embeddingModelVersion,
+                        now: now
+                    )
+                }
             }
         }
         publishStatusChange(.documentIndexed)
@@ -1996,6 +2029,7 @@ public actor SQLiteDatabase {
                     .integer(sourceID)
                 ]
             )
+            try refreshCommunicationGraphInTransaction()
         }
         publishStatusChange(.documentIndexed)
     }
@@ -2988,6 +3022,14 @@ public actor SQLiteDatabase {
                     "UPDATE documents SET last_indexed_at = ? WHERE id = ?",
                     bindings: [.real(now), .integer(index.document.documentID)]
                 )
+                try recordIndexedAnalysisVersions(
+                    documentID: index.document.documentID,
+                    ocrVersion: nil,
+                    parserVersion: FindoraAnalysisVersions.parser,
+                    embeddingModelID: embeddingModelID,
+                    embeddingModelVersion: embeddingModelVersion,
+                    now: now
+                )
             }
         }
         publishStatusChange(.embeddingsChanged)
@@ -3010,6 +3052,18 @@ public actor SQLiteDatabase {
                 SET ocr_status = 'pending',
                     last_successful_processing = NULL, last_indexed_at = NULL
                 """
+            )
+            try execute(
+                """
+                UPDATE document_analysis_versions
+                SET ocr_version = NULL,
+                    chunk_version = NULL,
+                    embedding_version = NULL,
+                    ai_analysis_version = NULL,
+                    summary_version = NULL,
+                    updated_at = ?
+                """,
+                bindings: [.real(now)]
             )
             try execute(
                 """
@@ -3325,6 +3379,1493 @@ public actor SQLiteDatabase {
         publishStatusChange(.processingPaused)
     }
 
+    public func refreshCommunicationGraph() throws {
+        try transaction {
+            try refreshCommunicationGraphInTransaction()
+        }
+        publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func databaseIntegrityCheck() throws -> String {
+        let rows = try query("PRAGMA integrity_check")
+        return rows.first?.values.values.compactMap {
+            if case .text(let value) = $0 { return value }
+            return nil
+        }.first ?? "unbekannt"
+    }
+
+    public func databaseVersionSnapshot(
+        embeddingModelID: String = "builtin-token-hash",
+        embeddingModelVersion: String = "1"
+    ) throws -> DatabaseVersionSnapshot {
+        let schemaRow = try query(
+            """
+            SELECT COALESCE(MAX(version), 0) AS version,
+                   MAX(applied_at) AS applied_at
+            FROM schema_migrations
+            """
+        ).first
+        let targets: [(DocumentAnalysisKind, String, String, Bool)] = [
+            (.ocr, FindoraAnalysisVersions.ocr, "ocr_version", true),
+            (.parser, FindoraAnalysisVersions.parser, "parser_version", false),
+            (.chunks, FindoraAnalysisVersions.chunks, "chunk_version", false),
+            (
+                .embeddings,
+                "\(embeddingModelID)@\(embeddingModelVersion)",
+                "embedding_version",
+                false
+            ),
+            (
+                .aiAnalysis,
+                FindoraAnalysisVersions.aiAnalysis,
+                "ai_analysis_version",
+                false
+            ),
+            (
+                .peopleAnalysis,
+                FindoraAnalysisVersions.peopleAnalysis,
+                "people_analysis_version",
+                false
+            ),
+            (
+                .projectAnalysis,
+                FindoraAnalysisVersions.projectAnalysis,
+                "project_analysis_version",
+                false
+            ),
+            (.summary, FindoraAnalysisVersions.summary, "summary_version", false)
+        ]
+        let versions = try targets.map { kind, target, column, acceptsNotRequired in
+            let currentCondition = acceptsNotRequired
+                ? "\(column) IN (?, 'not-required')"
+                : "\(column) = ?"
+            let row = try query(
+                """
+                SELECT
+                    SUM(CASE WHEN \(currentCondition) THEN 1 ELSE 0 END) AS current_count,
+                    SUM(CASE
+                        WHEN \(column) IS NOT NULL AND NOT (\(currentCondition))
+                        THEN 1 ELSE 0 END
+                    ) AS outdated_count,
+                    SUM(CASE WHEN \(column) IS NULL THEN 1 ELSE 0 END) AS missing_count
+                FROM documents d
+                LEFT JOIN document_analysis_versions v ON v.document_id = d.id
+                """
+                ,
+                bindings: [.text(target), .text(target)]
+            ).first
+            return AnalysisVersionCount(
+                kind: kind,
+                currentVersion: target,
+                currentDocuments: Int(row?.int64("current_count") ?? 0),
+                outdatedDocuments: Int(row?.int64("outdated_count") ?? 0),
+                missingDocuments: Int(row?.int64("missing_count") ?? 0)
+            )
+        }
+        return DatabaseVersionSnapshot(
+            schemaVersion: Int(schemaRow?.int64("version") ?? 0),
+            expectedSchemaVersion: FindoraAnalysisVersions.schema,
+            lastMigrationAt: schemaRow?.double("applied_at").map {
+                Date(timeIntervalSince1970: $0)
+            },
+            versions: versions,
+            pendingUpgrades: Int(try scalarInt64(
+                "SELECT COUNT(*) FROM analysis_upgrade_jobs WHERE state IN ('pending', 'running', 'paused')"
+            )),
+            failedUpgrades: Int(try scalarInt64(
+                "SELECT COUNT(*) FROM analysis_upgrade_jobs WHERE state = 'failed'"
+            )),
+            upgradePaused: try setting(key: "analysisUpgradePaused") == "1"
+        )
+    }
+
+    @discardableResult
+    public func prepareIncrementalAnalysisUpgrades() throws -> Int {
+        let now = Date().timeIntervalSince1970
+        try transaction {
+            let targets = [
+                (
+                    DocumentAnalysisKind.peopleAnalysis,
+                    FindoraAnalysisVersions.peopleAnalysis,
+                    "people_analysis_version"
+                ),
+                (
+                    DocumentAnalysisKind.projectAnalysis,
+                    FindoraAnalysisVersions.projectAnalysis,
+                    "project_analysis_version"
+                )
+            ]
+            for (kind, target, column) in targets {
+                try execute(
+                    """
+                    INSERT INTO analysis_upgrade_jobs (
+                        document_id, analysis_kind, target_version, state,
+                        attempt_count, created_at, updated_at
+                    )
+                    SELECT d.id, ?, ?, 'pending', 0, ?, ?
+                    FROM documents d
+                    LEFT JOIN document_analysis_versions v ON v.document_id = d.id
+                    WHERE v.\(column) IS NULL OR v.\(column) != ?
+                    ON CONFLICT(document_id, analysis_kind, target_version) DO UPDATE SET
+                        state = CASE
+                            WHEN analysis_upgrade_jobs.state = 'completed'
+                            THEN analysis_upgrade_jobs.state
+                            ELSE 'pending' END,
+                        updated_at = excluded.updated_at
+                    """,
+                    bindings: [
+                        .text(kind.rawValue), .text(target), .real(now),
+                        .real(now), .text(target)
+                    ]
+                )
+            }
+        }
+        return Int(try scalarInt64(
+            "SELECT COUNT(*) FROM analysis_upgrade_jobs WHERE state = 'pending'"
+        ))
+    }
+
+    @discardableResult
+    public func runIncrementalAnalysisUpgradeBatch(limit: Int = 100) throws -> Int {
+        guard try setting(key: "analysisUpgradePaused") != "1" else { return 0 }
+        return try transaction {
+            let rows = try query(
+                """
+                SELECT id, document_id, analysis_kind, target_version
+                FROM analysis_upgrade_jobs
+                WHERE state IN ('pending', 'paused')
+                ORDER BY updated_at, id
+                LIMIT ?
+                """,
+                bindings: [.integer(Int64(max(1, limit)))]
+            )
+            guard !rows.isEmpty else { return 0 }
+            let now = Date().timeIntervalSince1970
+            let jobIDs = rows.compactMap { $0.int64("id") }
+            let identifiers = jobIDs.map(String.init).joined(separator: ",")
+            try execute(
+                """
+                UPDATE analysis_upgrade_jobs
+                SET state = 'running', attempt_count = attempt_count + 1, updated_at = ?
+                WHERE id IN (\(identifiers))
+                """,
+                bindings: [.real(now)]
+            )
+            try refreshCommunicationGraphInTransaction()
+            for row in rows {
+                guard let jobID = row.int64("id"),
+                      let documentID = row.int64("document_id"),
+                      let kindRaw = row.string("analysis_kind"),
+                      let kind = DocumentAnalysisKind(rawValue: kindRaw),
+                      let target = row.string("target_version") else { continue }
+                let column: String
+                switch kind {
+                case .peopleAnalysis: column = "people_analysis_version"
+                case .projectAnalysis: column = "project_analysis_version"
+                default: continue
+                }
+                try ensureAnalysisVersionRow(documentID: documentID, now: now)
+                try execute(
+                    """
+                    UPDATE document_analysis_versions
+                    SET \(column) = ?, updated_at = ?
+                    WHERE document_id = ?
+                    """,
+                    bindings: [.text(target), .real(now), .integer(documentID)]
+                )
+                try execute(
+                    """
+                    UPDATE analysis_upgrade_jobs
+                    SET state = 'completed', last_error_category = NULL,
+                        updated_at = ?, completed_at = ?
+                    WHERE id = ?
+                    """,
+                    bindings: [.real(now), .real(now), .integer(jobID)]
+                )
+            }
+            return rows.count
+        }
+    }
+
+    public func setAnalysisUpgradePaused(_ paused: Bool) throws {
+        try transaction {
+            try setSetting(key: "analysisUpgradePaused", value: paused ? "1" : "0")
+            try execute(
+                """
+                UPDATE analysis_upgrade_jobs
+                SET state = ?, updated_at = ?
+                WHERE state IN ('pending', 'paused', 'running')
+                """,
+                bindings: [
+                    .text(paused ? AnalysisUpgradeState.paused.rawValue
+                                 : AnalysisUpgradeState.pending.rawValue),
+                    .real(Date().timeIntervalSince1970)
+                ]
+            )
+        }
+        publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func communicationPartners() throws -> [CommunicationPartner] {
+        try communicationPartners(ids: nil)
+    }
+
+    public func organizations() throws -> [Organization] {
+        try query(
+            """
+            SELECT o.id, o.canonical_name, o.email_domain,
+                   COUNT(p.id) AS partner_count
+            FROM organizations o
+            LEFT JOIN communication_partners p ON p.organization_id = o.id
+            GROUP BY o.id
+            ORDER BY lower(o.canonical_name)
+            """
+        ).compactMap { row in
+            guard let id = row.int64("id"),
+                  let name = row.string("canonical_name"),
+                  let count = row.int64("partner_count") else { return nil }
+            return Organization(
+                id: id,
+                name: name,
+                domain: row.string("email_domain"),
+                partnerCount: Int(count)
+            )
+        }
+    }
+
+    public func communicationProjects() throws -> [CommunicationProject] {
+        try communicationProjects(ids: nil)
+    }
+
+    public func communicationGraphStatistics() throws -> CommunicationGraphStatistics {
+        CommunicationGraphStatistics(
+            partners: Int(try scalarInt64("SELECT COUNT(*) FROM communication_partners")),
+            organizations: Int(try scalarInt64("SELECT COUNT(*) FROM organizations")),
+            projects: Int(try scalarInt64("SELECT COUNT(*) FROM projects")),
+            automaticLinks: Int(try scalarInt64(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM mail_relations WHERE relation_status IN ('automatic', 'confirmed'))
+                    + (SELECT COUNT(*) FROM document_relations WHERE relation_status IN ('automatic', 'confirmed'))
+                """
+            )),
+            suggestions: Int(try scalarInt64(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM mail_relations WHERE relation_status = 'suggested')
+                    + (SELECT COUNT(*) FROM document_relations WHERE relation_status = 'suggested')
+                """
+            ))
+        )
+    }
+
+    public func communicationGraphContext(
+        documentID: Int64
+    ) throws -> CommunicationGraphContext {
+        let partnerRows = try query(
+            """
+            WITH related_emails(email_id) AS (
+                SELECT id FROM emails WHERE document_id = ?
+                UNION
+                SELECT al.email_id
+                FROM email_attachments a
+                JOIN email_attachment_links al ON al.attachment_id = a.id
+                WHERE a.document_id = ?
+                UNION
+                SELECT email_id FROM mail_relations WHERE document_id = ?
+                UNION
+                SELECT related_email_id
+                FROM mail_relations
+                WHERE email_id IN (SELECT id FROM emails WHERE document_id = ?)
+                  AND related_email_id IS NOT NULL
+            )
+            SELECT DISTINCT pel.partner_id
+            FROM communication_partner_email_links pel
+            WHERE pel.email_id IN (SELECT email_id FROM related_emails)
+            """,
+            bindings: [
+                .integer(documentID), .integer(documentID),
+                .integer(documentID), .integer(documentID)
+            ]
+        )
+        let partnerIDs = Set(partnerRows.compactMap { $0.int64("partner_id") })
+
+        let projectRows = try query(
+            """
+            SELECT DISTINCT project_id FROM project_document_links WHERE document_id = ?
+            UNION
+            SELECT DISTINCT pel.project_id
+            FROM project_email_links pel
+            WHERE pel.email_id IN (
+                SELECT id FROM emails WHERE document_id = ?
+                UNION
+                SELECT al.email_id
+                FROM email_attachments a
+                JOIN email_attachment_links al ON al.attachment_id = a.id
+                WHERE a.document_id = ?
+                UNION
+                SELECT email_id FROM mail_relations WHERE document_id = ?
+            )
+            """,
+            bindings: [
+                .integer(documentID), .integer(documentID),
+                .integer(documentID), .integer(documentID)
+            ]
+        )
+        let projectIDs = Set(projectRows.compactMap { $0.int64("project_id") })
+
+        let emailLinks = try query(
+            """
+            SELECT mr.id, e.document_id, e.subject,
+                   COALESCE(e.sender_address, '') AS sender,
+                   mr.relation_kind, mr.relation_status, mr.confidence
+            FROM mail_relations mr
+            JOIN emails e ON e.id = mr.email_id
+            WHERE mr.document_id = ?
+            UNION ALL
+            SELECT mr.id, related.document_id, related.subject,
+                   COALESCE(related.sender_address, ''),
+                   mr.relation_kind, mr.relation_status, mr.confidence
+            FROM emails source
+            JOIN mail_relations mr ON mr.email_id = source.id
+            JOIN emails related ON related.id = mr.related_email_id
+            WHERE source.document_id = ?
+            """,
+            bindings: [.integer(documentID), .integer(documentID)]
+        ).compactMap(Self.graphLink)
+
+        let documentLinks = try query(
+            """
+            SELECT dr.id, other.id AS document_id,
+                   COALESCE(l.file_name, a.canonical_file_name, 'Dokument') AS subject,
+                   COALESCE(l.relative_path, a.mime_type, '') AS sender,
+                   dr.relation_kind, dr.relation_status, dr.confidence
+            FROM document_relations dr
+            JOIN documents other
+              ON other.id = CASE
+                  WHEN dr.document_id = ? THEN dr.related_document_id
+                  ELSE dr.document_id
+              END
+            LEFT JOIN document_locations l
+              ON l.document_id = other.id AND l.deleted_at IS NULL
+            LEFT JOIN email_attachments a ON a.document_id = other.id
+            WHERE dr.document_id = ? OR dr.related_document_id = ?
+            UNION ALL
+            SELECT mr.id, linked.id,
+                   COALESCE(l.file_name, a.canonical_file_name, 'Dokument'),
+                   COALESCE(l.relative_path, a.mime_type, ''),
+                   mr.relation_kind, mr.relation_status, mr.confidence
+            FROM emails source
+            JOIN mail_relations mr
+              ON mr.email_id = source.id AND mr.document_id IS NOT NULL
+            JOIN documents linked ON linked.id = mr.document_id
+            LEFT JOIN document_locations l
+              ON l.document_id = linked.id AND l.deleted_at IS NULL
+            LEFT JOIN email_attachments a ON a.document_id = linked.id
+            WHERE source.document_id = ?
+            """,
+            bindings: [
+                .integer(documentID), .integer(documentID),
+                .integer(documentID), .integer(documentID)
+            ]
+        ).compactMap(Self.graphLink)
+
+        return CommunicationGraphContext(
+            partners: try communicationPartners(ids: partnerIDs),
+            projects: try communicationProjects(ids: projectIDs),
+            linkedEmails: emailLinks,
+            linkedDocuments: documentLinks
+        )
+    }
+
+    public func communicationGraphSearch(
+        query searchText: String,
+        contentFilter: SearchContentFilter = .all,
+        limit: Int = 60
+    ) throws -> [SearchSource] {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let escaped = trimmed
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        let pattern = "%\(escaped)%"
+        let rows = try query(
+            """
+            WITH matched_partners(id) AS (
+                SELECT DISTINCT p.id
+                FROM communication_partners p
+                LEFT JOIN communication_partner_aliases a ON a.partner_id = p.id
+                LEFT JOIN organizations o ON o.id = p.organization_id
+                WHERE lower(p.canonical_name) LIKE lower(?) ESCAPE '\\'
+                   OR lower(p.primary_address) LIKE lower(?) ESCAPE '\\'
+                   OR lower(COALESCE(a.display_name, '')) LIKE lower(?) ESCAPE '\\'
+                   OR lower(a.address) LIKE lower(?) ESCAPE '\\'
+                   OR lower(COALESCE(o.canonical_name, '')) LIKE lower(?) ESCAPE '\\'
+            ),
+            matched_projects(id) AS (
+                SELECT id FROM projects
+                WHERE lower(canonical_name) LIKE lower(?) ESCAPE '\\'
+                   OR lower(reference_key) LIKE lower(?) ESCAPE '\\'
+            ),
+            matched_emails(id) AS (
+                SELECT DISTINCT pel.email_id
+                FROM communication_partner_email_links pel
+                WHERE pel.partner_id IN (SELECT id FROM matched_partners)
+                UNION
+                SELECT email_id FROM project_email_links
+                WHERE project_id IN (SELECT id FROM matched_projects)
+            ),
+            matched_documents(id) AS (
+                SELECT document_id FROM emails WHERE id IN (SELECT id FROM matched_emails)
+                UNION
+                SELECT a.document_id
+                FROM email_attachment_links al
+                JOIN email_attachments a ON a.id = al.attachment_id
+                WHERE al.email_id IN (SELECT id FROM matched_emails)
+                UNION
+                SELECT document_id FROM mail_relations
+                WHERE email_id IN (SELECT id FROM matched_emails)
+                  AND document_id IS NOT NULL
+                UNION
+                SELECT document_id FROM project_document_links
+                WHERE project_id IN (SELECT id FROM matched_projects)
+            )
+            SELECT c.document_id, c.id AS chunk_id, c.page_number, c.chunk_text,
+                   m.file_name, m.absolute_path, m.relative_path, m.content_type,
+                   m.mail_subject, m.mail_sender, m.mail_date, m.mailbox,
+                   m.parent_email_subject, m.parent_email_sender,
+                   m.parent_email_date
+            FROM search_source_metadata m
+            JOIN chunks c ON c.id = (
+                SELECT first_chunk.id FROM chunks first_chunk
+                WHERE first_chunk.document_id = m.document_id
+                ORDER BY first_chunk.page_number, first_chunk.ordinal LIMIT 1
+            )
+            WHERE m.document_id IN (SELECT id FROM matched_documents)
+              AND \(Self.contentFilterSQL(contentFilter, alias: "m"))
+            GROUP BY m.document_id
+            ORDER BY m.file_name
+            LIMIT ?
+            """,
+            bindings: [
+                .text(pattern), .text(pattern), .text(pattern), .text(pattern),
+                .text(pattern), .text(pattern), .text(pattern), .integer(Int64(limit))
+            ]
+        )
+        return rows.enumerated().compactMap { index, row in
+            guard let source = Self.source(row: row, score: 1 / Double(index + 1)) else {
+                return nil
+            }
+            return SearchSource(
+                id: source.id,
+                documentID: source.documentID,
+                chunkID: source.chunkID,
+                fileName: source.fileName,
+                absolutePath: source.absolutePath,
+                relativePath: source.relativePath,
+                pageNumber: source.pageNumber,
+                excerpt: source.excerpt,
+                score: source.score,
+                reason: "Über einen lokalen Kommunikationspartner oder ein Projekt verknüpft.",
+                contentType: source.contentType,
+                mailSubject: source.mailSubject,
+                mailSender: source.mailSender,
+                mailDate: source.mailDate,
+                mailbox: source.mailbox,
+                parentEmailSubject: source.parentEmailSubject,
+                parentEmailSender: source.parentEmailSender,
+                parentEmailDate: source.parentEmailDate
+            )
+        }
+    }
+
+    private func communicationPartners(
+        ids: Set<Int64>?
+    ) throws -> [CommunicationPartner] {
+        if let ids, ids.isEmpty { return [] }
+        let filter = ids.map {
+            "WHERE p.id IN (\($0.sorted().map(String.init).joined(separator: ",")))"
+        } ?? ""
+        let rows = try query(
+            """
+            SELECT p.id, p.canonical_name, p.primary_address, p.last_activity_at,
+                   o.canonical_name AS organization_name,
+                   GROUP_CONCAT(DISTINCT a.address) AS aliases,
+                   COUNT(DISTINCT pel.email_id) AS email_count,
+                   COUNT(DISTINCT CASE
+                       WHEN (att.mime_type = 'application/pdf' OR d.content_type = 'pdf')
+                       THEN COALESCE(att.document_id, mr.document_id)
+                   END) AS pdf_count,
+                   COUNT(DISTINCT CASE
+                       WHEN lower(COALESCE(att.canonical_file_name, l.file_name, ''))
+                            LIKE '%angebot%'
+                         OR lower(COALESCE(att.canonical_file_name, l.file_name, ''))
+                            LIKE '%offer%'
+                       THEN COALESCE(att.document_id, mr.document_id)
+                   END) AS offer_count,
+                   COUNT(DISTINCT CASE
+                       WHEN lower(COALESCE(att.canonical_file_name, l.file_name, ''))
+                            LIKE '%rechnung%'
+                         OR lower(COALESCE(att.canonical_file_name, l.file_name, ''))
+                            LIKE '%invoice%'
+                       THEN COALESCE(att.document_id, mr.document_id)
+                   END) AS invoice_count,
+                   COUNT(DISTINCT CASE
+                       WHEN att.mime_type LIKE 'image/%' THEN att.document_id
+                   END) AS image_count
+            FROM communication_partners p
+            LEFT JOIN organizations o ON o.id = p.organization_id
+            LEFT JOIN communication_partner_aliases a ON a.partner_id = p.id
+            LEFT JOIN communication_partner_email_links pel ON pel.partner_id = p.id
+            LEFT JOIN email_attachment_links al ON al.email_id = pel.email_id
+            LEFT JOIN email_attachments att ON att.id = al.attachment_id
+            LEFT JOIN mail_relations mr
+              ON mr.email_id = pel.email_id AND mr.document_id IS NOT NULL
+            LEFT JOIN documents d ON d.id = mr.document_id
+            LEFT JOIN document_locations l
+              ON l.document_id = mr.document_id AND l.deleted_at IS NULL
+            \(filter)
+            GROUP BY p.id
+            ORDER BY COALESCE(p.last_activity_at, 0) DESC, lower(p.canonical_name)
+            """
+        )
+        return rows.compactMap { row in
+            guard let id = row.int64("id"),
+                  let name = row.string("canonical_name"),
+                  let address = row.string("primary_address"),
+                  let emails = row.int64("email_count"),
+                  let pdfs = row.int64("pdf_count"),
+                  let offers = row.int64("offer_count"),
+                  let invoices = row.int64("invoice_count"),
+                  let images = row.int64("image_count") else { return nil }
+            let aliases = row.string("aliases")?
+                .split(separator: ",").map(String.init).sorted() ?? []
+            return CommunicationPartner(
+                id: id,
+                displayName: name,
+                primaryAddress: address,
+                aliasAddresses: aliases,
+                organizationName: row.string("organization_name"),
+                emailCount: Int(emails),
+                pdfCount: Int(pdfs),
+                offerCount: Int(offers),
+                invoiceCount: Int(invoices),
+                imageCount: Int(images),
+                lastActivity: row.double("last_activity_at").map {
+                    Date(timeIntervalSince1970: $0)
+                }
+            )
+        }
+    }
+
+    private func communicationProjects(
+        ids: Set<Int64>?
+    ) throws -> [CommunicationProject] {
+        if let ids, ids.isEmpty { return [] }
+        let filter = ids.map {
+            "WHERE p.id IN (\($0.sorted().map(String.init).joined(separator: ",")))"
+        } ?? ""
+        let rows = try query(
+            """
+            SELECT p.id, p.canonical_name, p.reference_key, p.relation_status,
+                   p.confidence, p.last_activity_at,
+                   COUNT(DISTINCT pel.email_id) AS email_count,
+                   COUNT(DISTINCT pdl.document_id) AS document_count,
+                   GROUP_CONCAT(DISTINCT cp.canonical_name) AS partner_names
+            FROM projects p
+            LEFT JOIN project_email_links pel ON pel.project_id = p.id
+            LEFT JOIN project_document_links pdl ON pdl.project_id = p.id
+            LEFT JOIN communication_partner_email_links cpel
+              ON cpel.email_id = pel.email_id
+            LEFT JOIN communication_partners cp ON cp.id = cpel.partner_id
+            \(filter)
+            GROUP BY p.id
+            ORDER BY COALESCE(p.last_activity_at, 0) DESC, lower(p.canonical_name)
+            """
+        )
+        return rows.compactMap { row in
+            guard let id = row.int64("id"),
+                  let name = row.string("canonical_name"),
+                  let reference = row.string("reference_key"),
+                  let statusRaw = row.string("relation_status"),
+                  let status = GraphRelationStatus(rawValue: statusRaw),
+                  let confidence = row.double("confidence"),
+                  let emailCount = row.int64("email_count"),
+                  let documentCount = row.int64("document_count") else { return nil }
+            return CommunicationProject(
+                id: id,
+                name: name,
+                reference: reference,
+                status: status,
+                confidence: confidence,
+                emailCount: Int(emailCount),
+                documentCount: Int(documentCount),
+                partnerNames: row.string("partner_names")?
+                    .split(separator: ",").map(String.init).sorted() ?? [],
+                lastActivity: row.double("last_activity_at").map {
+                    Date(timeIntervalSince1970: $0)
+                }
+            )
+        }
+    }
+
+    private static func graphLink(_ row: SQLiteRow) -> GraphLink? {
+        guard let id = row.int64("id"),
+              let title = row.string("subject"),
+              let subtitle = row.string("sender"),
+              let kindRaw = row.string("relation_kind"),
+              let kind = GraphRelationKind(rawValue: kindRaw),
+              let statusRaw = row.string("relation_status"),
+              let status = GraphRelationStatus(rawValue: statusRaw),
+              let confidence = row.double("confidence") else { return nil }
+        return GraphLink(
+            id: "\(kindRaw)-\(id)-\(row.int64("document_id") ?? 0)",
+            title: title,
+            subtitle: subtitle,
+            documentID: row.int64("document_id"),
+            kind: kind,
+            status: status,
+            confidence: confidence
+        )
+    }
+
+    private struct GraphEmailRecord {
+        let id: Int64
+        let documentID: Int64
+        let subject: String
+        let text: String
+        let conversationID: String?
+        let activity: Double
+        let references: Set<String>
+        let tokens: Set<String>
+        let embedding: GraphEmbedding?
+    }
+
+    private struct GraphDocumentRecord {
+        let id: Int64
+        let fileName: String
+        let text: String
+        let activity: Double
+        let references: Set<String>
+        let tokens: Set<String>
+        let embedding: GraphEmbedding?
+    }
+
+    private struct GraphEmbedding {
+        let modelID: String
+        let modelVersion: String
+        let vector: [Float]
+    }
+
+    private func refreshCommunicationGraphInTransaction() throws {
+        let now = Date().timeIntervalSince1970
+        try execute("DELETE FROM communication_partner_email_links")
+
+        let addressRows = try query(
+            """
+            SELECT r.email_id, r.role, r.display_name, r.address,
+                   COALESCE(e.sent_at, e.received_at, e.imported_at) AS activity
+            FROM email_recipients r
+            JOIN emails e ON e.id = r.email_id
+            WHERE trim(r.address) != ''
+            """
+        )
+        for row in addressRows {
+            guard let emailID = row.int64("email_id"),
+                  let role = row.string("role"),
+                  let address = row.string("address"),
+                  let activity = row.double("activity") else { continue }
+            let normalized = Self.normalizedEmailAddress(address)
+            guard !normalized.isEmpty else { continue }
+            let displayName = Self.partnerDisplayName(
+                row.string("display_name"),
+                address: normalized
+            )
+            let organizationID = try organizationID(
+                for: normalized,
+                now: now
+            )
+            try execute(
+                """
+                INSERT INTO communication_partners (
+                    organization_id, canonical_name, primary_address,
+                    last_activity_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(primary_address) DO UPDATE SET
+                    organization_id = COALESCE(excluded.organization_id, organization_id),
+                    canonical_name = CASE
+                        WHEN length(excluded.canonical_name) > length(canonical_name)
+                        THEN excluded.canonical_name ELSE canonical_name END,
+                    last_activity_at = MAX(
+                        COALESCE(last_activity_at, 0),
+                        excluded.last_activity_at
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    organizationID.map(SQLiteValue.integer) ?? .null,
+                    .text(displayName), .text(normalized), .real(activity),
+                    .real(now), .real(now)
+                ]
+            )
+            let partnerID = try scalarInt64(
+                "SELECT id FROM communication_partners WHERE primary_address = ?",
+                bindings: [.text(normalized)]
+            )
+            try execute(
+                """
+                INSERT INTO communication_partner_aliases (
+                    partner_id, display_name, address, normalized_address, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(normalized_address) DO UPDATE SET
+                    partner_id = excluded.partner_id,
+                    display_name = COALESCE(excluded.display_name, display_name),
+                    address = excluded.address
+                """,
+                bindings: [
+                    .integer(partnerID),
+                    row.string("display_name").map(SQLiteValue.text) ?? .null,
+                    .text(address), .text(normalized), .real(now)
+                ]
+            )
+            try execute(
+                """
+                INSERT OR IGNORE INTO communication_partner_email_links
+                    (partner_id, email_id, role)
+                VALUES (?, ?, ?)
+                """,
+                bindings: [.integer(partnerID), .integer(emailID), .text(role)]
+            )
+        }
+        try execute(
+            """
+            DELETE FROM communication_partners
+            WHERE NOT EXISTS (
+                SELECT 1 FROM communication_partner_email_links l
+                WHERE l.partner_id = communication_partners.id
+            )
+            """
+        )
+        try execute(
+            """
+            DELETE FROM organizations
+            WHERE NOT EXISTS (
+                SELECT 1 FROM communication_partners p
+                WHERE p.organization_id = organizations.id
+            )
+            """
+        )
+
+        try execute(
+            "DELETE FROM mail_relations WHERE relation_status IN ('automatic', 'suggested')"
+        )
+        try execute(
+            "DELETE FROM document_relations WHERE relation_status IN ('automatic', 'suggested')"
+        )
+        try execute(
+            "DELETE FROM project_email_links WHERE relation_status IN ('automatic', 'suggested')"
+        )
+        try execute(
+            "DELETE FROM project_document_links WHERE relation_status IN ('automatic', 'suggested')"
+        )
+        try execute(
+            """
+            DELETE FROM projects
+            WHERE relation_status IN ('automatic', 'suggested')
+              AND NOT EXISTS (
+                  SELECT 1 FROM project_email_links pel WHERE pel.project_id = projects.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM project_document_links pdl WHERE pdl.project_id = projects.id
+              )
+            """
+        )
+
+        try execute(
+            """
+            INSERT OR IGNORE INTO mail_relations (
+                email_id, related_email_id, document_id, relation_kind,
+                relation_status, confidence, evidence_summary, created_at, updated_at
+            )
+            SELECT DISTINCT al.email_id, NULL, a.document_id,
+                   'identicalAttachment', 'automatic', 1.0,
+                   'SHA-256 des Mail-Anhangs und des Dokuments sind identisch.',
+                   ?, ?
+            FROM email_attachment_links al
+            JOIN email_attachments a ON a.id = al.attachment_id
+            """,
+            bindings: [.real(now), .real(now)]
+        )
+        try execute(
+            """
+            INSERT OR IGNORE INTO mail_relations (
+                email_id, related_email_id, document_id, relation_kind,
+                relation_status, confidence, evidence_summary, created_at, updated_at
+            )
+            SELECT a.id, b.id, NULL, 'sameConversation', 'automatic', 0.98,
+                   'Beide Nachrichten besitzen dieselbe lokale Unterhaltungskennung.',
+                   ?, ?
+            FROM emails a
+            JOIN emails b ON b.id > a.id
+              AND a.conversation_id IS NOT NULL
+              AND trim(a.conversation_id) != ''
+              AND b.conversation_id = a.conversation_id
+            """,
+            bindings: [.real(now), .real(now)]
+        )
+
+        let emails = try graphEmailRecords()
+        let documents = try graphDocumentRecords()
+        for email in emails {
+            for document in documents where document.id != email.documentID {
+                let sharedReferences = email.references.intersection(document.references)
+                if let reference = sharedReferences.sorted().first {
+                    try upsertMailDocumentRelation(
+                        emailID: email.id,
+                        documentID: document.id,
+                        kind: .sharedProjectReference,
+                        status: .automatic,
+                        confidence: 0.96,
+                        evidence: "Gemeinsame Projektreferenz: \(reference)",
+                        now: now
+                    )
+                } else {
+                    let similarity = Self.jaccard(email.tokens, document.tokens)
+                    if similarity >= 0.62 {
+                        try upsertMailDocumentRelation(
+                            emailID: email.id,
+                            documentID: document.id,
+                            kind: .contentSimilarity,
+                            status: .automatic,
+                            confidence: min(0.92, similarity),
+                            evidence: "Hohe lokale Textähnlichkeit.",
+                            now: now
+                        )
+                    } else if similarity >= 0.18 {
+                        try upsertMailDocumentRelation(
+                            emailID: email.id,
+                            documentID: document.id,
+                            kind: .contentSimilarity,
+                            status: .suggested,
+                            confidence: min(0.61, similarity + 0.20),
+                            evidence: "Mögliche lokale Textähnlichkeit; manuelle Prüfung empfohlen.",
+                            now: now
+                        )
+                    }
+                    if let semantic = Self.graphCosine(
+                        email.embedding,
+                        document.embedding
+                    ), semantic >= 0.42 {
+                        try upsertMailDocumentRelation(
+                            emailID: email.id,
+                            documentID: document.id,
+                            kind: .localSemantic,
+                            status: .suggested,
+                            confidence: min(0.79, semantic),
+                            evidence: "Lokale Embeddings deuten auf einen möglichen Zusammenhang hin.",
+                            now: now
+                        )
+                    }
+                }
+            }
+        }
+
+        try insertFileNameSuggestions(now: now)
+        try rebuildProjects(emails: emails, documents: documents, now: now)
+        try rebuildSuggestedProjects(now: now)
+        try rebuildDocumentRelations(now: now)
+        try markCommunicationAnalysisVersionsInTransaction(now: now)
+    }
+
+    private func organizationID(for address: String, now: Double) throws -> Int64? {
+        guard let domain = address.split(separator: "@", maxSplits: 1).last.map(String.init),
+              domain.contains("."),
+              !Self.freeMailDomains.contains(domain) else { return nil }
+        let organizationName = domain
+            .split(separator: ".").first.map(String.init)?
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized ?? domain
+        try execute(
+            """
+            INSERT INTO organizations (
+                canonical_name, email_domain, created_at, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(email_domain) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            bindings: [.text(organizationName), .text(domain), .real(now), .real(now)]
+        )
+        return try scalarInt64(
+            "SELECT id FROM organizations WHERE email_domain = ?",
+            bindings: [.text(domain)]
+        )
+    }
+
+    private func ensureAnalysisVersionRow(documentID: Int64, now: Double) throws {
+        try execute(
+            """
+            INSERT OR IGNORE INTO document_analysis_versions (document_id, updated_at)
+            VALUES (?, ?)
+            """,
+            bindings: [.integer(documentID), .real(now)]
+        )
+    }
+
+    private func recordIndexedAnalysisVersions(
+        documentID: Int64,
+        ocrVersion: String?,
+        parserVersion: String,
+        embeddingModelID: String,
+        embeddingModelVersion: String,
+        now: Double
+    ) throws {
+        try ensureAnalysisVersionRow(documentID: documentID, now: now)
+        try execute(
+            """
+            UPDATE document_analysis_versions
+            SET ocr_version = COALESCE(?, ocr_version),
+                parser_version = ?,
+                chunk_version = ?,
+                embedding_version = ?,
+                updated_at = ?
+            WHERE document_id = ?
+            """,
+            bindings: [
+                ocrVersion.map(SQLiteValue.text) ?? .null,
+                .text(parserVersion),
+                .text(FindoraAnalysisVersions.chunks),
+                .text("\(embeddingModelID)@\(embeddingModelVersion)"),
+                .real(now),
+                .integer(documentID)
+            ]
+        )
+    }
+
+    private func markCommunicationAnalysisVersionsInTransaction(now: Double) throws {
+        let exists = try scalarInt64(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name = 'document_analysis_versions'
+            """
+        ) > 0
+        guard exists else { return }
+        try execute(
+            """
+            INSERT OR IGNORE INTO document_analysis_versions (document_id, updated_at)
+            SELECT id, ? FROM documents
+            """,
+            bindings: [.real(now)]
+        )
+        try execute(
+            """
+            UPDATE document_analysis_versions
+            SET people_analysis_version = ?,
+                project_analysis_version = ?,
+                updated_at = ?
+            """,
+            bindings: [
+                .text(FindoraAnalysisVersions.peopleAnalysis),
+                .text(FindoraAnalysisVersions.projectAnalysis),
+                .real(now)
+            ]
+        )
+    }
+
+    private func graphEmailRecords() throws -> [GraphEmailRecord] {
+        try query(
+            """
+            SELECT id, document_id, subject, normalized_text, conversation_id,
+                   COALESCE(sent_at, received_at, imported_at) AS activity,
+                   (
+                       SELECT ce.model_id
+                       FROM chunks c
+                       JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+                       WHERE c.document_id = emails.document_id
+                       ORDER BY c.page_number, c.ordinal LIMIT 1
+                   ) AS embedding_model_id,
+                   (
+                       SELECT ce.model_version
+                       FROM chunks c
+                       JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+                       WHERE c.document_id = emails.document_id
+                       ORDER BY c.page_number, c.ordinal LIMIT 1
+                   ) AS embedding_model_version,
+                   (
+                       SELECT ce.vector
+                       FROM chunks c
+                       JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+                       WHERE c.document_id = emails.document_id
+                       ORDER BY c.page_number, c.ordinal LIMIT 1
+                   ) AS embedding_vector
+            FROM emails
+            """
+        ).compactMap { row in
+            guard let id = row.int64("id"),
+                  let documentID = row.int64("document_id"),
+                  let subject = row.string("subject"),
+                  let text = row.string("normalized_text"),
+                  let activity = row.double("activity") else { return nil }
+            let combined = "\(subject)\n\(text)"
+            return GraphEmailRecord(
+                id: id,
+                documentID: documentID,
+                subject: subject,
+                text: text,
+                conversationID: row.string("conversation_id"),
+                activity: activity,
+                references: Self.projectReferences(in: combined),
+                tokens: Self.graphTokens(in: combined),
+                embedding: Self.graphEmbedding(row)
+            )
+        }
+    }
+
+    private func graphDocumentRecords() throws -> [GraphDocumentRecord] {
+        try query(
+            """
+            SELECT d.id, COALESCE(MIN(l.file_name), MIN(a.canonical_file_name), 'Dokument')
+                       AS file_name,
+                   COALESCE(GROUP_CONCAT(DISTINCT c.chunk_text), '') AS document_text,
+                   COALESCE(MAX(l.modified_at), MAX(d.last_indexed_at), 0) AS activity,
+                   (
+                       SELECT ce.model_id
+                       FROM chunks first_chunk
+                       JOIN chunk_embeddings ce ON ce.chunk_id = first_chunk.id
+                       WHERE first_chunk.document_id = d.id
+                       ORDER BY first_chunk.page_number, first_chunk.ordinal LIMIT 1
+                   ) AS embedding_model_id,
+                   (
+                       SELECT ce.model_version
+                       FROM chunks first_chunk
+                       JOIN chunk_embeddings ce ON ce.chunk_id = first_chunk.id
+                       WHERE first_chunk.document_id = d.id
+                       ORDER BY first_chunk.page_number, first_chunk.ordinal LIMIT 1
+                   ) AS embedding_model_version,
+                   (
+                       SELECT ce.vector
+                       FROM chunks first_chunk
+                       JOIN chunk_embeddings ce ON ce.chunk_id = first_chunk.id
+                       WHERE first_chunk.document_id = d.id
+                       ORDER BY first_chunk.page_number, first_chunk.ordinal LIMIT 1
+                   ) AS embedding_vector
+            FROM documents d
+            LEFT JOIN document_locations l
+              ON l.document_id = d.id AND l.deleted_at IS NULL
+            LEFT JOIN email_attachments a ON a.document_id = d.id
+            LEFT JOIN chunks c ON c.document_id = d.id
+            WHERE d.content_type != 'email'
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM document_locations active
+                      WHERE active.document_id = d.id AND active.deleted_at IS NULL
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM email_attachments attached
+                      WHERE attached.document_id = d.id
+                  )
+              )
+            GROUP BY d.id
+            """
+        ).compactMap { row in
+            guard let id = row.int64("id"),
+                  let fileName = row.string("file_name"),
+                  let text = row.string("document_text"),
+                  let activity = row.double("activity") else { return nil }
+            let combined = "\(fileName)\n\(text)"
+            return GraphDocumentRecord(
+                id: id,
+                fileName: fileName,
+                text: text,
+                activity: activity,
+                references: Self.projectReferences(in: combined),
+                tokens: Self.graphTokens(in: combined),
+                embedding: Self.graphEmbedding(row)
+            )
+        }
+    }
+
+    private func upsertMailDocumentRelation(
+        emailID: Int64,
+        documentID: Int64,
+        kind: GraphRelationKind,
+        status: GraphRelationStatus,
+        confidence: Double,
+        evidence: String,
+        now: Double
+    ) throws {
+        try execute(
+            """
+            INSERT INTO mail_relations (
+                email_id, related_email_id, document_id, relation_kind,
+                relation_status, confidence, evidence_summary, created_at, updated_at
+            ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO UPDATE SET
+                relation_status = CASE
+                    WHEN mail_relations.relation_status IN ('confirmed', 'rejected')
+                    THEN mail_relations.relation_status
+                    ELSE excluded.relation_status END,
+                confidence = MAX(mail_relations.confidence, excluded.confidence),
+                evidence_summary = excluded.evidence_summary,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .integer(emailID), .integer(documentID), .text(kind.rawValue),
+                .text(status.rawValue), .real(confidence), .text(evidence),
+                .real(now), .real(now)
+            ]
+        )
+    }
+
+    private func insertFileNameSuggestions(now: Double) throws {
+        let rows = try query(
+            """
+            SELECT DISTINCT al.email_id, pdf.id AS document_id
+            FROM email_attachment_links al
+            JOIN email_attachments a ON a.id = al.attachment_id
+            JOIN document_locations l
+              ON lower(l.file_name) = lower(al.file_name) AND l.deleted_at IS NULL
+            JOIN documents pdf ON pdf.id = l.document_id
+            WHERE pdf.id != a.document_id
+              AND pdf.content_hash != a.sha256
+            """
+        )
+        for row in rows {
+            guard let emailID = row.int64("email_id"),
+                  let documentID = row.int64("document_id") else { continue }
+            try upsertMailDocumentRelation(
+                emailID: emailID,
+                documentID: documentID,
+                kind: .fileNameSimilarity,
+                status: .suggested,
+                confidence: 0.35,
+                evidence: "Gleicher Dateiname, aber abweichender SHA-256; keine automatische Verknüpfung.",
+                now: now
+            )
+        }
+    }
+
+    private func rebuildProjects(
+        emails: [GraphEmailRecord],
+        documents: [GraphDocumentRecord],
+        now: Double
+    ) throws {
+        let references = Set(
+            emails.flatMap(\.references) + documents.flatMap(\.references)
+        )
+        for reference in references.sorted() {
+            let matchingEmails = emails.filter { $0.references.contains(reference) }
+            let matchingDocuments = documents.filter { $0.references.contains(reference) }
+            let latest = (
+                matchingEmails.map(\.activity) + matchingDocuments.map(\.activity)
+            ).max() ?? now
+            let sampleName = matchingEmails.first?.subject
+                ?? matchingDocuments.first?.fileName
+                ?? reference
+            let projectName = Self.projectName(from: sampleName, reference: reference)
+            try execute(
+                """
+                INSERT INTO projects (
+                    canonical_name, reference_key, relation_status, confidence,
+                    last_activity_at, created_at, updated_at
+                ) VALUES (?, ?, 'automatic', 0.96, ?, ?, ?)
+                ON CONFLICT(reference_key) DO UPDATE SET
+                    canonical_name = excluded.canonical_name,
+                    relation_status = CASE
+                        WHEN projects.relation_status IN ('confirmed', 'rejected')
+                        THEN projects.relation_status
+                        ELSE excluded.relation_status END,
+                    confidence = MAX(projects.confidence, excluded.confidence),
+                    last_activity_at = excluded.last_activity_at,
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(projectName), .text(reference),
+                    .real(latest), .real(now), .real(now)
+                ]
+            )
+            let projectID = try scalarInt64(
+                "SELECT id FROM projects WHERE reference_key = ?",
+                bindings: [.text(reference)]
+            )
+            for email in matchingEmails {
+                try execute(
+                    """
+                    INSERT INTO project_email_links (
+                        project_id, email_id, relation_status, confidence, evidence_kind
+                    ) VALUES (?, ?, 'automatic', 0.96, 'sharedProjectReference')
+                    ON CONFLICT(project_id, email_id) DO UPDATE SET
+                        relation_status = CASE
+                            WHEN project_email_links.relation_status IN ('confirmed', 'rejected')
+                            THEN project_email_links.relation_status
+                            ELSE excluded.relation_status END,
+                        confidence = MAX(project_email_links.confidence, excluded.confidence),
+                        evidence_kind = excluded.evidence_kind
+                    """,
+                    bindings: [.integer(projectID), .integer(email.id)]
+                )
+            }
+            for document in matchingDocuments {
+                try execute(
+                    """
+                    INSERT INTO project_document_links (
+                        project_id, document_id, relation_status, confidence, evidence_kind
+                    ) VALUES (?, ?, 'automatic', 0.96, 'sharedProjectReference')
+                    ON CONFLICT(project_id, document_id) DO UPDATE SET
+                        relation_status = CASE
+                            WHEN project_document_links.relation_status IN ('confirmed', 'rejected')
+                            THEN project_document_links.relation_status
+                            ELSE excluded.relation_status END,
+                        confidence = MAX(project_document_links.confidence, excluded.confidence),
+                        evidence_kind = excluded.evidence_kind
+                    """,
+                    bindings: [.integer(projectID), .integer(document.id)]
+                )
+            }
+        }
+    }
+
+    private func rebuildSuggestedProjects(now: Double) throws {
+        let rows = try query(
+            """
+            SELECT mr.email_id, mr.document_id, e.subject, mr.confidence,
+                   mr.relation_kind,
+                   COALESCE(l.file_name, a.canonical_file_name, '') AS file_name,
+                   COALESCE(e.sent_at, e.received_at, e.imported_at) AS activity
+            FROM mail_relations mr
+            JOIN emails e ON e.id = mr.email_id
+            LEFT JOIN document_locations l
+              ON l.document_id = mr.document_id AND l.deleted_at IS NULL
+            LEFT JOIN email_attachments a ON a.document_id = mr.document_id
+            WHERE mr.relation_status = 'suggested'
+              AND mr.document_id IS NOT NULL
+              AND mr.relation_kind IN (
+                  'contentSimilarity', 'fileNameSimilarity', 'localSemantic'
+              )
+            """
+        )
+        for row in rows {
+            guard let emailID = row.int64("email_id"),
+                  let documentID = row.int64("document_id"),
+                  let subject = row.string("subject"),
+                  let confidence = row.double("confidence"),
+                  let kind = row.string("relation_kind"),
+                  let activity = row.double("activity") else { continue }
+            let trimmedSubject = subject.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fileName = row.string("file_name") ?? ""
+            let baseName = trimmedSubject.isEmpty
+                ? fileName.replacingOccurrences(of: ".pdf", with: "", options: .caseInsensitive)
+                : trimmedSubject
+            guard baseName.count >= 4 else { continue }
+            let normalized = baseName.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "de_DE")
+            )
+            let digest = SHA256Hasher().hash(data: Data(normalized.utf8))
+            let reference = "VORSCHLAG-\(digest.prefix(12).uppercased())"
+            try execute(
+                """
+                INSERT INTO projects (
+                    canonical_name, reference_key, relation_status, confidence,
+                    last_activity_at, created_at, updated_at
+                ) VALUES (?, ?, 'suggested', ?, ?, ?, ?)
+                ON CONFLICT(reference_key) DO UPDATE SET
+                    confidence = MAX(projects.confidence, excluded.confidence),
+                    last_activity_at = MAX(
+                        COALESCE(projects.last_activity_at, 0),
+                        excluded.last_activity_at
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text("Vorschlag: \(baseName)"), .text(reference),
+                    .real(confidence), .real(activity), .real(now), .real(now)
+                ]
+            )
+            let projectID = try scalarInt64(
+                "SELECT id FROM projects WHERE reference_key = ?",
+                bindings: [.text(reference)]
+            )
+            try execute(
+                """
+                INSERT INTO project_email_links (
+                    project_id, email_id, relation_status, confidence, evidence_kind
+                ) VALUES (?, ?, 'suggested', ?, ?)
+                ON CONFLICT(project_id, email_id) DO UPDATE SET
+                    confidence = MAX(project_email_links.confidence, excluded.confidence),
+                    evidence_kind = excluded.evidence_kind
+                """,
+                bindings: [
+                    .integer(projectID), .integer(emailID),
+                    .real(confidence), .text(kind)
+                ]
+            )
+            try execute(
+                """
+                INSERT INTO project_document_links (
+                    project_id, document_id, relation_status, confidence, evidence_kind
+                ) VALUES (?, ?, 'suggested', ?, ?)
+                ON CONFLICT(project_id, document_id) DO UPDATE SET
+                    confidence = MAX(project_document_links.confidence, excluded.confidence),
+                    evidence_kind = excluded.evidence_kind
+                """,
+                bindings: [
+                    .integer(projectID), .integer(documentID),
+                    .real(confidence), .text(kind)
+                ]
+            )
+        }
+    }
+
+    private func rebuildDocumentRelations(now: Double) throws {
+        let rows = try query(
+            """
+            SELECT a.document_id AS first_id, b.document_id AS second_id,
+                   p.reference_key, p.relation_status, p.confidence
+            FROM project_document_links a
+            JOIN project_document_links b
+              ON b.project_id = a.project_id AND b.document_id > a.document_id
+            JOIN projects p ON p.id = a.project_id
+            """
+        )
+        for row in rows {
+            guard let first = row.int64("first_id"),
+                  let second = row.int64("second_id"),
+                  let reference = row.string("reference_key"),
+                  let status = row.string("relation_status"),
+                  let confidence = row.double("confidence") else { continue }
+            try execute(
+                """
+                INSERT INTO document_relations (
+                    document_id, related_document_id, relation_kind,
+                    relation_status, confidence, evidence_summary,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'sharedProjectReference', ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id, related_document_id, relation_kind) DO UPDATE SET
+                    relation_status = CASE
+                        WHEN document_relations.relation_status IN ('confirmed', 'rejected')
+                        THEN document_relations.relation_status
+                        ELSE excluded.relation_status END,
+                    confidence = MAX(document_relations.confidence, excluded.confidence),
+                    evidence_summary = excluded.evidence_summary,
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .integer(first), .integer(second),
+                    .text(status), .real(confidence),
+                    .text("Gemeinsame Projektreferenz: \(reference)"),
+                    .real(now), .real(now)
+                ]
+            )
+        }
+    }
+
+    private static let freeMailDomains: Set<String> = [
+        "gmail.com", "googlemail.com", "icloud.com", "me.com", "mac.com",
+        "outlook.com", "hotmail.com", "live.com", "yahoo.com", "gmx.de",
+        "gmx.net", "web.de", "mail.de", "t-online.de"
+    ]
+
+    private static func normalizedEmailAddress(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func partnerDisplayName(_ name: String?, address: String) -> String {
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmed.isEmpty { return trimmed }
+        return address.split(separator: "@").first.map(String.init) ?? address
+    }
+
+    private static func graphEmbedding(_ row: SQLiteRow) -> GraphEmbedding? {
+        guard let modelID = row.string("embedding_model_id"),
+              let modelVersion = row.string("embedding_model_version"),
+              let data = row.data("embedding_vector") else { return nil }
+        return GraphEmbedding(
+            modelID: modelID,
+            modelVersion: modelVersion,
+            vector: decode(vector: data)
+        )
+    }
+
+    private static func graphCosine(
+        _ lhs: GraphEmbedding?,
+        _ rhs: GraphEmbedding?
+    ) -> Double? {
+        guard let lhs, let rhs,
+              lhs.modelID == rhs.modelID,
+              lhs.modelVersion == rhs.modelVersion,
+              lhs.vector.count == rhs.vector.count,
+              !lhs.vector.isEmpty else { return nil }
+        return Double(zip(lhs.vector, rhs.vector).reduce(Float.zero) {
+            $0 + $1.0 * $1.1
+        })
+    }
+
+    private static func graphTokens(in text: String) -> Set<String> {
+        let folded = text.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "de_DE")
+        )
+        let components = folded.components(
+            separatedBy: CharacterSet.alphanumerics.inverted
+        )
+        return Set(components.filter {
+            $0.count >= 3 && !graphStopWords.contains($0)
+        }.prefix(1_500))
+    }
+
+    private static let graphStopWords: Set<String> = [
+        "aber", "alle", "auch", "das", "dem", "den", "der", "des", "die",
+        "ein", "eine", "einer", "eines", "fuer", "für", "ist", "mit", "nicht",
+        "oder", "sich", "sie", "und", "von", "wir", "wird", "zum", "zur",
+        "and", "are", "for", "from", "the", "this", "with", "your"
+    ]
+
+    private static func jaccard(_ lhs: Set<String>, _ rhs: Set<String>) -> Double {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
+        let intersection = lhs.intersection(rhs).count
+        guard intersection >= 3 else { return 0 }
+        return Double(intersection) / Double(lhs.union(rhs).count)
+    }
+
+    private static func projectReferences(in text: String) -> Set<String> {
+        let patterns = [
+            #"(?i)\b(?:PRJ|PROJECT|PROJEKT|AUFTRAG|ORDER|AZ)[\s:_/-]*[A-Z0-9][A-Z0-9._/-]{2,}\b"#,
+            #"(?i)\b[A-Z]{2,8}-[0-9]{2,}(?:-[A-Z0-9]+)*\b"#
+        ]
+        var references: Set<String> = []
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(pattern: pattern) else {
+                continue
+            }
+            for match in expression.matches(in: text, range: fullRange) {
+                let raw = nsText.substring(with: match.range)
+                let canonical = raw.uppercased()
+                    .replacingOccurrences(
+                        of: #"^(PRJ|PROJECT|PROJEKT|AUFTRAG|ORDER|AZ)[\s:_/-]*"#,
+                        with: "",
+                        options: .regularExpression
+                    )
+                    .trimmingCharacters(in: .punctuationCharacters)
+                if canonical.count >= 4 {
+                    references.insert(canonical)
+                }
+            }
+        }
+        return references
+    }
+
+    private static func projectName(from source: String, reference: String) -> String {
+        let cleaned = source
+            .replacingOccurrences(of: ".pdf", with: "", options: .caseInsensitive)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty || cleaned.count > 100 {
+            return "Projekt \(reference)"
+        }
+        return cleaned
+    }
+
     private func migrate() throws {
         try execute(
             """
@@ -3335,6 +4876,11 @@ public actor SQLiteDatabase {
             """
         )
         let current = try scalarInt64("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
+        guard current <= Int64(FindoraAnalysisVersions.schema) else {
+            throw FindoraError.database(
+                "Die Bibliothek verwendet Schema \(current), diese Findora-Version unterstützt höchstens Schema \(FindoraAnalysisVersions.schema)."
+            )
+        }
         if current < 1 {
             try transaction {
                 for statement in Self.migration1 {
@@ -3449,6 +4995,45 @@ public actor SQLiteDatabase {
                 }
                 try execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (10, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 11 {
+            try transaction {
+                let hasDocumentSchema = try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'documents'
+                    """
+                ) > 0
+                if hasDocumentSchema {
+                    for statement in Self.migration11 {
+                        try execute(statement)
+                    }
+                    try refreshCommunicationGraphInTransaction()
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (11, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 12 {
+            try transaction {
+                let hasDocumentSchema = try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'documents'
+                    """
+                ) > 0
+                if hasDocumentSchema {
+                    for statement in Self.migration12 {
+                        try execute(statement)
+                    }
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (12, ?)",
                     bindings: [.real(Date().timeIntervalSince1970)]
                 )
             }
@@ -4271,6 +5856,196 @@ public actor SQLiteDatabase {
         LEFT JOIN email_source_links sl ON sl.email_id = e.id
         LEFT JOIN mail_import_sources s ON s.id = sl.source_id
         """
+    ]
+
+    private static let migration11 = [
+        """
+        CREATE TABLE organizations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_name TEXT NOT NULL,
+            email_domain TEXT UNIQUE,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE communication_partners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+            canonical_name TEXT NOT NULL,
+            primary_address TEXT NOT NULL UNIQUE,
+            last_activity_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE communication_partner_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL REFERENCES communication_partners(id) ON DELETE CASCADE,
+            display_name TEXT,
+            address TEXT NOT NULL,
+            normalized_address TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE communication_partner_email_links (
+            partner_id INTEGER NOT NULL REFERENCES communication_partners(id) ON DELETE CASCADE,
+            email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            PRIMARY KEY(partner_id, email_id, role)
+        )
+        """,
+        """
+        CREATE TABLE projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical_name TEXT NOT NULL,
+            reference_key TEXT NOT NULL UNIQUE,
+            relation_status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            last_activity_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE project_document_links (
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            relation_status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            evidence_kind TEXT NOT NULL,
+            PRIMARY KEY(project_id, document_id)
+        )
+        """,
+        """
+        CREATE TABLE project_email_links (
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+            relation_status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            evidence_kind TEXT NOT NULL,
+            PRIMARY KEY(project_id, email_id)
+        )
+        """,
+        """
+        CREATE TABLE document_relations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            related_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            relation_kind TEXT NOT NULL,
+            relation_status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            evidence_summary TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            CHECK(document_id < related_document_id),
+            UNIQUE(document_id, related_document_id, relation_kind)
+        )
+        """,
+        """
+        CREATE TABLE mail_relations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+            related_email_id INTEGER REFERENCES emails(id) ON DELETE CASCADE,
+            document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+            relation_kind TEXT NOT NULL,
+            relation_status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            evidence_summary TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            CHECK(related_email_id IS NOT NULL OR document_id IS NOT NULL),
+            UNIQUE(email_id, related_email_id, document_id, relation_kind)
+        )
+        """,
+        "CREATE INDEX idx_partners_organization ON communication_partners(organization_id)",
+        "CREATE INDEX idx_partner_email_links_email ON communication_partner_email_links(email_id)",
+        "CREATE INDEX idx_project_document_links_document ON project_document_links(document_id)",
+        "CREATE INDEX idx_project_email_links_email ON project_email_links(email_id)",
+        "CREATE INDEX idx_document_relations_related ON document_relations(related_document_id)",
+        "CREATE INDEX idx_mail_relations_document ON mail_relations(document_id)",
+        "CREATE INDEX idx_mail_relations_related_email ON mail_relations(related_email_id)",
+        """
+        CREATE UNIQUE INDEX idx_mail_relations_email_document_kind
+        ON mail_relations(email_id, document_id, relation_kind)
+        WHERE related_email_id IS NULL AND document_id IS NOT NULL
+        """,
+        """
+        CREATE UNIQUE INDEX idx_mail_relations_email_email_kind
+        ON mail_relations(email_id, related_email_id, relation_kind)
+        WHERE related_email_id IS NOT NULL AND document_id IS NULL
+        """
+    ]
+
+    private static let migration12 = [
+        """
+        CREATE TABLE document_analysis_versions (
+            document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+            ocr_version TEXT,
+            parser_version TEXT,
+            chunk_version TEXT,
+            embedding_version TEXT,
+            ai_analysis_version TEXT,
+            people_analysis_version TEXT,
+            project_analysis_version TEXT,
+            summary_version TEXT,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE analysis_upgrade_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            analysis_kind TEXT NOT NULL,
+            target_version TEXT NOT NULL,
+            state TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error_category TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            completed_at REAL,
+            UNIQUE(document_id, analysis_kind, target_version)
+        )
+        """,
+        """
+        INSERT INTO document_analysis_versions (
+            document_id, ocr_version, parser_version, chunk_version,
+            embedding_version, ai_analysis_version, people_analysis_version,
+            project_analysis_version, summary_version, updated_at
+        )
+        SELECT d.id,
+               CASE
+                   WHEN d.ocr_status = 'completed' THEN 'ocr-v1'
+                   WHEN d.ocr_status = 'not_required' THEN 'not-required'
+                   ELSE NULL
+               END,
+               CASE
+                   WHEN EXISTS (SELECT 1 FROM pages p WHERE p.document_id = d.id)
+                   THEN 'parser-v1' ELSE NULL
+               END,
+               CASE
+                   WHEN EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id)
+                   THEN 'page-v1-900-150' ELSE NULL
+               END,
+               (
+                   SELECT c.embedding_model_id || '@' || c.embedding_model_version
+                   FROM chunks c
+                   WHERE c.document_id = d.id
+                   ORDER BY c.indexed_at DESC
+                   LIMIT 1
+               ),
+               NULL,
+               'communication-people-v1',
+               'communication-project-v1',
+               NULL,
+               strftime('%s', 'now')
+        FROM documents d
+        """,
+        "CREATE INDEX idx_analysis_upgrade_jobs_state ON analysis_upgrade_jobs(state, updated_at)",
+        "CREATE INDEX idx_analysis_versions_people ON document_analysis_versions(people_analysis_version)",
+        "CREATE INDEX idx_analysis_versions_projects ON document_analysis_versions(project_analysis_version)"
     ]
 }
 

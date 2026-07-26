@@ -99,8 +99,11 @@ enum InterfaceAppearance: String, CaseIterable, Identifiable {
 enum AppSection: String, CaseIterable, Identifiable {
     case search = "Suche"
     case mail = "E-Mail-Quellen"
+    case partners = "Kommunikationspartner"
+    case projects = "Projekte"
     case status = "Dokumentenstatus"
     case maintenance = "Dokumentenwartung"
+    case versions = "Versionen"
     case ocr = "OCR"
     case models = "Modelle"
     case settings = "Einstellungen"
@@ -112,8 +115,11 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .search: "magnifyingglass"
         case .mail: "envelope"
+        case .partners: "person.2"
+        case .projects: "folder.badge.gearshape"
         case .status: "doc.text"
         case .maintenance: "wrench.and.screwdriver"
+        case .versions: "clock.arrow.trianglehead.counterclockwise.rotate.90"
         case .ocr: "text.viewfinder"
         case .models: "cpu"
         case .settings: "gearshape"
@@ -201,6 +207,17 @@ final class AppState {
     var isAnswerModelLoaded = false
     var isEmbeddingModelLoaded = false
     var mailSources: [MailImportSource] = []
+    var communicationPartners: [CommunicationPartner] = []
+    var communicationProjects: [CommunicationProject] = []
+    var communicationGraphStatistics = CommunicationGraphStatistics(
+        partners: 0,
+        organizations: 0,
+        projects: 0,
+        automaticLinks: 0,
+        suggestions: 0
+    )
+    var databaseVersionSnapshot: DatabaseVersionSnapshot?
+    var isAnalysisUpgradeRunning = false
     var pendingMailImport: PendingMailImport?
     var mailImportProgress: MailImportProgress?
     var mailImportMessage: String?
@@ -247,8 +264,11 @@ final class AppState {
         return switch section {
         case .search: "Search"
         case .mail: "Email sources"
+        case .partners: "Communication partners"
+        case .projects: "Projects"
         case .status: "Document status"
         case .maintenance: "Document maintenance"
+        case .versions: "Versions"
         case .ocr: "OCR"
         case .models: "Models"
         case .settings: "Settings"
@@ -305,6 +325,7 @@ final class AppState {
     private var statusRefreshTask: Task<Void, Never>?
     private var statusConsistencyTask: Task<Void, Never>?
     private var statusRefreshPending = false
+    private var analysisUpgradeTask: Task<Void, Never>?
 
     init() {
         do {
@@ -395,6 +416,9 @@ final class AppState {
                 return
             }
             try await database.initialize()
+            _ = try await database.prepareIncrementalAnalysisUpgrades()
+            await refreshDatabaseVersions()
+            startIncrementalAnalysisUpgrades()
             await startDocumentStatusMonitoring()
             await runMemoryPressureDiagnosticIfRequested()
             await loadSettings()
@@ -1908,9 +1932,78 @@ final class AppState {
     func refreshDatabaseState() async {
         do {
             await refreshDocumentStatus()
+            await refreshCommunicationGraph()
             logEntries = try await database.recentErrors()
         } catch {
             report(error)
+        }
+    }
+
+    func refreshCommunicationGraph() async {
+        do {
+            communicationPartners = try await database.communicationPartners()
+            communicationProjects = try await database.communicationProjects()
+            communicationGraphStatistics =
+                try await database.communicationGraphStatistics()
+        } catch {
+            report(error, taskType: "Kommunikationsverknüpfungen laden")
+        }
+    }
+
+    func graphContext(for documentID: Int64) async -> CommunicationGraphContext {
+        (try? await database.communicationGraphContext(documentID: documentID))
+            ?? CommunicationGraphContext()
+    }
+
+    func refreshDatabaseVersions() async {
+        do {
+            databaseVersionSnapshot = try await database.databaseVersionSnapshot(
+                embeddingModelID: activeEmbeddingModelID ?? "builtin-token-hash",
+                embeddingModelVersion: activeEmbeddingModelVersion ?? "1"
+            )
+        } catch {
+            report(error, taskType: "Datenbankversionen laden")
+        }
+    }
+
+    func startIncrementalAnalysisUpgrades() {
+        guard analysisUpgradeTask == nil,
+              databaseVersionSnapshot?.upgradePaused != true else { return }
+        analysisUpgradeTask = Task {
+            isAnalysisUpgradeRunning = true
+            defer {
+                isAnalysisUpgradeRunning = false
+                analysisUpgradeTask = nil
+            }
+            do {
+                _ = try await database.prepareIncrementalAnalysisUpgrades()
+                while !Task.isCancelled {
+                    let completed = try await database
+                        .runIncrementalAnalysisUpgradeBatch(limit: 40)
+                    await refreshDatabaseVersions()
+                    if completed == 0 { break }
+                    await Task.yield()
+                }
+                await refreshCommunicationGraph()
+            } catch {
+                report(error, taskType: "Inkrementelle Analyseaktualisierung")
+            }
+        }
+    }
+
+    func setAnalysisUpgradePaused(_ paused: Bool) {
+        Task {
+            do {
+                if paused {
+                    analysisUpgradeTask?.cancel()
+                    analysisUpgradeTask = nil
+                }
+                try await database.setAnalysisUpgradePaused(paused)
+                await refreshDatabaseVersions()
+                if !paused { startIncrementalAnalysisUpgrades() }
+            } catch {
+                report(error, taskType: "Analyseaktualisierung pausieren")
+            }
         }
     }
 
@@ -2679,8 +2772,11 @@ struct ContentView: View {
                         switch state.selectedSection ?? .search {
                         case .search: SearchView()
                         case .mail: MailSourcesView()
+                        case .partners: CommunicationPartnersView()
+                        case .projects: CommunicationProjectsView()
                         case .status: StatusView()
                         case .maintenance: MaintenanceView()
+                        case .versions: DatabaseVersionsView()
                         case .ocr: OCRView()
                         case .models: ModelsView()
                         case .settings: SettingsView()
@@ -2770,8 +2866,8 @@ private struct FindoraSidebar: View {
             Divider()
 
             List(selection: $selection) {
-                sidebarSection([.search, .mail])
-                sidebarSection([.status, .maintenance])
+                sidebarSection([.search, .mail, .partners, .projects])
+                sidebarSection([.status, .maintenance, .versions])
                 sidebarSection([.ocr, .models])
                 sidebarSection([.settings, .logs])
             }
@@ -2843,6 +2939,218 @@ private struct FindoraAboutView: View {
         .padding(32)
         .frame(minWidth: 440)
         .accessibilityElement(children: .contain)
+    }
+}
+
+struct CommunicationPartnersView: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Kommunikationspartner").font(.title2.bold())
+                        Text(
+                            "Lokal zusammengeführte Absender, Empfänger, Organisationen und Alias-Adressen."
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Aktualisieren") {
+                        Task { await state.refreshCommunicationGraph() }
+                    }
+                }
+                HStack(spacing: 10) {
+                    GraphSummaryTile(
+                        title: "Partner",
+                        value: state.communicationGraphStatistics.partners,
+                        symbol: "person.2"
+                    )
+                    GraphSummaryTile(
+                        title: "Organisationen",
+                        value: state.communicationGraphStatistics.organizations,
+                        symbol: "building.2"
+                    )
+                    GraphSummaryTile(
+                        title: "Sichere Verknüpfungen",
+                        value: state.communicationGraphStatistics.automaticLinks,
+                        symbol: "link.badge.plus"
+                    )
+                    GraphSummaryTile(
+                        title: "Vorschläge",
+                        value: state.communicationGraphStatistics.suggestions,
+                        symbol: "questionmark.diamond"
+                    )
+                }
+                if state.communicationPartners.isEmpty {
+                    ContentUnavailableView(
+                        "Noch keine Kommunikationspartner",
+                        systemImage: "person.2.slash",
+                        description: Text(
+                            "Partner entstehen automatisch beim lokalen Import von E-Mails."
+                        )
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 260)
+                } else {
+                    LazyVStack(spacing: 10) {
+                        ForEach(state.communicationPartners) { partner in
+                            VStack(alignment: .leading, spacing: 9) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(partner.displayName).font(.headline)
+                                        Text(partner.primaryAddress)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if let organization = partner.organizationName {
+                                        Label(organization, systemImage: "building.2")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if let activity = partner.lastActivity {
+                                        Text(activity.formatted(date: .abbreviated, time: .omitted))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                HStack(spacing: 7) {
+                                    GraphCountBadge("E-Mails", partner.emailCount)
+                                    GraphCountBadge("PDFs", partner.pdfCount)
+                                    GraphCountBadge("Angebote", partner.offerCount)
+                                    GraphCountBadge("Rechnungen", partner.invoiceCount)
+                                    GraphCountBadge("Bilder", partner.imageCount)
+                                }
+                                if partner.aliasAddresses.count > 1 {
+                                    Text(
+                                        "Aliase: " + partner.aliasAddresses.joined(separator: ", ")
+                                    )
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(14)
+                            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .task { await state.refreshCommunicationGraph() }
+    }
+}
+
+struct CommunicationProjectsView: View {
+    @Environment(AppState.self) private var state
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Projekte").font(.title2.bold())
+                        Text(
+                            "Automatische lokale Gruppierung über Betreff, Text, Dateiname und Projektreferenzen."
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Aktualisieren") {
+                        Task { await state.refreshCommunicationGraph() }
+                    }
+                }
+                if state.communicationProjects.isEmpty {
+                    ContentUnavailableView(
+                        "Noch keine Projekte erkannt",
+                        systemImage: "folder.badge.questionmark",
+                        description: Text(
+                            "Eindeutige Referenzen wie PRJ-1001 oder AUFTRAG 4711 werden automatisch gruppiert."
+                        )
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 300)
+                } else {
+                    LazyVStack(spacing: 10) {
+                        ForEach(state.communicationProjects) { project in
+                            VStack(alignment: .leading, spacing: 9) {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(project.name).font(.headline)
+                                        Text("Referenz: \(project.reference)")
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    SearchBadge(
+                                        text: project.status.displayName,
+                                        color: project.status == .suggested ? .orange : .green
+                                    )
+                                }
+                                HStack(spacing: 7) {
+                                    GraphCountBadge("E-Mails", project.emailCount)
+                                    GraphCountBadge("Dokumente", project.documentCount)
+                                    if let activity = project.lastActivity {
+                                        Text("Zuletzt \(activity.formatted(date: .abbreviated, time: .omitted))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                if !project.partnerNames.isEmpty {
+                                    Label(
+                                        project.partnerNames.joined(separator: ", "),
+                                        systemImage: "person.2"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(14)
+                            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .task { await state.refreshCommunicationGraph() }
+    }
+}
+
+private struct GraphSummaryTile: View {
+    let title: String
+    let value: Int
+    let symbol: String
+
+    var body: some View {
+        HStack {
+            Image(systemName: symbol).foregroundStyle(.tint)
+            VStack(alignment: .leading) {
+                Text(value.formatted()).font(.title3.bold())
+                Text(title).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct GraphCountBadge: View {
+    let label: String
+    let count: Int
+
+    init(_ label: String, _ count: Int) {
+        self.label = label
+        self.count = count
+    }
+
+    var body: some View {
+        Text("\(label): \(count)")
+            .font(.caption2.bold())
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(.quaternary, in: Capsule())
     }
 }
 
@@ -3613,6 +3921,7 @@ struct MailSourcePreview: View {
             if let parent = source.parentEmailSubject {
                 LabeledContent("Zugehörige E-Mail", value: parent)
             }
+            GraphContextPanel(documentID: source.documentID)
             Divider()
             ScrollView {
                 Text(source.excerpt)
@@ -3655,10 +3964,70 @@ struct PDFSourcePreview: View {
                 Button("Schließen") { dismiss() }
             }
             .padding()
+            GraphContextPanel(documentID: source.documentID)
+                .padding(.horizontal)
+                .padding(.bottom, 10)
             Divider()
             PDFKitView(url: URL(filePath: source.absolutePath), pageNumber: source.pageNumber)
         }
         .frame(minWidth: 760, minHeight: 700)
+    }
+}
+
+private struct GraphContextPanel: View {
+    @Environment(AppState.self) private var state
+    let documentID: Int64
+    @State private var context = CommunicationGraphContext()
+
+    var body: some View {
+        if !context.partners.isEmpty
+            || !context.projects.isEmpty
+            || !context.linkedEmails.isEmpty
+            || !context.linkedDocuments.isEmpty {
+            VStack(alignment: .leading, spacing: 7) {
+                Label("Verknüpfungen", systemImage: "point.3.connected.trianglepath.dotted")
+                    .font(.subheadline.bold())
+                if !context.partners.isEmpty {
+                    LabeledContent(
+                        "Partner",
+                        value: context.partners.map(\.displayName).joined(separator: ", ")
+                    )
+                }
+                if !context.projects.isEmpty {
+                    LabeledContent(
+                        "Projekte",
+                        value: context.projects.map(\.name).joined(separator: ", ")
+                    )
+                }
+                ForEach(context.linkedEmails.prefix(3)) { link in
+                    graphLinkRow(link, symbol: "envelope")
+                }
+                ForEach(context.linkedDocuments.prefix(3)) { link in
+                    graphLinkRow(link, symbol: "doc.text")
+                }
+            }
+            .font(.caption)
+            .padding(10)
+            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
+        }
+        EmptyView()
+            .task(id: documentID) {
+                guard documentID > 0 else { return }
+                context = await state.graphContext(for: documentID)
+            }
+    }
+
+    private func graphLinkRow(_ link: GraphLink, symbol: String) -> some View {
+        HStack {
+            Label(link.title, systemImage: symbol)
+                .lineLimit(1)
+            Spacer()
+            Text(link.status.displayName)
+                .foregroundStyle(link.status == .suggested ? .orange : .secondary)
+            Text(link.confidence, format: .percent.precision(.fractionLength(0)))
+                .foregroundStyle(.secondary)
+        }
+        .help("\(link.kind.displayName): \(link.subtitle)")
     }
 }
 
@@ -4095,6 +4464,152 @@ private enum MaintenanceStatusFilter: String, CaseIterable, Identifiable {
     case unavailable = "Nicht verfügbar"
 
     var id: Self { self }
+}
+
+struct DatabaseVersionsView: View {
+    @Environment(AppState.self) private var state
+    @State private var confirmsEmbeddingUpdate = false
+    @State private var confirmsFullRebuild = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Versionen").font(.title2.bold())
+                        Text(
+                            "Schema- und Analyseversionen der lokalen Bibliothek. Bestehende Inhalte bleiben bei Migrationen erhalten."
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Aktualisieren") {
+                        Task { await state.refreshDatabaseVersions() }
+                    }
+                }
+                if let snapshot = state.databaseVersionSnapshot {
+                    HStack(spacing: 10) {
+                        GraphSummaryTile(
+                            title: "Datenbankschema",
+                            value: snapshot.schemaVersion,
+                            symbol: "cylinder.split.1x2"
+                        )
+                        GraphSummaryTile(
+                            title: "Erwartetes Schema",
+                            value: snapshot.expectedSchemaVersion,
+                            symbol: "checkmark.seal"
+                        )
+                        GraphSummaryTile(
+                            title: "Offene Upgrades",
+                            value: snapshot.pendingUpgrades,
+                            symbol: "arrow.triangle.2.circlepath"
+                        )
+                        GraphSummaryTile(
+                            title: "Fehlgeschlagen",
+                            value: snapshot.failedUpgrades,
+                            symbol: "exclamationmark.triangle"
+                        )
+                    }
+                    if let migrated = snapshot.lastMigrationAt {
+                        LabeledContent(
+                            "Letzte Migration",
+                            value: migrated.formatted(date: .abbreviated, time: .standard)
+                        )
+                    }
+                    VStack(spacing: 0) {
+                        ForEach(snapshot.versions) { version in
+                            HStack {
+                                Text(version.kind.displayName)
+                                    .frame(width: 150, alignment: .leading)
+                                Text(version.currentVersion)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                GraphCountBadge("Aktuell", version.currentDocuments)
+                                GraphCountBadge("Veraltet", version.outdatedDocuments)
+                                GraphCountBadge("Fehlt", version.missingDocuments)
+                            }
+                            .padding(.vertical, 9)
+                            if version.id != snapshot.versions.last?.id { Divider() }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
+
+                    HStack {
+                        Button("Fehlende Analysen ergänzen") {
+                            state.startIncrementalAnalysisUpgrades()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(
+                            state.isAnalysisUpgradeRunning
+                                || snapshot.upgradePaused
+                                || snapshot.pendingUpgrades == 0
+                        )
+                        Button(snapshot.upgradePaused ? "Fortsetzen" : "Pausieren") {
+                            state.setAnalysisUpgradePaused(!snapshot.upgradePaused)
+                        }
+                        .disabled(snapshot.pendingUpgrades == 0 && !snapshot.upgradePaused)
+                        if state.isAnalysisUpgradeRunning {
+                            ProgressView().controlSize(.small)
+                            Text("Fehlende Personen-/Projektanalysen werden lokal ergänzt.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    GroupBox("Explizite Wartungsaktionen") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(
+                                "OCR und Embeddings werden nach einem Update niemals automatisch neu erzeugt."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            HStack {
+                                Button("Embeddings aktualisieren …") {
+                                    confirmsEmbeddingUpdate = true
+                                }
+                                Button("OCR erneut ausführen …") {
+                                    state.selectedSection = .ocr
+                                }
+                                Button("Gesamten Index neu erstellen …", role: .destructive) {
+                                    confirmsFullRebuild = true
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                } else {
+                    ProgressView("Versionsinformationen werden geladen …")
+                        .frame(maxWidth: .infinity, minHeight: 260)
+                }
+            }
+            .padding(20)
+        }
+        .task { await state.refreshDatabaseVersions() }
+        .confirmationDialog(
+            "Embeddings ausdrücklich aktualisieren?",
+            isPresented: $confirmsEmbeddingUpdate
+        ) {
+            Button("Embeddings aus gespeicherten Texten neu aufbauen") {
+                state.rebuildSearchIndex()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("OCR und Originaldateien werden dabei nicht verändert.")
+        }
+        .confirmationDialog(
+            "Gesamten Suchindex ausdrücklich neu erstellen?",
+            isPresented: $confirmsFullRebuild
+        ) {
+            Button("Gesamten Index neu erstellen", role: .destructive) {
+                state.rebuildSearchIndex()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Diese Aktion wird nur nach dieser ausdrücklichen Bestätigung gestartet.")
+        }
+    }
 }
 
 struct MaintenanceView: View {

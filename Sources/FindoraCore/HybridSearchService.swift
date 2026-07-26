@@ -5,6 +5,7 @@ public actor HybridSearchService {
         var source: SearchSource
         var lexicalRank: Int?
         var semanticScore: Double?
+        var graphRank: Int?
         var combinedScore: Double
     }
 
@@ -61,7 +62,13 @@ public actor HybridSearchService {
             contentFilter: contentFilter,
             limit: 40
         )
-        let (lexicalResults, fileNameResults) = try await (lexical, fileNames)
+        async let graph = database.communicationGraphSearch(
+            query: trimmed,
+            contentFilter: contentFilter,
+            limit: 60
+        )
+        let (lexicalResults, fileNameResults, graphResults) =
+            try await (lexical, fileNames, graph)
         var semantic: [(SearchSource, Double)] = []
         if semanticEnabled {
             let vector = try await embedder.embed(
@@ -89,6 +96,7 @@ public actor HybridSearchService {
                 source: source,
                 lexicalRank: rank,
                 semanticScore: nil,
+                graphRank: nil,
                 combinedScore: 0.55 / Double(61 + rank)
             )
         }
@@ -103,6 +111,23 @@ public actor HybridSearchService {
                     source: source,
                     lexicalRank: rank,
                     semanticScore: nil,
+                    graphRank: nil,
+                    combinedScore: contribution
+                )
+            }
+        }
+        for (rank, source) in graphResults.enumerated() {
+            let contribution = 0.64 / Double(61 + rank)
+            if var existing = candidates[source.id] {
+                existing.graphRank = rank
+                existing.combinedScore += contribution
+                candidates[source.id] = existing
+            } else {
+                candidates[source.id] = Candidate(
+                    source: source,
+                    lexicalRank: nil,
+                    semanticScore: nil,
+                    graphRank: rank,
                     combinedScore: contribution
                 )
             }
@@ -119,6 +144,7 @@ public actor HybridSearchService {
                     source: source,
                     lexicalRank: nil,
                     semanticScore: semanticScore,
+                    graphRank: nil,
                     combinedScore: contribution
                 )
             }
@@ -126,7 +152,11 @@ public actor HybridSearchService {
 
         let viable = candidates.values.filter {
             $0.combinedScore >= 0.0065
-                && ($0.lexicalRank != nil || ($0.semanticScore ?? -1) >= 0.10)
+                && (
+                    $0.lexicalRank != nil
+                    || $0.graphRank != nil
+                    || ($0.semanticScore ?? -1) >= 0.10
+                )
         }
         let evidence = try await database.searchEvidence(
             documentIDs: Set(viable.map(\.source.documentID))
@@ -184,7 +214,8 @@ public actor HybridSearchService {
         let matchedHardTerms = hardTerms.filter {
             contains($0, in: allDocumentText) || contains($0, in: fileName)
         }
-        guard hardTerms.isEmpty || (
+        let isGraphMatch = candidate.graphRank != nil
+        guard isGraphMatch || hardTerms.isEmpty || (
             plan.mustMatchAll
                 ? matchedHardTerms.count == hardTerms.count
                 : !matchedHardTerms.isEmpty
@@ -196,7 +227,7 @@ public actor HybridSearchService {
             contains(topic, in: allDocumentText)
                 || plan.optionalTerms.contains(where: { contains($0, in: allDocumentText) })
         }
-        let topicsSatisfied = plan.topics.isEmpty
+        let topicsSatisfied = isGraphMatch || plan.topics.isEmpty
             || (plan.mustMatchAll
                 ? matchedTopics.count == plan.topics.count
                 : !matchedTopics.isEmpty)
@@ -218,7 +249,9 @@ public actor HybridSearchService {
         let hasExactEvidence = candidate.lexicalRank != nil
         let semanticScore = candidate.semanticScore ?? -1
         let relevance: SearchRelevance
-        if topicsSatisfied {
+        if isGraphMatch {
+            relevance = .relevant
+        } else if topicsSatisfied {
             if sameChunk && (!hardTerms.isEmpty || !plan.topics.isEmpty) {
                 relevance = .veryRelevant
             } else if !hardTerms.isEmpty || !plan.topics.isEmpty {
@@ -237,18 +270,21 @@ public actor HybridSearchService {
         var kinds: [SearchMatchKind] = []
         if hasExactEvidence { kinds.append(.exact) }
         if semanticScore >= 0.10 { kinds.append(.semantic) }
+        if isGraphMatch { kinds.append(.relation) }
         if hardTerms.contains(where: { contains($0, in: fileName) }) {
             kinds.append(.fileName)
         }
         kinds.append(sameChunk ? .sameChunk : .sameDocument)
 
-        let reason = reason(
-            matchedEntities: matchedEntities,
-            matchedTopics: matchedTopics,
-            fileNameMatched: kinds.contains(.fileName),
-            sameChunk: sameChunk,
-            pageNumber: bestChunk.pageNumber
-        )
+        let reason = isGraphMatch
+            ? candidate.source.reason
+            : reason(
+                matchedEntities: matchedEntities,
+                matchedTopics: matchedTopics,
+                fileNameMatched: kinds.contains(.fileName),
+                sameChunk: sameChunk,
+                pageNumber: bestChunk.pageNumber
+            )
         let excerpt = bestChunk.text.count > 560
             ? String(bestChunk.text.prefix(557)) + "…"
             : bestChunk.text

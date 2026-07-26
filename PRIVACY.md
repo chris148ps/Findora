@@ -11,12 +11,15 @@ Findora ist als lokale Einzelbenutzer-Anwendung entworfen.
   indexierte Anhänge;
 - Suchanfragen und Suchverlauf;
 - Volltextindex und Embeddings;
+- Kommunikationspartner, Organisationen, Projekte, Beziehungen und
+  dokumentbezogene Analyseversionen;
 - an das lokale Sprachmodell übergebene Auszüge;
 - erzeugte Antworten;
 - Einstellungen, Jobstatus und technische Logs.
 
 Es erfolgt keine Übertragung von Dokument-, E-Mail- oder Anhangsinhalten,
-Suchanfragen oder Antworten an OpenAI oder andere KI-Anbieter. Es gibt
+Kommunikationsbeziehungen, Suchanfragen oder Antworten an OpenAI oder andere
+KI-Anbieter. Es gibt
 standardmäßig keine Telemetrie,
 Analyse-, Crash-Upload- oder Tracking-Funktion.
 

@@ -517,3 +517,16 @@
 "Frei am Modellziel" = "Free at model location";
 "Freier Speicher ist kritisch." = "Free storage is critical.";
 "Freier Speicher ist knapp." = "Free storage is low.";
+"Diese Aktion wird nur nach dieser ausdrücklichen Bestätigung gestartet." = "This action starts only after this explicit confirmation.";
+"Embeddings aktualisieren …" = "Update embeddings…";
+"Embeddings aus gespeicherten Texten neu aufbauen" = "Rebuild embeddings from stored text";
+"Explizite Wartungsaktionen" = "Explicit maintenance actions";
+"Fehlende Personen-/Projektanalysen werden lokal ergänzt." = "Missing people and project analyses are being added locally.";
+"Gesamten Index neu erstellen" = "Rebuild the entire index";
+"Gesamten Index neu erstellen …" = "Rebuild the entire index…";
+"Kommunikationspartner" = "Communication partners";
+"OCR erneut ausführen …" = "Run OCR again…";
+"OCR und Originaldateien werden dabei nicht verändert." = "OCR and original files are not changed.";
+"Projekte" = "Projects";
+"Verknüpfungen" = "Links";
+"Versionen" = "Versions";
