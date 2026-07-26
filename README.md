@@ -5,9 +5,9 @@ semantische Suche in privaten PDF-Beständen. Dokumente, Suchanfragen,
 Embeddings und Antworten bleiben auf dem Mac. Es werden weder Ollama noch ein
 externer KI-Server oder eine Cloud-KI benötigt.
 
-Früherer Entwicklungsname: PrivateDocSearch. Bundle-ID sowie bestehende
-Daten-, Modell-, Bookmark- und Logpfade bleiben zur verlustfreien
-Kompatibilität unverändert.
+Die technische Identität verwendet durchgängig `Findora`: Bundle-ID
+`de.findora.app`, Swift-Module, Build-Targets sowie Daten-, Modell-,
+Bookmark- und Logpfade tragen denselben Produktnamen.
 
 ## Voraussetzungen
 
@@ -99,7 +99,7 @@ Jobstatus erlaubt die Fortsetzung nach einem Neustart.
 Status, Warteschlange und technische Fehler erscheinen unter **Status** und
 **Logs**. Inhalte von Dokumenten werden nicht protokolliert.
 Das dauerhaft lesbare technische Protokoll liegt unter
-`~/Library/Logs/PrivateDocSearch/PrivateDocSearch.log`.
+`~/Library/Logs/Findora/Findora.log`.
 
 Der Dokumentenstatus aktualisiert sich während Scan, OCR, Indexierung,
 Embedding-Erstellung und Wartung automatisch. Datenbankereignisse werden
@@ -235,8 +235,8 @@ OCR-Sprachen `tesseract-lang` installieren. Weitere Fälle stehen in
    sollen:
 
 ```text
-~/Library/Application Support/PrivateDocSearch/
-~/Library/Logs/PrivateDocSearch/
+~/Library/Application Support/Findora/
+~/Library/Logs/Findora/
 ```
 
 Private PDFs liegen außerhalb dieser Pfade und werden bei der Deinstallation
@@ -256,3 +256,4 @@ nicht gelöscht.
 - [`TESTING.md`](TESTING.md)
 - [`UI_LOCALIZATION.md`](UI_LOCALIZATION.md)
 - [`FINDORA_UI.md`](FINDORA_UI.md)
+- [`docs/CODEX_WORKFLOW.md`](docs/CODEX_WORKFLOW.md)

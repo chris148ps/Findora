@@ -142,14 +142,14 @@ Danach manuell:
 25. Deutsch, Englisch, Systemsprache sowie System, Hell und Dunkel in allen
     Hauptansichten auf Lesbarkeit und Persistenz prüfen.
 26. Unter **Protokoll > Statuswerte prüfen** alle Invarianten ausführen und
-    Ergebnis in UI und `PrivateDocSearch.log` kontrollieren.
+    Ergebnis in UI und `Findora.log` kontrollieren.
 
 Der Memory-Pressure-Pfad lässt sich ohne echten Speichermangel kontrolliert
 beim App-Start auslösen:
 
 ```bash
-PRIVATEDOCSEARCH_SIMULATE_MEMORY_PRESSURE=critical \
-  PRIVATEDOCSEARCH_DISABLE_DOCUMENT_ACCESS=1 \
+FINDORA_SIMULATE_MEMORY_PRESSURE=critical \
+  FINDORA_DISABLE_DOCUMENT_ACCESS=1 \
   build/Findora.app/Contents/MacOS/Findora
 ```
 

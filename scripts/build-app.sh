@@ -52,7 +52,7 @@ for resource_bundle in "$binary_directory"/*.bundle(N); do
   ditto "$resource_bundle" "$bundle_path/Contents/Resources/${resource_bundle:t}"
 done
 
-app_resource_bundle="$binary_directory/Findora_PrivateDocSearchApp.bundle/Contents/Resources"
+app_resource_bundle="$binary_directory/Findora_FindoraApp.bundle/Contents/Resources"
 if [[ ! -d "$app_resource_bundle" ]]; then
   print -u2 "Findora-Ressourcenbundle fehlt: $app_resource_bundle"
   exit 1
@@ -70,7 +70,7 @@ codesign \
   --force \
   --deep \
   --sign - \
-  --entitlements "$project_root/Config/PrivateDocSearch.entitlements" \
+  --entitlements "$project_root/Config/Findora.entitlements" \
   "$bundle_path"
 
 print "$bundle_path"

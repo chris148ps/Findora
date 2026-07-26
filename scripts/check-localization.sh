@@ -2,9 +2,9 @@
 set -euo pipefail
 
 project_root=${0:A:h:h}
-source_file="$project_root/Sources/PrivateDocSearchApp/PrivateDocSearchApp.swift"
-english_file="$project_root/Sources/PrivateDocSearchApp/Resources/en.lproj/Localizable.strings"
-audit_directory=$(mktemp -d /tmp/PrivateDocSearch-localization.XXXXXX)
+source_file="$project_root/Sources/FindoraApp/FindoraApp.swift"
+english_file="$project_root/Sources/FindoraApp/Resources/en.lproj/Localizable.strings"
+audit_directory=$(mktemp -d /tmp/Findora-localization.XXXXXX)
 trap 'rm -rf "$audit_directory"' EXIT
 
 plutil -lint "$english_file"

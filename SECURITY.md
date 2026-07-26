@@ -18,7 +18,7 @@ erreichbarer Stammordner wird nicht als Löschung aller Dokumente gewertet.
 Die interne Homebrew-OCR-Version wird ohne App Sandbox signiert, weil eine
 sandboxed App externe Homebrew-Programme nicht zuverlässig ausführen kann.
 Die kleinsten vorgesehenen Sandbox-Entitlements liegen separat in
-`Config/PrivateDocSearch-Sandbox.entitlements`; sie sind für eine spätere
+`Config/Findora-Sandbox.entitlements`; sie sind für eine spätere
 Version mit gebündeltem OCR-Helfer bestimmt.
 
 ## Sichere OCR-Ersetzung

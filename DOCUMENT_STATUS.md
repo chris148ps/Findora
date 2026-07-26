@@ -121,7 +121,7 @@ klassifiziert. Alte Pfadversionen sind ausgeschlossen.
 - Embeddingtypen gegen `Embeddings gesamt`;
 - nichtnegative Hauptwerte.
 
-Das Ergebnis wird in `~/Library/Logs/PrivateDocSearch/PrivateDocSearch.log`
+Das Ergebnis wird in `~/Library/Logs/Findora/Findora.log`
 protokolliert und in der UI angezeigt. Bei einer Abweichung entsteht zusätzlich
 ein technischer Protokolleintrag. Die Diagnose löscht und verändert weder PDFs
 noch Dokumentdaten.

@@ -31,8 +31,8 @@ Inferenzpfad erzwingen. Eine Anhebung auf macOS 15 ist nicht erforderlich.
 Die Swift-Pakete und Targets folgen diesen Abhängigkeiten:
 
 ```text
-PrivateDocSearchApp (SwiftUI/AppKit)
-    ├── PrivateDocSearchCore
+FindoraApp (SwiftUI/AppKit)
+    ├── FindoraCore
     │   ├── FolderAccess
     │   ├── FileObservation
     │   ├── OCR
@@ -42,13 +42,13 @@ PrivateDocSearchApp (SwiftUI/AppKit)
     │   ├── Persistence
     │   ├── Models
     │   └── Logging
-    └── PrivateDocSearchMLX
+    └── FindoraMLX
         ├── MLXLLM
         ├── MLXEmbedders
         └── ModelRuntime
 ```
 
-`PrivateDocSearchCore` enthält keine UI-Abhängigkeit und lässt sich ohne
+`FindoraCore` enthält keine UI-Abhängigkeit und lässt sich ohne
 Modelldownload testen. Protokolle kapseln veränderliche Implementierungen:
 
 - `FolderAccessProviding`
@@ -141,15 +141,15 @@ standardmäßig nicht gleichzeitig.
 
 Die Datenbank liegt unter:
 
-`~/Library/Application Support/PrivateDocSearch/PrivateDocSearch.sqlite3`
+`~/Library/Application Support/Findora/Findora.sqlite3`
 
 Modelle liegen unter:
 
-`~/Library/Application Support/PrivateDocSearch/Models/`
+`~/Library/Application Support/Findora/Models/`
 
 Logs liegen unter:
 
-`~/Library/Logs/PrivateDocSearch/`
+`~/Library/Logs/Findora/`
 
 Die Datenbank nutzt WAL, Foreign Keys, versionierte Transaktionen und FTS5.
 Das Schema enthält:

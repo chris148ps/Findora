@@ -1,4 +1,4 @@
-# Findora – UI, Produktname und Kompatibilität
+# Findora – UI und technische Produktidentität
 
 ## Produktname
 
@@ -6,23 +6,25 @@ Der sichtbare Produktname lautet **Findora**. Er wird im Hauptfenster, in der
 Menüleiste, im Über-Fenster, in Antworten sowie in den App-Metadaten verwendet.
 Der Release-Build erzeugt `build/Findora.app` mit dem Executable `Findora`.
 
-Interne Swift-Module und Quellverzeichnisse behalten ihre bisherigen Namen.
-Auch die Bundle-ID `de.privatedocsearch.app` und diese produktiven Pfade bleiben
-absichtlich unverändert:
+Swift-Module, Quellverzeichnisse, Bundle-ID und lokale Speicherorte verwenden
+durchgängig den Produktnamen:
 
 ```text
-~/Library/Application Support/PrivateDocSearch/
-~/Library/Logs/PrivateDocSearch/
+Bundle-ID: de.findora.app
+~/Library/Application Support/Findora/
+~/Library/Logs/Findora/
 ```
 
-Damit bleiben Datenbank, Modelle, Security-Scoped Bookmarks, Einstellungen und
-bestehende Protokolle ohne Migration nutzbar.
+Die Datenbank heißt `Findora.sqlite3`, das technische Protokoll `Findora.log`.
+Da es noch keine produktiven Installationen gibt, wird keine Altpfad- oder
+Einstellungsmigration ausgeführt.
 
-Eine spätere Bundle-ID-Änderung wäre ein eigener Migrations- und Release-Schritt:
-Sie erzeugt eine neue Preferences-Domain und kann Sandbox-Container,
-Security-Scoped Bookmarks, Keychain-Zugriffsgruppen, Signierung,
-Provisioning sowie App-Store-Connect-Zuordnung entkoppeln. Ohne abgestimmte
-Migration könnte die App dadurch wie eine neue, leere Installation erscheinen.
+`UserDefaults.standard` verwendet über die neue Bundle-ID die Findora-
+Preferences-Domain. Dedizierte Cache-Verzeichnisse, Spotlight-Importer,
+QuickLook-Erweiterungen, Xcode-Projekte/-Workspaces, CI-Konfigurationen,
+Release-Skripte sowie App-Icon- oder Launch-Asset-Kataloge sind in diesem
+SwiftPM-Projekt nicht vorhanden; der Audit ergab deshalb dort keine
+umzubenennenden oder doppelten Artefakte.
 
 ## Navigation
 

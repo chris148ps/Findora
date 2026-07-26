@@ -9,8 +9,8 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .library(name: "PrivateDocSearchCore", targets: ["PrivateDocSearchCore"]),
-        .executable(name: "Findora", targets: ["PrivateDocSearchApp"])
+        .library(name: "FindoraCore", targets: ["FindoraCore"]),
+        .executable(name: "Findora", targets: ["FindoraApp"])
     ],
     dependencies: [
         .package(
@@ -28,7 +28,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "PrivateDocSearchCore",
+            name: "FindoraCore",
             resources: [.process("Resources")],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
@@ -37,9 +37,9 @@ let package = Package(
             ]
         ),
         .target(
-            name: "PrivateDocSearchMLX",
+            name: "FindoraMLX",
             dependencies: [
-                "PrivateDocSearchCore",
+                "FindoraCore",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
@@ -48,13 +48,13 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "PrivateDocSearchApp",
-            dependencies: ["PrivateDocSearchCore", "PrivateDocSearchMLX"],
+            name: "FindoraApp",
+            dependencies: ["FindoraCore", "FindoraMLX"],
             resources: [.process("Resources")]
         ),
         .testTarget(
-            name: "PrivateDocSearchCoreTests",
-            dependencies: ["PrivateDocSearchCore", "PrivateDocSearchMLX"]
+            name: "FindoraCoreTests",
+            dependencies: ["FindoraCore", "FindoraMLX"]
         )
     ]
 )

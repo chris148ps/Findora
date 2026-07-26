@@ -86,7 +86,7 @@ Nur reguläre `.pdf`-Dateien werden angenommen. Ignoriert werden:
 - versteckte Dateien;
 - `.part`, `.partial`, `.download`, `.tmp`, `.temp`, `.crdownload`;
 - Namen mit Cloud-/Office-Temporärpräfixen wie `~$`;
-- app-eigene `.privatedocsearch-ocr-*`-Dateien;
+- app-eigene `.findora-ocr-*`-Dateien;
 - Symlinks;
 - Dateien im Application-Support- oder Models-Verzeichnis.
 

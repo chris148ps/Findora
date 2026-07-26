@@ -86,8 +86,8 @@ App beenden und nur nach bewusstem Entschluss diese lokalen App-Daten
 entfernen:
 
 ```text
-~/Library/Application Support/PrivateDocSearch/
-~/Library/Logs/PrivateDocSearch/
+~/Library/Application Support/Findora/
+~/Library/Logs/Findora/
 ```
 
 Die ausgewählten Original-PDFs liegen nicht dort und dürfen nicht gelöscht
@@ -99,7 +99,7 @@ Memory-Pressure-Ereignisse, Pausierung/Fortsetzung, Modell-Entladung und
 technische Fehler stehen zeilenweise unter:
 
 ```text
-~/Library/Logs/PrivateDocSearch/PrivateDocSearch.log
+~/Library/Logs/Findora/Findora.log
 ```
 
 Dokumentinhalte werden dort nicht protokolliert.

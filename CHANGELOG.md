@@ -34,11 +34,24 @@ oder Tags.
 - Lesbares lokales Dateiprotokoll für Speicherdruck, Pausierung,
   Modell-Entladung und Fehler ergänzt.
 
+### Geändert
+
+- Technische Produktidentität vollständig auf Findora vereinheitlicht:
+  Bundle-ID `de.findora.app`, SwiftPM-Module und Targets, Quell- und
+  Testverzeichnisse, Entitlements, Datenbank-, Application-Support-,
+  Log-, URL-, Queue- und Diagnosekennungen.
+- Lokale Daten werden unter `~/Library/Application Support/Findora/`,
+  Protokolle unter `~/Library/Logs/Findora/Findora.log` angelegt.
+- Keine Altpfad- oder Einstellungsmigration, da vor der Umstellung keine
+  produktiven Installationen existieren.
+
 ### Bekannte Punkte vor externer Freigabe
 
 - Developer-ID-Signierung und Notarisierung stehen aus.
-- Die interne Version setzt Homebrew-OCR voraus und läuft deshalb ohne App
-  Sandbox.
+- Nur ausdrücklich gewähltes Tesseract oder dauerhaftes OCR benötigt die
+  externe Homebrew-OCR-Werkzeugkette; der Apple-Vision-Standardpfad kommt
+  ohne diese Komponenten aus. Der optionale externe Werkzeugpfad läuft
+  weiterhin ohne App Sandbox.
 - Physische Langzeitabnahme mit großem synthetischem Bestand auf einem
   8-GB-Zielgerät steht aus.
 - Version 1 enthält keinen automatischen App-Updater.

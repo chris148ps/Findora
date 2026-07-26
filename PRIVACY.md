@@ -35,8 +35,8 @@ Suchanfragen werden dabei nicht übertragen.
 ## Lokale Speicherung
 
 ```text
-~/Library/Application Support/PrivateDocSearch/
-~/Library/Logs/PrivateDocSearch/
+~/Library/Application Support/Findora/
+~/Library/Logs/Findora/
 ```
 
 Logs enthalten keine extrahierten Dokumenttexte, Suchauszüge, Prompts oder
