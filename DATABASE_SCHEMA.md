@@ -1,6 +1,6 @@
 # Datenbankschema
 
-Die aktuelle erwartete Schema-Version ist **12**. `schema_migrations` enthält
+Die aktuelle erwartete Schema-Version ist **13**. `schema_migrations` enthält
 jede erfolgreich und transaktional angewendete Version mit Zeitstempel. Die
 App führt beim Öffnen nur noch fehlende Migrationen aus; ein Fehler rollt die
 jeweilige Migration vollständig zurück.
@@ -47,6 +47,17 @@ Schema-Migration 12 ergänzt inkrementelle Analyseversionen:
   Hintergrundaufträge.
 
 Die Migration übernimmt bestehende Dokumente, Seiten, OCR-Texte, Chunks,
-Embeddings und Maildaten unverändert. Automatisch nachgeholt werden nur
-fehlende Personen- und Projektanalysen. OCR, Embeddings und ein kompletter
+Embeddings und Maildaten unverändert. OCR, Embeddings und ein kompletter
 Indexaufbau benötigen weiterhin eine ausdrückliche Nutzeraktion.
+
+Schema-Migration 13 ergänzt die sichere Mail-Dublettenwartung:
+
+- `email_source_links` speichert den konkreten Quelldateipfad, Größe,
+  Datei-SHA-256 und ob eine Mail als eigenständige EML-/MSG-Datei verschoben
+  werden kann.
+- `email_source_link_suppressions` verhindert, dass ein bewusst nur aus
+  Findora entferntes Exemplar beim nächsten Quellenabgleich still wiederkehrt.
+
+Die Benutzerbereiche Kommunikationspartner und Projekte sind für ein späteres
+Update zurückgestellt. Bestehende Tabellen aus Schema 11 bleiben
+verlustfrei erhalten; Findora erzeugt derzeit keine neuen Projektgruppen.

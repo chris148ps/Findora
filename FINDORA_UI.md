@@ -79,8 +79,10 @@ Lokalisierungsprüfung muss vor einem Build ohne fehlende Schlüssel enden.
 ## Über-Fenster
 
 **Über Findora** zeigt Produktname, Version, Build, lokale Verarbeitung und den
-Hinweis, dass keine Telemetrie verwendet wird. Es verändert keine Dokumente
-und löst keine externen Abhängigkeitsprüfungen aus.
+Hinweis, dass keine allgemeine Telemetrie verwendet wird. Die separat
+aktivierbaren, bereinigten Crashberichte sind in den Einstellungen erklärt.
+Das Über-Fenster verändert keine Dokumente und löst keine externen
+Abhängigkeitsprüfungen aus.
 
 ## Kurzbeschreibungen
 

@@ -400,8 +400,8 @@ func communicationGraphLinksIdenticalPDFAttachmentsInBothImportOrders() async th
                 && $0.status == .automatic
                 && $0.confidence == 1
         })
-        #expect(context.partners.contains { $0.primaryAddress == "anna@synthetic-acme.test" })
-        #expect(context.projects.contains { $0.reference == "1001" })
+        #expect(context.partners.isEmpty)
+        #expect(context.projects.isEmpty)
         let emailSource = try #require(
             try await database.fileNameSearch(
                 terms: ["PRJ-1001 Nordhafen Auftrag"],
@@ -420,8 +420,7 @@ func communicationGraphLinksIdenticalPDFAttachmentsInBothImportOrders() async th
             embedder: TokenHashEmbedding(dimensions: 64),
             semanticEnabled: false
         ).search("PRJ-1001")
-        #expect(Set(projectMatches.map(\.contentType)).contains(.email))
-        #expect(projectMatches.contains { $0.matchKinds.contains(.relation) })
+        #expect(!projectMatches.contains { $0.matchKinds.contains(.relation) })
     }
 }
 
@@ -495,19 +494,17 @@ func communicationGraphKeepsFilenameOnlyAndSemanticMatchesAsSuggestions() async 
         $0.kind == .contentSimilarity && $0.status == .suggested
     })
     let partners = try await database.communicationPartners()
-    #expect(partners.count == 2)
+    #expect(partners.isEmpty)
     let organizations = try await database.organizations()
-    #expect(organizations.count == 2)
-    #expect(try await database.communicationProjects().contains {
-        $0.status == .suggested
-    })
+    #expect(organizations.isEmpty)
+    #expect(try await database.communicationProjects().isEmpty)
     let partnerMatches = try await HybridSearchService(
         database: database,
         embedder: TokenHashEmbedding(dimensions: 64),
         semanticEnabled: false
     ).search("Carla Kontakt")
     #expect(partnerMatches.contains { $0.contentType == .email })
-    #expect(partnerMatches.contains { $0.contentType != .email })
+    #expect(!partnerMatches.contains { $0.matchKinds.contains(.relation) })
 }
 
 @Test
@@ -518,8 +515,16 @@ func communicationGraphSeparatesMultipleContactsAndProjects() async throws {
         applicationSupport: root.appending(path: "Support"),
         logs: root.appending(path: "Logs")
     )
-    let first = root.appending(path: "first.eml")
-    let second = root.appending(path: "second.eml")
+    let importFolder = root.appending(
+        path: "Mails",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: importFolder,
+        withIntermediateDirectories: true
+    )
+    let first = importFolder.appending(path: "first.eml")
+    let second = importFolder.appending(path: "second.eml")
     try syntheticGraphEML(
         messageID: "first-project@test.invalid",
         subject: "PRJ-2001 Synthetisches Projekt Alpha",
@@ -543,15 +548,277 @@ func communicationGraphSeparatesMultipleContactsAndProjects() async throws {
     ).importSources(urls: [first, second], importMode: .referenced) { _ in }
     #expect(summary.imported == 2)
     let partners = try await database.communicationPartners()
-    #expect(partners.contains { $0.primaryAddress == "erika@synthetic-acme.test" })
-    #expect(partners.contains { $0.primaryAddress == "felix@synthetic-acme.test" })
+    #expect(partners.isEmpty)
     let organizations = try await database.organizations()
-    #expect(organizations.contains {
-        $0.domain == "synthetic-acme.test" && $0.partnerCount == 2
+    #expect(organizations.isEmpty)
+    #expect(try await database.communicationProjects().isEmpty)
+}
+
+@Test
+func mailDuplicateMaintenanceKeepsAReferenceAndSuppressesRemovedExemplars() async throws {
+    let root = try syntheticTemporaryDirectory("mail-duplicates")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let duplicateFolder = root.appending(
+        path: "Mails",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: duplicateFolder,
+        withIntermediateDirectories: true
+    )
+    let first = duplicateFolder.appending(path: "first.eml")
+    let second = duplicateFolder.appending(path: "second.eml")
+    let data = syntheticGraphEML(
+        messageID: "duplicate@test.invalid",
+        subject: "Synthetische Dublette",
+        sender: "Sender <sender@example.invalid>",
+        recipients: "Empfang <recipient@example.invalid>",
+        body: "Ausschließlich synthetische Testdaten"
+    )
+    try data.write(to: first)
+    try data.write(to: second)
+
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let service = MailImportService(
+        database: database,
+        embedder: TokenHashEmbedding(dimensions: 64),
+        archiveRoot: paths.mailArchive
+    )
+    let summary = try await service.importSources(
+        urls: [duplicateFolder],
+        importMode: .referenced
+    ) { _ in }
+    #expect(summary.imported == 1)
+    #expect(summary.duplicates == 1)
+
+    let group = try #require(try await database.mailDuplicateGroups().first)
+    #expect(group.exemplars.count == 2)
+    #expect(group.exemplars.filter(\.isReference).count == 1)
+    #expect(group.exemplars.allSatisfy {
+        $0.isIndividualFile && $0.sourceFileHash != nil
     })
-    let projects = try await database.communicationProjects()
-    #expect(projects.contains { $0.reference == "2001" })
-    #expect(projects.contains { $0.reference == "2002" })
+    let reference = try #require(group.exemplars.first { $0.isReference })
+    await #expect(throws: Error.self) {
+        try await database.removeMailDuplicateExemplars(linkIDs: [reference.id])
+    }
+    await #expect(throws: Error.self) {
+        try await database.removeMailDuplicateExemplars(
+            linkIDs: Set(group.exemplars.map(\.id))
+        )
+    }
+
+    let removable = try #require(group.exemplars.first { !$0.isReference })
+    #expect(
+        try await database.removeMailDuplicateExemplars(linkIDs: [removable.id])
+            == 1
+    )
+    #expect(try await database.mailDuplicateGroups().isEmpty)
+    #expect(FileManager.default.fileExists(atPath: first.path))
+    #expect(FileManager.default.fileExists(atPath: second.path))
+
+    _ = try await service.synchronizeSource(sourceID: removable.sourceID) { _ in }
+    #expect(try await database.mailDuplicateGroups().isEmpty)
+}
+
+@Test
+func mailDuplicateTrashChecksHashesReferenceAndMBOXContainerIndividually() async throws {
+    let root = try syntheticTemporaryDirectory("mail-duplicate-trash")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let folder = root.appending(path: "Mails", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let duplicateData = syntheticGraphEML(
+        messageID: "trash-duplicate@test.invalid",
+        subject: "Synthetische Papierkorb-Dublette",
+        sender: "Sender <sender@example.invalid>",
+        recipients: "Empfang <recipient@example.invalid>",
+        body: "Ausschließlich synthetische Testdaten"
+    )
+    let files = ["mail_original.eml", "mail_duplicate.eml", "mail_duplicate_2.eml"]
+        .map { folder.appending(path: $0) }
+    for file in files {
+        try duplicateData.write(to: file)
+    }
+    try syntheticGraphEML(
+        messageID: "similar@test.invalid",
+        subject: "Synthetisch ähnlich, aber verschieden",
+        sender: "Sender <sender@example.invalid>",
+        recipients: "Empfang <recipient@example.invalid>",
+        body: "Bewusst anderer Inhalt"
+    ).write(to: folder.appending(path: "mail_similar_but_different.eml"))
+
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let importer = MailImportService(
+        database: database,
+        embedder: TokenHashEmbedding(dimensions: 64),
+        archiveRoot: paths.mailArchive
+    )
+    _ = try await importer.importSources(
+        urls: [folder],
+        importMode: .referenced
+    ) { _ in }
+    var group = try #require(try await database.mailDuplicateGroups().first)
+    #expect(group.exemplars.count == 3)
+    #expect(try await database.mailDuplicateGroups().count == 1)
+    let reference = try #require(group.exemplars.first { $0.isReference })
+    let removable = group.exemplars.filter { !$0.isReference }
+    let good = try #require(removable.first)
+    let changed = try #require(removable.last)
+    let changedURL = try #require(changed.sourceFilePath.map {
+        URL(filePath: $0)
+    })
+    try Data("nachträglich verändert".utf8).write(to: changedURL)
+
+    let trash = MailTestTrashManager(
+        directory: root.appending(path: "Trash", directoryHint: .isDirectory)
+    )
+    let maintenance = DocumentMaintenanceService(
+        database: database,
+        trashManager: trash
+    )
+    let partial = await maintenance.trashMailDuplicateExemplars([good, changed])
+    #expect(partial.succeeded.count == 1)
+    #expect(partial.failures.count == 1)
+    #expect(
+        FileManager.default.fileExists(
+            atPath: try #require(reference.sourceFilePath)
+        )
+    )
+    #expect(FileManager.default.fileExists(atPath: changedURL.path))
+    #expect(trash.trashedItemCount == 1)
+
+    try duplicateData.write(to: changedURL)
+    _ = try await importer.synchronizeSource(sourceID: changed.sourceID) { _ in }
+    group = try #require(try await database.mailDuplicateGroups().first)
+    let currentReference = try #require(
+        group.exemplars.first { $0.isReference }
+    )
+    let currentRemovable = try #require(group.exemplars.first { !$0.isReference })
+    let referenceURL = URL(
+        filePath: try #require(currentReference.sourceFilePath)
+    )
+    let referenceBackup = try Data(contentsOf: referenceURL)
+    try FileManager.default.removeItem(at: referenceURL)
+    let missingReference = await maintenance.removeMailDuplicateExemplarsFromIndex(
+        [currentRemovable]
+    )
+    #expect(missingReference.failures.count == 1)
+    try referenceBackup.write(to: referenceURL)
+    _ = try await importer.synchronizeSource(sourceID: currentRemovable.sourceID) { _ in }
+
+    let mboxData = syntheticGraphEML(
+        messageID: "mbox-only-duplicate@test.invalid",
+        subject: "Synthetische MBOX-Dublette",
+        sender: "MBOX Sender <mbox@example.invalid>",
+        recipients: "MBOX Empfang <recipient@example.invalid>",
+        body: "Ausschließlich synthetischer MBOX-Inhalt"
+    )
+    let mboxMessage = String(data: mboxData, encoding: .utf8) ?? ""
+    let mboxBody = """
+    From synthetic@example.invalid Mon Jul 27 10:00:00 2026
+    \(mboxMessage)
+    """
+    let mboxFolder = root.appending(
+        path: "MBOX-Ordner",
+        directoryHint: .isDirectory
+    )
+    try FileManager.default.createDirectory(
+        at: mboxFolder,
+        withIntermediateDirectories: true
+    )
+    let firstMBOX = mboxFolder.appending(path: "first.mbox")
+    let secondMBOX = mboxFolder.appending(path: "second.mbox")
+    try Data(mboxBody.utf8).write(to: firstMBOX)
+    try Data(mboxBody.utf8).write(to: secondMBOX)
+    _ = try await importer.importSources(
+        urls: [mboxFolder],
+        importMode: .referenced
+    ) { _ in }
+    let mboxGroup = try #require(
+        try await database.mailDuplicateGroups().first {
+            $0.exemplars.allSatisfy { !$0.isIndividualFile }
+        }
+    )
+    let mboxRemoval = await maintenance.trashMailDuplicateExemplars(
+        [try #require(mboxGroup.exemplars.first { !$0.isReference })]
+    )
+    #expect(mboxRemoval.skipped.count == 1)
+    #expect(FileManager.default.fileExists(atPath: firstMBOX.path))
+    #expect(FileManager.default.fileExists(atPath: secondMBOX.path))
+}
+
+@Test
+func retiredPartnerAndProjectRowsSurviveImportWithoutNewProfiles() async throws {
+    let root = try syntheticTemporaryDirectory("retired-graph-data")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    var database: SQLiteDatabase? = SQLiteDatabase(url: paths.database)
+    try await database?.initialize()
+    try await database?.checkpointAndClose()
+    database = nil
+    try executeSyntheticSQL(
+        """
+        INSERT INTO organizations
+            (canonical_name, email_domain, created_at, updated_at)
+        VALUES ('Historisch', 'historisch.invalid', 1, 1);
+        INSERT INTO communication_partners
+            (organization_id, canonical_name, primary_address, created_at, updated_at)
+        VALUES (
+            (SELECT id FROM organizations WHERE email_domain='historisch.invalid'),
+            'Historischer Eintrag', 'historisch@invalid.example', 1, 1
+        );
+        INSERT INTO projects
+            (canonical_name, reference_key, relation_status, confidence, created_at, updated_at)
+        VALUES ('Historisches Projekt', 'HIST-1', 'confirmed', 1, 1, 1);
+        """,
+        at: paths.database
+    )
+    let reopened = SQLiteDatabase(url: paths.database)
+    try await reopened.initialize()
+    let eml = root.appending(path: "new.eml")
+    try syntheticGraphEML(
+        messageID: "no-new-profiles@test.invalid",
+        subject: "PRJ-9999 keine Profilbildung",
+        sender: "Neue Person <new@synthetic-acme.test>",
+        recipients: "Findora Test <findora@example.invalid>",
+        body: "Synthetischer Inhalt PRJ-9999"
+    ).write(to: eml)
+    _ = try await MailImportService(
+        database: reopened,
+        embedder: TokenHashEmbedding(dimensions: 64),
+        archiveRoot: paths.mailArchive
+    ).importSources(urls: [eml], importMode: .referenced) { _ in }
+
+    #expect(try await reopened.organizations().map(\.name) == ["Historisch"])
+    #expect(
+        try await reopened.communicationPartners().map(\.displayName)
+            == ["Historischer Eintrag"]
+    )
+    #expect(
+        try await reopened.communicationProjects().map(\.name)
+            == ["Historisches Projekt"]
+    )
+    let matches = try await HybridSearchService(
+        database: reopened,
+        embedder: TokenHashEmbedding(dimensions: 64),
+        semanticEnabled: false
+    ).search("Historischer Eintrag")
+    #expect(!matches.contains { $0.matchKinds.contains(.relation) })
+    #expect(try await reopened.databaseQuickCheck() == "ok")
+    #expect(try await reopened.databaseIntegrityCheck() == "ok")
+    #expect(try await reopened.databaseForeignKeyViolationCount() == 0)
 }
 
 @Test
@@ -847,6 +1114,38 @@ private func syntheticScalarInt(_ sql: String, at url: URL) throws -> Int {
         throw FindoraError.database("Synthetische Testabfrage lieferte keine Zeile.")
     }
     return Int(sqlite3_column_int64(statement, 0))
+}
+
+private final class MailTestTrashManager: TrashManaging, @unchecked Sendable {
+    private let directory: URL
+    private let lock = NSLock()
+    private var count = 0
+
+    init(directory: URL) {
+        self.directory = directory
+    }
+
+    var trashedItemCount: Int {
+        lock.withLock { count }
+    }
+
+    func trashItem(at url: URL) throws -> URL {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let target = directory.appending(
+            path: "\(UUID().uuidString)-\(url.lastPathComponent)"
+        )
+        try FileManager.default.moveItem(at: url, to: target)
+        lock.withLock { count += 1 }
+        return target
+    }
+
+    func restoreItem(from trashedURL: URL, to originalURL: URL) throws {
+        try FileManager.default.moveItem(at: trashedURL, to: originalURL)
+        lock.withLock { count -= 1 }
+    }
 }
 
 private func syntheticTemporaryDirectory(_ name: String) throws -> URL {

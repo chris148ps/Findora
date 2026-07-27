@@ -8,8 +8,16 @@ import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 
+final class FindoraApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        CrashReportCoordinator.endCurrentSession()
+    }
+}
+
 @main
 struct FindoraApplication: App {
+    @NSApplicationDelegateAdaptor(FindoraApplicationDelegate.self)
+    private var applicationDelegate
     @State private var state = AppState()
 
     var body: some Scene {
@@ -96,11 +104,37 @@ enum InterfaceAppearance: String, CaseIterable, Identifiable {
     }
 }
 
+private func translatedOCRDetail(_ value: String, isEnglish: Bool) -> String {
+    guard isEnglish else { return value }
+    return switch value {
+    case "unbestimmt": "undetermined"
+    case "Kontrastanhebung + 300 dpi": "Contrast enhancement + 300 dpi"
+    case "Binarisierung + 300 dpi": "Binarization + 300 dpi"
+    case "Begradigung und Randbereinigung": "Deskewing and border cleanup"
+    case "Deutsch + Englisch": "German + English"
+    case "400 dpi + Kontrastanhebung": "400 dpi + contrast enhancement"
+    case "Alternative OCR-Engine": "Alternative OCR engine"
+    case "Höhere Renderauflösung": "Higher rendering resolution"
+    case "Standardrendering + automatische Drehung":
+        "Standard rendering + automatic rotation"
+    case "Graustufen, Kontrast erhöhen, Hintergrund aufhellen":
+        "Grayscale, increased contrast, lightened background"
+    case "Schwarz-Weiß-Binarisierung und Rauschreduktion":
+        "Black-and-white binarization and noise reduction"
+    case "Begradigen, automatische Drehung und Randbereinigung":
+        "Deskewing, automatic rotation, and border cleanup"
+    case "Alternative Sprachkombination": "Alternative language combination"
+    case "Einzelverarbeitung mit hoher Auflösung":
+        "Single-file processing at high resolution"
+    case "Alternative lokale OCR-Engine + 300 dpi":
+        "Alternative local OCR engine + 300 dpi"
+    default: value
+    }
+}
+
 enum AppSection: String, CaseIterable, Identifiable {
     case search = "Suche"
     case mail = "E-Mail-Quellen"
-    case partners = "Kommunikationspartner"
-    case projects = "Projekte"
     case status = "Dokumentenstatus"
     case maintenance = "Dokumentenwartung"
     case versions = "Versionen"
@@ -115,8 +149,6 @@ enum AppSection: String, CaseIterable, Identifiable {
         switch self {
         case .search: "magnifyingglass"
         case .mail: "envelope"
-        case .partners: "person.2"
-        case .projects: "folder.badge.gearshape"
         case .status: "doc.text"
         case .maintenance: "wrench.and.screwdriver"
         case .versions: "clock.arrow.trianglehead.counterclockwise.rotate.90"
@@ -193,6 +225,7 @@ final class AppState {
     var isInstallingOCRComponents = false
     var ocrInstallationMessage: String?
     var duplicateGroups: [DuplicateGroup] = []
+    var mailDuplicateGroups: [MailDuplicateGroup] = []
     var emptyPageCandidates: [EmptyPageCandidate] = []
     var emptyPDFCandidates: [EmptyPDFCandidate] = []
     var ocrReviewCandidates: [OCRReviewCandidate] = []
@@ -207,17 +240,7 @@ final class AppState {
     var isAnswerModelLoaded = false
     var isEmbeddingModelLoaded = false
     var mailSources: [MailImportSource] = []
-    var communicationPartners: [CommunicationPartner] = []
-    var communicationProjects: [CommunicationProject] = []
-    var communicationGraphStatistics = CommunicationGraphStatistics(
-        partners: 0,
-        organizations: 0,
-        projects: 0,
-        automaticLinks: 0,
-        suggestions: 0
-    )
     var databaseVersionSnapshot: DatabaseVersionSnapshot?
-    var isAnalysisUpgradeRunning = false
     var pendingMailImport: PendingMailImport?
     var mailImportProgress: MailImportProgress?
     var mailImportMessage: String?
@@ -235,6 +258,10 @@ final class AppState {
     var isStorageMigrationInProgress = false
     var removedDocumentPolicy: RemovedDocumentPolicy = .removeAfterSuccessfulScan
     var lastSynchronizationMessage: String?
+    var automaticCrashReportsEnabled = false
+    var crashReportRecipient = ""
+    var crashReportDeliveryResult: CrashReportDeliveryResult?
+    var hasPendingCrashReport = false
     var hardwareProfile: HardwareProfile
 
     var interfaceLocale: Locale {
@@ -264,8 +291,6 @@ final class AppState {
         return switch section {
         case .search: "Search"
         case .mail: "Email sources"
-        case .partners: "Communication partners"
-        case .projects: "Projects"
         case .status: "Document status"
         case .maintenance: "Document maintenance"
         case .versions: "Versions"
@@ -325,7 +350,7 @@ final class AppState {
     private var statusRefreshTask: Task<Void, Never>?
     private var statusConsistencyTask: Task<Void, Never>?
     private var statusRefreshPending = false
-    private var analysisUpgradeTask: Task<Void, Never>?
+    private var crashReportSession: CrashReportSession?
 
     init() {
         do {
@@ -393,6 +418,20 @@ final class AppState {
             fatalError("Findora-Verzeichnisse konnten nicht angelegt werden: \(error)")
         }
 
+        crashReportSession = try? CrashReportCoordinator.beginSession(
+            logFile: paths.logs.appending(path: "Findora.log"),
+            appVersion: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String ?? "unbekannt",
+            buildVersion: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleVersion"
+            ) as? String ?? "unbekannt"
+        )
+        if let crashReportSession {
+            hasPendingCrashReport = CrashReportCoordinator.hasPendingReport(
+                session: crashReportSession
+            )
+        }
         startMemoryPressureMonitoring()
         Task { await start() }
     }
@@ -416,12 +455,11 @@ final class AppState {
                 return
             }
             try await database.initialize()
-            _ = try await database.prepareIncrementalAnalysisUpgrades()
             await refreshDatabaseVersions()
-            startIncrementalAnalysisUpgrades()
             await startDocumentStatusMonitoring()
             await runMemoryPressureDiagnosticIfRequested()
             await loadSettings()
+            await deliverPendingCrashReport()
             processingSession = try await database.latestProcessingSession()
             if let finishedAt = processingSession?.finishedAt,
                Date().timeIntervalSince(finishedAt) > 8 {
@@ -604,9 +642,15 @@ final class AppState {
                         self?.mailImportProgress = progress
                     }
                 }
-                mailImportMessage =
-                    "\(summary.imported) E-Mail(s) importiert, \(summary.updated) aktualisiert, "
-                    + "\(summary.duplicates) Dublette(n) übersprungen, \(summary.attachments) Anhang/Anhänge erkannt."
+                if interfaceLocale.language.languageCode?.identifier == "en" {
+                    mailImportMessage =
+                        "\(summary.imported) email(s) imported, \(summary.updated) updated, "
+                        + "\(summary.duplicates) duplicate(s) skipped, \(summary.attachments) attachment(s) detected."
+                } else {
+                    mailImportMessage =
+                        "\(summary.imported) E-Mail(s) importiert, \(summary.updated) aktualisiert, "
+                        + "\(summary.duplicates) Dublette(n) übersprungen, \(summary.attachments) Anhang/Anhänge erkannt."
+                }
                 await refreshMailSources()
                 await refreshDatabaseState()
             } catch is CancellationError {
@@ -649,8 +693,13 @@ final class AppState {
                         self?.mailImportProgress = progress
                     }
                 }
-                mailImportMessage =
-                    "Abgleich abgeschlossen: \(summary.imported) neu, \(summary.updated) aktualisiert, \(summary.duplicates) Dublette(n)."
+                if interfaceLocale.language.languageCode?.identifier == "en" {
+                    mailImportMessage =
+                        "Synchronization complete: \(summary.imported) new, \(summary.updated) updated, \(summary.duplicates) duplicate(s)."
+                } else {
+                    mailImportMessage =
+                        "Abgleich abgeschlossen: \(summary.imported) neu, \(summary.updated) aktualisiert, \(summary.duplicates) Dublette(n)."
+                }
                 await refreshMailSources()
                 await refreshDatabaseState()
             } catch {
@@ -1151,8 +1200,13 @@ final class AppState {
                 )
             }
             await refreshDatabaseState()
-            lastSynchronizationMessage =
-                "Synchronisation abgeschlossen: \(files.count) PDF-Datei(en) im führenden Dokumentenordner abgeglichen."
+            if interfaceLocale.language.languageCode?.identifier == "en" {
+                lastSynchronizationMessage =
+                    "Synchronization complete: \(files.count) PDF file(s) reconciled with the primary document folder."
+            } else {
+                lastSynchronizationMessage =
+                    "Synchronisation abgeschlossen: \(files.count) PDF-Datei(en) im führenden Dokumentenordner abgeglichen."
+            }
             await updateProcessingSession(failed: statistics.failedJobs)
             await finishProcessingSession(phase: .completed)
         } catch is CancellationError {
@@ -1217,6 +1271,14 @@ final class AppState {
     func saveSettings() {
         Task {
             do {
+                guard !automaticCrashReportsEnabled
+                        || CrashReportCoordinator.isValidEmailAddress(
+                            crashReportRecipient
+                        ) else {
+                    lastError =
+                        "Bitte eine gültige E-Mail-Adresse für Crashberichte eingeben."
+                    return
+                }
                 let data = try JSONEncoder().encode(ocrConfiguration)
                 guard let ocrJSON = String(data: data, encoding: .utf8) else {
                     throw FindoraError.processFailed("OCR-Einstellungen konnten nicht codiert werden.")
@@ -1228,11 +1290,22 @@ final class AppState {
                 try await database.setSetting(key: "interfaceLanguage", value: interfaceLanguage.rawValue)
                 try await database.setSetting(key: "interfaceAppearance", value: interfaceAppearance.rawValue)
                 try await database.setSetting(
+                    key: "automaticCrashReportsEnabled",
+                    value: automaticCrashReportsEnabled ? "1" : "0"
+                )
+                try await database.setSetting(
+                    key: "crashReportRecipient",
+                    value: crashReportRecipient.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    )
+                )
+                try await database.setSetting(
                     key: "removedDocumentPolicy",
                     value: removedDocumentPolicy.rawValue
                 )
                 startScanLoop()
                 modelMessage = "Einstellungen wurden lokal gespeichert."
+                await deliverPendingCrashReport()
             } catch {
                 report(error)
             }
@@ -1406,18 +1479,20 @@ final class AppState {
     func refreshMaintenance() async {
         do {
             async let duplicates = database.duplicateGroups()
+            async let mailDuplicates = database.mailDuplicateGroups()
             async let emptyPages = database.emptyPageCandidates()
             async let emptyPDFs = database.emptyPDFCandidates()
             async let ocrReview = database.ocrReviewCandidates()
             async let missingFiles = database.missingFileCandidates()
             let snapshot = try await (
-                duplicates, emptyPages, emptyPDFs, ocrReview, missingFiles
+                duplicates, mailDuplicates, emptyPages, emptyPDFs, ocrReview, missingFiles
             )
             duplicateGroups = snapshot.0
-            emptyPageCandidates = snapshot.1
-            emptyPDFCandidates = snapshot.2
-            ocrReviewCandidates = snapshot.3
-            missingFileCandidates = snapshot.4
+            mailDuplicateGroups = snapshot.1
+            emptyPageCandidates = snapshot.2
+            emptyPDFCandidates = snapshot.3
+            ocrReviewCandidates = snapshot.4
+            missingFileCandidates = snapshot.5
         } catch {
             report(error)
         }
@@ -1426,14 +1501,23 @@ final class AppState {
     func analyzeMissingPages() {
         guard !isMaintainingDocuments, !isProcessing else { return }
         isMaintainingDocuments = true
-        maintenanceMessage = "Fehlende Seitenanalysen werden ergänzt …"
+        maintenanceMessage =
+            interfaceLocale.language.languageCode?.identifier == "en"
+                ? "Adding missing page analyses…"
+                : "Fehlende Seitenanalysen werden ergänzt …"
         Task {
             defer { isMaintainingDocuments = false }
             do {
                 let count = try await maintenanceService.analyzeMissingPages()
-                maintenanceMessage = count == 0
-                    ? "Alle indexierten PDFs besitzen bereits eine Seitenanalyse."
-                    : "\(count) PDF(s) wurden ohne erneute OCR visuell analysiert."
+                if interfaceLocale.language.languageCode?.identifier == "en" {
+                    maintenanceMessage = count == 0
+                        ? "All indexed PDFs already have a page analysis."
+                        : "\(count) PDF(s) were visually analyzed without running OCR again."
+                } else {
+                    maintenanceMessage = count == 0
+                        ? "Alle indexierten PDFs besitzen bereits eine Seitenanalyse."
+                        : "\(count) PDF(s) wurden ohne erneute OCR visuell analysiert."
+                }
                 try? await fileLogger.log(
                     .info,
                     category: "Dokumentenwartung",
@@ -1475,7 +1559,9 @@ final class AppState {
         guard !isMaintainingDocuments, !isProcessing else { return }
         isMaintainingDocuments = true
         maintenanceMessage =
-            "Leerseitenanalyse für Seite \(candidate.pageNumber) wird neu ausgeführt …"
+            interfaceLocale.language.languageCode?.identifier == "en"
+                ? "Reanalyzing page \(candidate.pageNumber) for empty content…"
+                : "Leerseitenanalyse für Seite \(candidate.pageNumber) wird neu ausgeführt …"
         Task {
             defer { isMaintainingDocuments = false }
             do {
@@ -1485,7 +1571,9 @@ final class AppState {
                     pageNumber: candidate.pageNumber
                 )
                 maintenanceMessage =
-                    "Seite \(candidate.pageNumber) wurde neu geprüft: \(result.status.displayName)."
+                    interfaceLocale.language.languageCode?.identifier == "en"
+                        ? "Page \(candidate.pageNumber) was checked again."
+                        : "Seite \(candidate.pageNumber) wurde neu geprüft: \(result.status.displayName)."
                 try? await fileLogger.log(
                     .info,
                     category: "Leerseitenanalyse",
@@ -1676,32 +1764,58 @@ final class AppState {
               !isMaintainingDocuments,
               !isProcessing else { return }
         isMaintainingDocuments = true
+        lastError = nil
         maintenanceMessage = "Bestätigte leere Seiten werden sicher entfernt …"
         Task {
             defer { isMaintainingDocuments = false }
-            do {
-                for group in Dictionary(grouping: candidates, by: \.absolutePath).values {
-                    guard let representative = group.first else { continue }
+            var succeeded = 0
+            var failures: [(fileName: String, reason: String)] = []
+            for group in Dictionary(grouping: candidates, by: \.absolutePath).values {
+                guard let representative = group.first else { continue }
+                do {
                     try await maintenanceService.removePages(
                         from: representative,
                         pageNumbers: Set(group.map(\.pageNumber))
                     )
+                    succeeded += group.count
+                } catch {
+                    failures.append(
+                        (representative.fileName, error.localizedDescription)
+                    )
                 }
+            }
+            if succeeded > 0 {
                 await processor.processPending(
                     ocrConfiguration: ocrConfiguration
                 ) { _ in }
-                maintenanceMessage =
-                    "\(candidates.count) bestätigte Seite(n) entfernt; Originalfassungen liegen im Papierkorb und der Suchindex wurde gezielt aktualisiert."
-                try? await fileLogger.log(
-                    .warning,
-                    category: "Dokumentenwartung",
-                    message: "Bestätigte leere Seiten entfernt und betroffene PDFs neu indexiert: \(candidates.count)."
-                )
-                await refreshMaintenance()
-                await refreshDatabaseState()
-            } catch {
-                report(error)
             }
+            if interfaceLocale.language.languageCode?.identifier == "en" {
+                maintenanceMessage =
+                    "\(succeeded) page(s) removed, \(failures.count) PDF(s) failed. Original versions of successful operations are in the Trash."
+            } else {
+                maintenanceMessage =
+                    "\(succeeded) Seite(n) entfernt, \(failures.count) PDF(s) fehlgeschlagen. Originalfassungen erfolgreicher Vorgänge liegen im Papierkorb."
+            }
+            if !failures.isEmpty {
+                lastError = failures.map {
+                    "\($0.fileName): \(localizedMaintenanceFailure($0.reason))"
+                }.joined(separator: "\n")
+            }
+            try? await fileLogger.log(
+                .warning,
+                category: "Dokumentenwartung",
+                message: "Bestätigte leere Seiten entfernt und betroffene PDFs neu indexiert: \(candidates.count)."
+            )
+            await refreshMaintenance()
+            await refreshDatabaseState()
+        }
+    }
+
+    func removeEmptyPDFsFromIndex(_ candidates: [EmptyPDFCandidate]) {
+        runMaintenanceAction(
+            message: "Bestätigte leere PDFs werden nur aus Findora entfernt …"
+        ) {
+            await self.maintenanceService.removeEmptyPDFsFromIndex(candidates)
         }
     }
 
@@ -1710,24 +1824,128 @@ final class AppState {
               !isMaintainingDocuments,
               !isProcessing else { return }
         isMaintainingDocuments = true
+        lastError = nil
         maintenanceMessage = "Bestätigte leere PDFs werden in den Papierkorb verschoben …"
         Task {
             defer { isMaintainingDocuments = false }
-            do {
-                let count = try await maintenanceService.trashEmptyPDFs(candidates)
+            let result = await maintenanceService
+                .trashEmptyPDFsIndividually(candidates)
+            if interfaceLocale.language.languageCode?.identifier == "en" {
                 maintenanceMessage =
-                    "\(count) bestätigte leere PDF(s) wurden in den macOS-Papierkorb verschoben."
-                try? await fileLogger.log(
-                    .warning,
-                    category: "Dokumentenwartung",
-                    message: "Bestätigte leere PDFs in den Papierkorb verschoben: \(count)."
-                )
-                await refreshMaintenance()
-                await refreshDatabaseState()
-            } catch {
-                report(error)
+                    "Empty PDFs: \(result.succeeded.count) succeeded, \(result.skipped.count) skipped, \(result.failures.count) failed."
+            } else {
+                maintenanceMessage =
+                    "Leere PDFs: \(result.summary)"
             }
+            if !result.failures.isEmpty {
+                lastError = result.failures.map {
+                    "\($0.objectName): \(localizedMaintenanceFailure($0.reason))"
+                }.joined(separator: "\n")
+            }
+            try? await fileLogger.log(
+                .warning,
+                category: "Dokumentenwartung",
+                message: "Leere PDFs: \(result.summary)"
+            )
+            await refreshMaintenance()
+            await refreshDatabaseState()
         }
+    }
+
+    func removeOCRReviewEntries(_ candidates: [OCRReviewCandidate]) {
+        runMaintenanceAction(
+            message: "Ausgewählte Seiten werden aus der OCR-Prüfliste entfernt …"
+        ) {
+            await self.maintenanceService.removeOCRReviewEntries(candidates)
+        }
+    }
+
+    func removeOCRReviewDocumentsFromIndex(
+        _ candidates: [OCRReviewCandidate]
+    ) {
+        runMaintenanceAction(
+            message: "Ausgewählte Dokumente werden nur aus dem Findora-Index entfernt …"
+        ) {
+            await self.maintenanceService
+                .removeOCRReviewDocumentsFromIndex(candidates)
+        }
+    }
+
+    func trashOCRReviewDocuments(_ candidates: [OCRReviewCandidate]) {
+        runMaintenanceAction(
+            message: "Ausgewählte Originaldateien werden in den Papierkorb verschoben …"
+        ) {
+            await self.maintenanceService.trashOCRReviewDocuments(candidates)
+        }
+    }
+
+    func removeMailDuplicateExemplarsFromIndex(
+        _ exemplars: [MailDuplicateExemplar]
+    ) {
+        runMaintenanceAction(
+            message: "Ausgewählte Mail-Exemplare werden nur aus Findora entfernt …"
+        ) {
+            await self.maintenanceService
+                .removeMailDuplicateExemplarsFromIndex(exemplars)
+        }
+    }
+
+    func trashMailDuplicateExemplars(
+        _ exemplars: [MailDuplicateExemplar]
+    ) {
+        runMaintenanceAction(
+            message: "Ausgewählte eigenständige Mail-Dateien werden in den Papierkorb verschoben …"
+        ) {
+            await self.maintenanceService.trashMailDuplicateExemplars(exemplars)
+        }
+    }
+
+    private func runMaintenanceAction(
+        message: String,
+        operation: @escaping @MainActor () async -> MaintenanceBatchResult
+    ) {
+        guard !isMaintainingDocuments, !isProcessing else { return }
+        isMaintainingDocuments = true
+        lastError = nil
+        maintenanceMessage = message
+        Task {
+            let result = await operation()
+            if interfaceLocale.language.languageCode?.identifier == "en" {
+                maintenanceMessage =
+                    "\(result.succeeded.count) succeeded, \(result.skipped.count) skipped, \(result.failures.count) failed."
+            } else {
+                maintenanceMessage = result.summary
+            }
+            if !result.failures.isEmpty {
+                lastError = result.failures
+                    .map {
+                        "\($0.objectName): \(localizedMaintenanceFailure($0.reason))"
+                    }
+                    .joined(separator: "\n")
+            }
+            await refreshMaintenance()
+            await refreshDatabaseState()
+            isMaintainingDocuments = false
+        }
+    }
+
+    private func localizedMaintenanceFailure(_ reason: String) -> String {
+        guard interfaceLocale.language.languageCode?.identifier == "en" else {
+            return reason
+        }
+        return reason
+            .replacingOccurrences(
+                of: "Der lokale Prozess ist fehlgeschlagen:",
+                with: "The local process failed:"
+            )
+            .replacingOccurrences(
+                of: "Die Datei wurde seit der Prüfung verändert; die Wartungsaktion wurde abgebrochen.",
+                with: "The file changed after it was reviewed; the maintenance action was cancelled."
+            )
+            .replacingOccurrences(
+                of: "Einzelne Seiten dürfen nur entfernt werden, wenn mindestens eine Seite erhalten bleibt.",
+                with: "Pages can be removed only when at least one page remains."
+            )
     }
 
     func trashDuplicateLocations(_ locations: [DuplicateLocation]) {
@@ -1932,21 +2150,9 @@ final class AppState {
     func refreshDatabaseState() async {
         do {
             await refreshDocumentStatus()
-            await refreshCommunicationGraph()
             logEntries = try await database.recentErrors()
         } catch {
             report(error)
-        }
-    }
-
-    func refreshCommunicationGraph() async {
-        do {
-            communicationPartners = try await database.communicationPartners()
-            communicationProjects = try await database.communicationProjects()
-            communicationGraphStatistics =
-                try await database.communicationGraphStatistics()
-        } catch {
-            report(error, taskType: "Kommunikationsverknüpfungen laden")
         }
     }
 
@@ -1966,46 +2172,6 @@ final class AppState {
         }
     }
 
-    func startIncrementalAnalysisUpgrades() {
-        guard analysisUpgradeTask == nil,
-              databaseVersionSnapshot?.upgradePaused != true else { return }
-        analysisUpgradeTask = Task {
-            isAnalysisUpgradeRunning = true
-            defer {
-                isAnalysisUpgradeRunning = false
-                analysisUpgradeTask = nil
-            }
-            do {
-                _ = try await database.prepareIncrementalAnalysisUpgrades()
-                while !Task.isCancelled {
-                    let completed = try await database
-                        .runIncrementalAnalysisUpgradeBatch(limit: 40)
-                    await refreshDatabaseVersions()
-                    if completed == 0 { break }
-                    await Task.yield()
-                }
-                await refreshCommunicationGraph()
-            } catch {
-                report(error, taskType: "Inkrementelle Analyseaktualisierung")
-            }
-        }
-    }
-
-    func setAnalysisUpgradePaused(_ paused: Bool) {
-        Task {
-            do {
-                if paused {
-                    analysisUpgradeTask?.cancel()
-                    analysisUpgradeTask = nil
-                }
-                try await database.setAnalysisUpgradePaused(paused)
-                await refreshDatabaseVersions()
-                if !paused { startIncrementalAnalysisUpgrades() }
-            } catch {
-                report(error, taskType: "Analyseaktualisierung pausieren")
-            }
-        }
-    }
 
     func checkStatusValues() async {
         do {
@@ -2512,6 +2678,10 @@ final class AppState {
                let appearance = InterfaceAppearance(rawValue: value) {
                 interfaceAppearance = appearance
             }
+            automaticCrashReportsEnabled =
+                try await database.setting(key: "automaticCrashReportsEnabled") == "1"
+            crashReportRecipient =
+                try await database.setting(key: "crashReportRecipient") ?? ""
             if let value = try await database.setting(key: "removedDocumentPolicy"),
                let policy = RemovedDocumentPolicy(rawValue: value) {
                 removedDocumentPolicy = policy
@@ -2520,6 +2690,75 @@ final class AppState {
             await processor.setPaused(isPaused)
         } catch {
             report(error)
+        }
+    }
+
+    private func deliverPendingCrashReport() async {
+        guard let crashReportSession else { return }
+        hasPendingCrashReport = CrashReportCoordinator.hasPendingReport(
+            session: crashReportSession
+        )
+        let result = await CrashReportCoordinator.deliverPendingReport(
+            session: crashReportSession,
+            configuration: CrashReportConfiguration(
+                isEnabled: automaticCrashReportsEnabled,
+                recipient: crashReportRecipient
+            ),
+            sender: AppleMailCrashReportSender()
+        )
+        crashReportDeliveryResult = result
+        hasPendingCrashReport = CrashReportCoordinator.hasPendingReport(
+            session: crashReportSession
+        )
+        let level: AppLogLevel = result == .sent ? .info : .warning
+        switch result {
+        case .noPendingReport:
+            return
+        case .disabled:
+            try? await fileLogger.log(
+                .info,
+                category: "Crashbericht",
+                message: "Ein lokaler Crashbericht wartet; automatischer Versand ist deaktiviert."
+            )
+        case .invalidRecipient:
+            try? await fileLogger.log(
+                .warning,
+                category: "Crashbericht",
+                message: "Ein lokaler Crashbericht wartet; die Empfängeradresse ist ungültig."
+            )
+        case .sent:
+            try? await fileLogger.log(
+                level,
+                category: "Crashbericht",
+                message: "Der bereinigte Crashbericht wurde über Apple Mail übergeben."
+            )
+        case .failed(let reason):
+            try? await fileLogger.log(
+                level,
+                category: "Crashbericht",
+                message: "Apple-Mail-Versand fehlgeschlagen: \(reason)"
+            )
+        }
+    }
+
+    func retryPendingCrashReport() {
+        Task { await deliverPendingCrashReport() }
+    }
+
+    var crashReportStatusText: LocalizedStringKey {
+        switch crashReportDeliveryResult {
+        case .none, .noPendingReport:
+            return hasPendingCrashReport
+                ? "Ein Crashbericht wartet auf den Versand."
+                : "Kein Crashbericht wartet auf den Versand."
+        case .disabled:
+            return "Ein Crashbericht wartet; automatischer Versand ist deaktiviert."
+        case .invalidRecipient:
+            return "Ein Crashbericht wartet; die Empfängeradresse ist ungültig."
+        case .sent:
+            return "Der Crashbericht wurde über Apple Mail gesendet."
+        case .failed:
+            return "Der Crashbericht konnte noch nicht über Apple Mail gesendet werden."
         }
     }
 
@@ -2772,8 +3011,6 @@ struct ContentView: View {
                         switch state.selectedSection ?? .search {
                         case .search: SearchView()
                         case .mail: MailSourcesView()
-                        case .partners: CommunicationPartnersView()
-                        case .projects: CommunicationProjectsView()
                         case .status: StatusView()
                         case .maintenance: MaintenanceView()
                         case .versions: DatabaseVersionsView()
@@ -2806,6 +3043,7 @@ struct ContentView: View {
         }
         .sheet(item: $state.pendingMailImport) { pending in
             MailImportConfirmationView(importRequest: pending)
+                .environment(\.locale, state.interfaceLocale)
         }
         .sheet(item: $state.pendingStorageChange) { change in
             StorageMigrationConfirmationView(change: change)
@@ -2866,7 +3104,7 @@ private struct FindoraSidebar: View {
             Divider()
 
             List(selection: $selection) {
-                sidebarSection([.search, .mail, .partners, .projects])
+                sidebarSection([.search, .mail])
                 sidebarSection([.status, .maintenance, .versions])
                 sidebarSection([.ocr, .models])
                 sidebarSection([.settings, .logs])
@@ -2929,7 +3167,7 @@ private struct FindoraAboutView: View {
             .multilineTextAlignment(.center)
             .frame(maxWidth: 360)
             Label(
-                isEnglish ? "No telemetry" : "Keine Telemetrie",
+                isEnglish ? "No general telemetry" : "Keine allgemeine Telemetrie",
                 systemImage: "hand.raised.fill"
             )
                 .foregroundStyle(.secondary)
@@ -2939,181 +3177,6 @@ private struct FindoraAboutView: View {
         .padding(32)
         .frame(minWidth: 440)
         .accessibilityElement(children: .contain)
-    }
-}
-
-struct CommunicationPartnersView: View {
-    @Environment(AppState.self) private var state
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Kommunikationspartner").font(.title2.bold())
-                        Text(
-                            "Lokal zusammengeführte Absender, Empfänger, Organisationen und Alias-Adressen."
-                        )
-                        .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Aktualisieren") {
-                        Task { await state.refreshCommunicationGraph() }
-                    }
-                }
-                HStack(spacing: 10) {
-                    GraphSummaryTile(
-                        title: "Partner",
-                        value: state.communicationGraphStatistics.partners,
-                        symbol: "person.2"
-                    )
-                    GraphSummaryTile(
-                        title: "Organisationen",
-                        value: state.communicationGraphStatistics.organizations,
-                        symbol: "building.2"
-                    )
-                    GraphSummaryTile(
-                        title: "Sichere Verknüpfungen",
-                        value: state.communicationGraphStatistics.automaticLinks,
-                        symbol: "link.badge.plus"
-                    )
-                    GraphSummaryTile(
-                        title: "Vorschläge",
-                        value: state.communicationGraphStatistics.suggestions,
-                        symbol: "questionmark.diamond"
-                    )
-                }
-                if state.communicationPartners.isEmpty {
-                    ContentUnavailableView(
-                        "Noch keine Kommunikationspartner",
-                        systemImage: "person.2.slash",
-                        description: Text(
-                            "Partner entstehen automatisch beim lokalen Import von E-Mails."
-                        )
-                    )
-                    .frame(maxWidth: .infinity, minHeight: 260)
-                } else {
-                    LazyVStack(spacing: 10) {
-                        ForEach(state.communicationPartners) { partner in
-                            VStack(alignment: .leading, spacing: 9) {
-                                HStack(alignment: .firstTextBaseline) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(partner.displayName).font(.headline)
-                                        Text(partner.primaryAddress)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    if let organization = partner.organizationName {
-                                        Label(organization, systemImage: "building.2")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    if let activity = partner.lastActivity {
-                                        Text(activity.formatted(date: .abbreviated, time: .omitted))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                HStack(spacing: 7) {
-                                    GraphCountBadge("E-Mails", partner.emailCount)
-                                    GraphCountBadge("PDFs", partner.pdfCount)
-                                    GraphCountBadge("Angebote", partner.offerCount)
-                                    GraphCountBadge("Rechnungen", partner.invoiceCount)
-                                    GraphCountBadge("Bilder", partner.imageCount)
-                                }
-                                if partner.aliasAddresses.count > 1 {
-                                    Text(
-                                        "Aliase: " + partner.aliasAddresses.joined(separator: ", ")
-                                    )
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                }
-                            }
-                            .padding(14)
-                            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
-                        }
-                    }
-                }
-            }
-            .padding(20)
-        }
-        .task { await state.refreshCommunicationGraph() }
-    }
-}
-
-struct CommunicationProjectsView: View {
-    @Environment(AppState.self) private var state
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Projekte").font(.title2.bold())
-                        Text(
-                            "Automatische lokale Gruppierung über Betreff, Text, Dateiname und Projektreferenzen."
-                        )
-                        .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("Aktualisieren") {
-                        Task { await state.refreshCommunicationGraph() }
-                    }
-                }
-                if state.communicationProjects.isEmpty {
-                    ContentUnavailableView(
-                        "Noch keine Projekte erkannt",
-                        systemImage: "folder.badge.questionmark",
-                        description: Text(
-                            "Eindeutige Referenzen wie PRJ-1001 oder AUFTRAG 4711 werden automatisch gruppiert."
-                        )
-                    )
-                    .frame(maxWidth: .infinity, minHeight: 300)
-                } else {
-                    LazyVStack(spacing: 10) {
-                        ForEach(state.communicationProjects) { project in
-                            VStack(alignment: .leading, spacing: 9) {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(project.name).font(.headline)
-                                        Text("Referenz: \(project.reference)")
-                                            .font(.caption.monospaced())
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    SearchBadge(
-                                        text: project.status.displayName,
-                                        color: project.status == .suggested ? .orange : .green
-                                    )
-                                }
-                                HStack(spacing: 7) {
-                                    GraphCountBadge("E-Mails", project.emailCount)
-                                    GraphCountBadge("Dokumente", project.documentCount)
-                                    if let activity = project.lastActivity {
-                                        Text("Zuletzt \(activity.formatted(date: .abbreviated, time: .omitted))")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                if !project.partnerNames.isEmpty {
-                                    Label(
-                                        project.partnerNames.joined(separator: ", "),
-                                        systemImage: "person.2"
-                                    )
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                }
-                            }
-                            .padding(14)
-                            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
-                        }
-                    }
-                }
-            }
-            .padding(20)
-        }
-        .task { await state.refreshCommunicationGraph() }
     }
 }
 
@@ -3250,9 +3313,9 @@ struct MailSourcesView: View {
                                 Grid(alignment: .leading, horizontalSpacing: 20) {
                                     GridRow {
                                         Text("Typ").foregroundStyle(.secondary)
-                                        Text(source.format.displayName)
+                                        Text(LocalizedStringKey(source.format.displayName))
                                         Text("Modus").foregroundStyle(.secondary)
-                                        Text(source.importMode.displayName)
+                                        Text(LocalizedStringKey(source.importMode.displayName))
                                     }
                                     GridRow {
                                         Text("Nachrichten").foregroundStyle(.secondary)
@@ -3361,7 +3424,7 @@ struct MailImportConfirmationView: View {
             }
             Picker("Importmodus", selection: $mode) {
                 ForEach(MailImportMode.allCases) { mode in
-                    Text(mode.displayName).tag(mode)
+                    Text(LocalizedStringKey(mode.displayName)).tag(mode)
                 }
             }
             .onChange(of: mode) { _, value in
@@ -3670,7 +3733,7 @@ struct SearchView: View {
             VStack(spacing: 8) {
                 Picker("Inhalt", selection: $state.searchContentFilter) {
                     ForEach(SearchContentFilter.allCases) { filter in
-                        Text(filter.displayName).tag(filter)
+                        Text(LocalizedStringKey(filter.displayName)).tag(filter)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -3874,7 +3937,7 @@ struct SearchBadge: View {
     let color: Color
 
     var body: some View {
-        Text(text)
+        Text(LocalizedStringKey(text))
             .font(.caption2.bold())
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
@@ -3949,6 +4012,7 @@ struct MailSourcePreview: View {
 
 struct PDFSourcePreview: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.locale) private var locale
     let source: SearchSource
 
     var body: some View {
@@ -3956,7 +4020,11 @@ struct PDFSourcePreview: View {
             HStack {
                 VStack(alignment: .leading) {
                     Text(source.fileName).font(.headline)
-                    Text("Seite \(source.pageNumber) · \(source.absolutePath)")
+                    Text(
+                        locale.language.languageCode?.identifier == "en"
+                            ? "Page \(source.pageNumber) · \(source.absolutePath)"
+                            : "Seite \(source.pageNumber) · \(source.absolutePath)"
+                    )
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -3980,25 +4048,11 @@ private struct GraphContextPanel: View {
     @State private var context = CommunicationGraphContext()
 
     var body: some View {
-        if !context.partners.isEmpty
-            || !context.projects.isEmpty
-            || !context.linkedEmails.isEmpty
+        if !context.linkedEmails.isEmpty
             || !context.linkedDocuments.isEmpty {
             VStack(alignment: .leading, spacing: 7) {
                 Label("Verknüpfungen", systemImage: "point.3.connected.trianglepath.dotted")
                     .font(.subheadline.bold())
-                if !context.partners.isEmpty {
-                    LabeledContent(
-                        "Partner",
-                        value: context.partners.map(\.displayName).joined(separator: ", ")
-                    )
-                }
-                if !context.projects.isEmpty {
-                    LabeledContent(
-                        "Projekte",
-                        value: context.projects.map(\.name).joined(separator: ", ")
-                    )
-                }
                 ForEach(context.linkedEmails.prefix(3)) { link in
                     graphLinkRow(link, symbol: "envelope")
                 }
@@ -4434,7 +4488,8 @@ private struct TechnicalMetricGroup: View {
 }
 
 private enum MaintenanceSection: String, CaseIterable, Identifiable {
-    case duplicates = "Duplikate"
+    case mailDuplicates = "Mail-Dubletten"
+    case duplicates = "PDF-Duplikate"
     case emptyPages = "Leere Seiten"
     case ocrReview = "OCR prüfen"
     case emptyPDFs = "Leere PDFs"
@@ -4499,16 +4554,6 @@ struct DatabaseVersionsView: View {
                             value: snapshot.expectedSchemaVersion,
                             symbol: "checkmark.seal"
                         )
-                        GraphSummaryTile(
-                            title: "Offene Upgrades",
-                            value: snapshot.pendingUpgrades,
-                            symbol: "arrow.triangle.2.circlepath"
-                        )
-                        GraphSummaryTile(
-                            title: "Fehlgeschlagen",
-                            value: snapshot.failedUpgrades,
-                            symbol: "exclamationmark.triangle"
-                        )
                     }
                     if let migrated = snapshot.lastMigrationAt {
                         LabeledContent(
@@ -4517,7 +4562,10 @@ struct DatabaseVersionsView: View {
                         )
                     }
                     VStack(spacing: 0) {
-                        ForEach(snapshot.versions) { version in
+                        ForEach(snapshot.versions.filter {
+                            $0.kind != .peopleAnalysis
+                                && $0.kind != .projectAnalysis
+                        }) { version in
                             HStack {
                                 Text(version.kind.displayName)
                                     .frame(width: 150, alignment: .leading)
@@ -4535,28 +4583,6 @@ struct DatabaseVersionsView: View {
                     }
                     .padding(.horizontal, 12)
                     .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
-
-                    HStack {
-                        Button("Fehlende Analysen ergänzen") {
-                            state.startIncrementalAnalysisUpgrades()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(
-                            state.isAnalysisUpgradeRunning
-                                || snapshot.upgradePaused
-                                || snapshot.pendingUpgrades == 0
-                        )
-                        Button(snapshot.upgradePaused ? "Fortsetzen" : "Pausieren") {
-                            state.setAnalysisUpgradePaused(!snapshot.upgradePaused)
-                        }
-                        .disabled(snapshot.pendingUpgrades == 0 && !snapshot.upgradePaused)
-                        if state.isAnalysisUpgradeRunning {
-                            ProgressView().controlSize(.small)
-                            Text("Fehlende Personen-/Projektanalysen werden lokal ergänzt.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
 
                     GroupBox("Explizite Wartungsaktionen") {
                         VStack(alignment: .leading, spacing: 10) {
@@ -4618,19 +4644,32 @@ struct MaintenanceView: View {
     @State private var filter = ""
     @State private var sort: MaintenanceSort = .fileName
     @State private var statusFilter: MaintenanceStatusFilter = .all
+    @State private var selectedMailExemplarIDs: Set<Int64> = []
     @State private var selectedDuplicatePaths: Set<String> = []
     @State private var selectedPageIDs: Set<String> = []
     @State private var selectedOCRReviewIDs: Set<String> = []
     @State private var selectedEmptyPDFPaths: Set<String> = []
     @State private var selectedMissingPaths: Set<String> = []
+    @State private var directPageRemovalID: String?
+    @State private var directEmptyPDFPath: String?
     @State private var manualOCRCandidate: OCRReviewCandidate?
+    @State private var confirmsMailIndexRemoval = false
+    @State private var confirmsMailTrash = false
     @State private var confirmsDuplicateTrash = false
     @State private var confirmsPageRemoval = false
+    @State private var confirmsEmptyPDFIndexRemoval = false
     @State private var confirmsEmptyPDFTrash = false
+    @State private var confirmsOCRReviewRemoval = false
+    @State private var confirmsOCRIndexRemoval = false
+    @State private var confirmsOCRTrash = false
     @State private var confirmsIndexReset = false
     @State private var confirmsIndexResetFinally = false
 
-    var body: some View {
+    private var isEnglish: Bool {
+        state.interfaceLocale.language.languageCode?.identifier == "en"
+    }
+
+    private var maintenanceBase: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
                 maintenanceSectionPicker
@@ -4669,6 +4708,8 @@ struct MaintenanceView: View {
 
             Group {
                 switch section {
+                case .mailDuplicates:
+                    mailDuplicateList
                 case .duplicates:
                     duplicateList
                 case .emptyPages:
@@ -4701,6 +4742,42 @@ struct MaintenanceView: View {
             ManualOCRReviewSheet(candidate: candidate)
                 .environment(state)
         }
+    }
+
+    var body: some View {
+        maintenanceBase
+        .confirmationDialog(
+            "Mail-Dubletten nur aus Findora entfernen?",
+            isPresented: $confirmsMailIndexRemoval
+        ) {
+            Button("Nur aus Findora entfernen", role: .destructive) {
+                state.removeMailDuplicateExemplarsFromIndex(selectedMailExemplars)
+                selectedMailExemplarIDs.removeAll()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text(
+                isEnglish
+                    ? "\(selectedMailExemplars.count) exemplar(s) will be permanently removed from the Findora index. Source files stay unchanged and one reference exemplar remains for each email."
+                    : "\(selectedMailExemplars.count) Exemplar(e) werden dauerhaft aus dem Findora-Index entfernt. Quelldateien bleiben unverändert; je Mail bleibt ein Referenzexemplar erhalten."
+            )
+        }
+        .confirmationDialog(
+            "Originale der Mail-Dubletten in den Papierkorb?",
+            isPresented: $confirmsMailTrash
+        ) {
+            Button("Originaldateien in den Papierkorb", role: .destructive) {
+                state.trashMailDuplicateExemplars(selectedMailExemplars)
+                selectedMailExemplarIDs.removeAll()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text(
+                isEnglish
+                    ? "\(selectedStandaloneMailExemplars.count) standalone EML/MSG file(s) will be moved to the macOS Trash and removed from Findora. MBOX entries and reference exemplars remain."
+                    : "\(selectedStandaloneMailExemplars.count) eigenständige EML-/MSG-Datei(en) werden in den macOS-Papierkorb verschoben und aus Findora entfernt. MBOX-Einträge und Referenzexemplare bleiben erhalten."
+            )
+        }
         .confirmationDialog(
             "Ausgewählte Duplikate in den Papierkorb verschieben?",
             isPresented: $confirmsDuplicateTrash
@@ -4712,7 +4789,55 @@ struct MaintenanceView: View {
             Button("Abbrechen", role: .cancel) {}
         } message: {
             Text(
-                "Nur byteidentische SHA-256-Duplikate werden verschoben. Je Gruppe muss mindestens eine Datei erhalten bleiben."
+                "\(selectedDuplicateLocations.count) byteidentische PDF-Datei(en) werden in den Papierkorb verschoben. Je SHA-256-Gruppe bleibt mindestens eine Datei erhalten."
+            )
+        }
+        .confirmationDialog(
+            "Aus OCR-Prüfliste entfernen?",
+            isPresented: $confirmsOCRReviewRemoval
+        ) {
+            Button("Nur aus Prüfliste entfernen") {
+                state.removeOCRReviewEntries(selectedOCRReviewCandidates)
+                selectedOCRReviewIDs.removeAll()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text(
+                isEnglish
+                    ? "\(selectedOCRReviewCandidates.count) page(s) will be excluded from further review notices. Files and search index stay unchanged."
+                    : "\(selectedOCRReviewCandidates.count) Seite(n) werden von weiteren Prüfhinweisen ausgeschlossen. Dateien und Suchindex bleiben unverändert."
+            )
+        }
+        .confirmationDialog(
+            "Dokumente nur aus dem Findora-Index entfernen?",
+            isPresented: $confirmsOCRIndexRemoval
+        ) {
+            Button("Nur aus Findora entfernen", role: .destructive) {
+                state.removeOCRReviewDocumentsFromIndex(selectedOCRReviewCandidates)
+                selectedOCRReviewIDs.removeAll()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text(
+                isEnglish
+                    ? "\(selectedOCRDocumentCount) document(s) will be removed from the local index. Original files remain and can be indexed again by a later scan."
+                    : "\(selectedOCRDocumentCount) Dokument(e) werden aus dem lokalen Index entfernt. Originaldateien bleiben liegen und können bei einem späteren Scan erneut aufgenommen werden."
+            )
+        }
+        .confirmationDialog(
+            "OCR-Originaldateien in den Papierkorb verschieben?",
+            isPresented: $confirmsOCRTrash
+        ) {
+            Button("Originaldateien in den Papierkorb", role: .destructive) {
+                state.trashOCRReviewDocuments(selectedOCRReviewCandidates)
+                selectedOCRReviewIDs.removeAll()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text(
+                isEnglish
+                    ? "\(selectedOCRDocumentCount) original file(s) will be moved to the macOS Trash and removed from Findora."
+                    : "\(selectedOCRDocumentCount) Originaldatei(en) werden in den macOS-Papierkorb verschoben und aus Findora entfernt."
             )
         }
         .confirmationDialog(
@@ -4720,13 +4845,37 @@ struct MaintenanceView: View {
             isPresented: $confirmsPageRemoval
         ) {
             Button("Neue PDF erzeugen und austauschen", role: .destructive) {
-                state.removeConfirmedEmptyPages(selectedEmptyPages)
+                state.removeConfirmedEmptyPages(pageRemovalCandidates)
                 selectedPageIDs.removeAll()
+                directPageRemovalID = nil
             }
-            Button("Abbrechen", role: .cancel) {}
+            Button("Abbrechen", role: .cancel) {
+                directPageRemovalID = nil
+            }
         } message: {
             Text(
-                "Die PDF wird neu erzeugt und vollständig validiert. Die ursprüngliche Fassung wird nach dem atomaren Austausch in den Papierkorb verschoben."
+                isEnglish
+                    ? "\(pageRemovalCandidates.count) page(s) in \(Set(pageRemovalCandidates.map(\.absolutePath)).count) PDF(s): \(pageRemovalSummary). Each PDF is validated; at least one page remains. The original version is moved to Trash after the atomic replacement."
+                    : "\(pageRemovalCandidates.count) Seite(n) in \(Set(pageRemovalCandidates.map(\.absolutePath)).count) PDF(s): \(pageRemovalSummary). Jede PDF wird validiert; mindestens eine Seite bleibt erhalten. Die jeweilige Originalfassung landet nach dem atomaren Austausch im Papierkorb."
+            )
+        }
+        .confirmationDialog(
+            "Bestätigte leere PDFs nur aus Findora entfernen?",
+            isPresented: $confirmsEmptyPDFIndexRemoval
+        ) {
+            Button("Nur aus Findora entfernen", role: .destructive) {
+                state.removeEmptyPDFsFromIndex(emptyPDFActionCandidates)
+                selectedEmptyPDFPaths.removeAll()
+                directEmptyPDFPath = nil
+            }
+            Button("Abbrechen", role: .cancel) {
+                directEmptyPDFPath = nil
+            }
+        } message: {
+            Text(
+                isEnglish
+                    ? "\(emptyPDFActionCandidates.count) completely empty PDF(s) will be removed only from the local index. Original files stay unchanged in their current location."
+                    : "\(emptyPDFActionCandidates.count) vollständig leere PDF(s) werden nur aus dem lokalen Index entfernt. Die Originaldateien bleiben unverändert am bisherigen Speicherort."
             )
         }
         .confirmationDialog(
@@ -4734,12 +4883,19 @@ struct MaintenanceView: View {
             isPresented: $confirmsEmptyPDFTrash
         ) {
             Button("In den Papierkorb", role: .destructive) {
-                state.trashEmptyPDFs(selectedEmptyPDFs)
+                state.trashEmptyPDFs(emptyPDFActionCandidates)
                 selectedEmptyPDFPaths.removeAll()
+                directEmptyPDFPath = nil
             }
-            Button("Abbrechen", role: .cancel) {}
+            Button("Abbrechen", role: .cancel) {
+                directEmptyPDFPath = nil
+            }
         } message: {
-            Text("Die Dateien werden niemals endgültig gelöscht.")
+            Text(
+                isEnglish
+                    ? "\(emptyPDFActionCandidates.count) completely empty PDF(s) will be moved to the macOS Trash: \(emptyPDFActionCandidates.map(\.fileName).joined(separator: ", ")). Nothing is permanently deleted."
+                    : "\(emptyPDFActionCandidates.count) vollständig leere PDF(s) werden in den macOS-Papierkorb verschoben: \(emptyPDFActionCandidates.map(\.fileName).joined(separator: ", ")). Es erfolgt keine endgültige Löschung."
+            )
         }
         .confirmationDialog(
             "Dokumentindex zurücksetzen?",
@@ -4879,81 +5035,229 @@ struct MaintenanceView: View {
         .accessibilityHint(Text("Lädt alle Wartungslisten neu"))
     }
 
-    private var duplicateList: some View {
+    private var mailDuplicateList: some View {
         VStack(spacing: 0) {
             List {
+                if filteredMailDuplicateGroups.isEmpty {
+                    maintenanceEmptyState(
+                        "Keine Mail-Dubletten",
+                        symbol: "checkmark.circle",
+                        description: "Keine Mail besitzt derzeit mehrere gespeicherte Quellenexemplare."
+                    )
+                }
+                ForEach(filteredMailDuplicateGroups) { group in
+                    Section {
+                        ForEach(group.exemplars) { exemplar in
+                            HStack(alignment: .top, spacing: 12) {
+                                Toggle(
+                                    "Auswählen",
+                                    isOn: Binding(
+                                        get: {
+                                            selectedMailExemplarIDs.contains(exemplar.id)
+                                        },
+                                        set: { selected in
+                                            if selected {
+                                                selectedMailExemplarIDs.insert(exemplar.id)
+                                            } else {
+                                                selectedMailExemplarIDs.remove(exemplar.id)
+                                            }
+                                        }
+                                    )
+                                )
+                                .labelsHidden()
+                                .disabled(exemplar.isReference)
+                                Image(
+                                    systemName: exemplar.isReference
+                                        ? "bookmark.fill" : "envelope"
+                                )
+                                .foregroundStyle(
+                                    exemplar.isReference ? .green : .secondary
+                                )
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text(exemplar.sourceName).font(.headline)
+                                        if exemplar.isReference {
+                                            SearchBadge(text: "Referenz bleibt erhalten", color: .green)
+                                        }
+                                        if !exemplar.isIndividualFile {
+                                            SearchBadge(text: "Original nicht einzeln verschiebbar", color: .orange)
+                                        }
+                                    }
+                                    Text(
+                                        exemplar.sourceFilePath
+                                            ?? exemplar.sourcePath
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                    HStack(spacing: 12) {
+                                        Text(
+                                            LocalizedStringKey(
+                                                exemplar.sourceFormat.displayName
+                                            )
+                                        )
+                                        if let size = exemplar.sourceFileSize {
+                                            Text(ByteCountFormatter.string(
+                                                fromByteCount: size,
+                                                countStyle: .file
+                                            ))
+                                        }
+                                        Text("Mail-SHA: \(exemplar.messageHash.prefix(12))…")
+                                    }
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    if let fileHash = exemplar.sourceFileHash {
+                                        Text("Datei-SHA-256: \(fileHash)")
+                                            .font(.caption2.monospaced())
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                    }
+                                }
+                            }
+                        }
+                    } header: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(group.subject)
+                            Text(
+                                "\(group.sender) → \(group.recipients.joined(separator: ", "))"
+                            )
+                            .font(.caption)
+                            Text(
+                                state.interfaceLocale.language.languageCode?
+                                    .identifier == "en"
+                                    ? "\(group.exemplars.count) exemplars · Identical stable email identity and SHA-256"
+                                    : "\(group.exemplars.count) Exemplare · \(group.recognitionBasis)"
+                            )
+                            .font(.caption2)
+                            if let date = group.date {
+                                Text(date.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2)
+                            }
+                        }
+                        .textCase(nil)
+                    }
+                }
+            }
+            HStack(spacing: 10) {
+                selectionCountLabel(selectedMailExemplars.count)
+                Spacer()
+                Button("Auswahl zurücksetzen") {
+                    selectedMailExemplarIDs.removeAll()
+                }
+                .disabled(selectedMailExemplars.isEmpty)
+                Button("Nur aus Findora entfernen …", role: .destructive) {
+                    confirmsMailIndexRemoval = true
+                }
+                .disabled(selectedMailExemplars.isEmpty)
+                Button("Originale in den Papierkorb …", role: .destructive) {
+                    confirmsMailTrash = true
+                }
+                .disabled(selectedStandaloneMailExemplars.isEmpty)
+            }
+            .padding(12)
+            .background(.bar)
+        }
+    }
+
+    private var duplicateList: some View {
+        VStack(spacing: 0) {
+            ScrollView {
                 if filteredDuplicateGroups.isEmpty {
                     maintenanceEmptyState(
                         "Keine Duplikate gefunden",
                         symbol: "doc.on.doc",
                         description: "Findora hat keine Dateien mit identischem SHA-256-Inhalt gefunden."
                     )
+                    .frame(maxWidth: .infinity, minHeight: 280)
                 }
-                ForEach(filteredDuplicateGroups) { group in
-                    Section {
-                        ForEach(sorted(group.locations)) { location in
-                            HStack(alignment: .top, spacing: 12) {
-                                Toggle(
-                                    "Entfernen",
-                                    isOn: selectionBinding(
-                                        location.absolutePath,
-                                        in: $selectedDuplicatePaths
-                                    )
-                                )
-                                .labelsHidden()
-                                MaintenanceThumbnail(
-                                    path: location.absolutePath,
-                                    pageNumber: 1
-                                )
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text(location.fileName).font(.headline)
-                                        if group.recommendedLocation == location {
-                                            Text("Empfohlen behalten")
-                                                .font(.caption2.bold())
-                                                .foregroundStyle(.green)
-                                        }
-                                    }
-                                    Text(location.relativePath)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Text(location.absolutePath)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .textSelection(.enabled)
-                                    Text(
-                                        "\(ByteCountFormatter.string(fromByteCount: location.fileSize, countStyle: .file)) · \(location.modifiedAt.formatted())"
-                                    )
-                                    .font(.caption2)
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    ForEach(filteredDuplicateGroups) { group in
+                        VStack(alignment: .leading, spacing: 0) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("\(group.locations.count) identische Dateien")
+                                    .font(.headline)
+                                Text("SHA-256 \(group.contentHash)")
+                                    .font(.caption2.monospaced())
                                     .foregroundStyle(.secondary)
-                                    HStack {
-                                        Button("Vorschau") {
-                                            state.previewMaintenanceFile(
-                                                path: location.absolutePath,
-                                                fileName: location.fileName,
-                                                relativePath: location.relativePath
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+
+                            Divider()
+
+                            ForEach(sorted(group.locations)) { location in
+                                VStack(spacing: 0) {
+                                    HStack(alignment: .top, spacing: 12) {
+                                        Toggle(
+                                            "Entfernen",
+                                            isOn: selectionBinding(
+                                                location.absolutePath,
+                                                in: $selectedDuplicatePaths
                                             )
-                                        }
-                                        Button("Diese Datei behalten") {
-                                            selectedDuplicatePaths.remove(
-                                                location.absolutePath
+                                        )
+                                        .labelsHidden()
+                                        MaintenanceThumbnail(
+                                            path: location.absolutePath,
+                                            pageNumber: 1
+                                        )
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            HStack {
+                                                Text(location.fileName).font(.headline)
+                                                if group.recommendedLocation == location {
+                                                    Text("Empfohlen behalten")
+                                                        .font(.caption2.bold())
+                                                        .foregroundStyle(.green)
+                                                }
+                                            }
+                                            Text(location.relativePath)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            Text(location.absolutePath)
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                                .textSelection(.enabled)
+                                            Text(
+                                                "\(ByteCountFormatter.string(fromByteCount: location.fileSize, countStyle: .file)) · \(location.modifiedAt.formatted())"
                                             )
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            HStack(spacing: 12) {
+                                                Button("Vorschau") {
+                                                    state.previewMaintenanceFile(
+                                                        path: location.absolutePath,
+                                                        fileName: location.fileName,
+                                                        relativePath: location.relativePath
+                                                    )
+                                                }
+                                                Button("Diese Datei behalten") {
+                                                    selectedDuplicatePaths.remove(
+                                                        location.absolutePath
+                                                    )
+                                                }
+                                            }
+                                            .buttonStyle(.borderless)
                                         }
                                     }
-                                    .buttonStyle(.borderless)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(12)
+
+                                    Divider()
+                                        .padding(.leading, 94)
                                 }
                             }
-                            .padding(.vertical, 4)
                         }
-                    } header: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(group.locations.count) identische Dateien")
-                            Text("SHA-256 \(group.contentHash)")
-                                .font(.caption2.monospaced())
-                                .textSelection(.enabled)
+                        .background(
+                            Color(nsColor: .controlBackgroundColor),
+                            in: RoundedRectangle(cornerRadius: 10)
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(.quaternary)
                         }
                     }
                 }
+                .padding(12)
             }
             maintenanceActionBar(
                 selectionCount: selectedDuplicateLocations.count,
@@ -4990,6 +5294,7 @@ struct MaintenanceView: View {
                         .disabled(
                             candidate.decision != .confirmedEmpty
                                 || !candidate.status.isEmptyCandidate
+                                || candidate.pageCount <= 1
                         )
                         MaintenanceThumbnail(
                             path: candidate.absolutePath,
@@ -4998,9 +5303,17 @@ struct MaintenanceView: View {
                         VStack(alignment: .leading, spacing: 5) {
                             HStack {
                                 Text(candidate.fileName).font(.headline)
-                                Text("Seite \(candidate.pageNumber)")
+                                Text(
+                                    isEnglish
+                                        ? "Page \(candidate.pageNumber)"
+                                        : "Seite \(candidate.pageNumber)"
+                                )
                                 Spacer()
-                                Text(candidate.status.displayName)
+                                Text(
+                                    LocalizedStringKey(
+                                        candidate.status.displayName
+                                    )
+                                )
                                     .font(.caption.bold())
                                     .foregroundStyle(
                                         candidate.status.isEmptyCandidate
@@ -5016,14 +5329,18 @@ struct MaintenanceView: View {
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                             Text(
-                                "\(candidate.confidence, format: .percent.precision(.fractionLength(1))) Sicherheit · \(candidate.metrics.whiteRatio, format: .percent.precision(.fractionLength(2))) Weißfläche"
+                                isEnglish
+                                    ? "\(candidate.confidence.formatted(.percent.precision(.fractionLength(1)))) confidence · \(candidate.metrics.whiteRatio.formatted(.percent.precision(.fractionLength(2)))) white area"
+                                    : "\(candidate.confidence.formatted(.percent.precision(.fractionLength(1)))) Sicherheit · \(candidate.metrics.whiteRatio.formatted(.percent.precision(.fractionLength(2)))) Weißfläche"
                             )
                             .font(.caption)
-                            Text(candidate.reason)
+                            Text(localizedAnalysisReason(candidate))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Text(
-                                "Dunkle Pixel \(candidate.metrics.darkPixelRatio, format: .percent.precision(.fractionLength(3))) · Kanten \(candidate.metrics.edgeRatio, format: .percent.precision(.fractionLength(3))) · Varianz \(candidate.metrics.variance.formatted(.number.precision(.fractionLength(5)))) · Bilder \(candidate.metrics.embeddedImageCount) · Annotationen \(candidate.metrics.annotationCount)"
+                                isEnglish
+                                    ? "Dark pixels \(candidate.metrics.darkPixelRatio.formatted(.percent.precision(.fractionLength(3)))) · Edges \(candidate.metrics.edgeRatio.formatted(.percent.precision(.fractionLength(3)))) · Variance \(candidate.metrics.variance.formatted(.number.precision(.fractionLength(5)))) · Images \(candidate.metrics.embeddedImageCount) · Annotations \(candidate.metrics.annotationCount)"
+                                    : "Dunkle Pixel \(candidate.metrics.darkPixelRatio.formatted(.percent.precision(.fractionLength(3)))) · Kanten \(candidate.metrics.edgeRatio.formatted(.percent.precision(.fractionLength(3)))) · Varianz \(candidate.metrics.variance.formatted(.number.precision(.fractionLength(5)))) · Bilder \(candidate.metrics.embeddedImageCount) · Annotationen \(candidate.metrics.annotationCount)"
                             )
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -5041,6 +5358,15 @@ struct MaintenanceView: View {
                                     )
                                 }
                                 .disabled(!candidate.status.isEmptyCandidate)
+                                Button("Seite entfernen …", role: .destructive) {
+                                    directPageRemovalID = candidate.id
+                                    confirmsPageRemoval = true
+                                }
+                                .disabled(
+                                    candidate.decision != .confirmedEmpty
+                                        || !candidate.status.isEmptyCandidate
+                                        || candidate.pageCount <= 1
+                                )
                                 Button("Analyse neu starten") {
                                     state.reanalyzeEmptyPage(candidate)
                                 }
@@ -5072,8 +5398,9 @@ struct MaintenanceView: View {
             maintenanceActionBar(
                 selectionCount: selectedEmptyPages.count,
                 title: "Ausgewählte Seiten entfernen",
-                enabled: !selectedEmptyPages.isEmpty
+                enabled: emptyPageSelectionIsSafe
             ) {
+                directPageRemovalID = nil
                 confirmsPageRemoval = true
             } reset: {
                 selectedPageIDs.removeAll()
@@ -5115,30 +5442,74 @@ struct MaintenanceView: View {
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                             Text(
-                                "\(candidate.pageCount) analysierte und manuell als leer bestätigte Seite(n) · \(candidate.confidence, format: .percent.precision(.fractionLength(1))) Sicherheit"
+                                isEnglish
+                                    ? "\(candidate.pageCount) analyzed and manually confirmed empty page(s) · \(candidate.confidence.formatted(.percent.precision(.fractionLength(1)))) confidence"
+                                    : "\(candidate.pageCount) analysierte und manuell als leer bestätigte Seite(n) · \(candidate.confidence.formatted(.percent.precision(.fractionLength(1)))) Sicherheit"
                             )
                             .font(.caption)
-                            Button("Vorschau") {
-                                state.previewMaintenanceFile(
-                                    path: candidate.absolutePath,
-                                    fileName: candidate.fileName,
-                                    relativePath: candidate.relativePath
-                                )
+                            Text(
+                                isEnglish
+                                    ? "All pages are currently confirmed empty."
+                                    : candidate.reason
+                            )
+                                .font(.caption)
+                            Text(
+                                "\(ByteCountFormatter.string(fromByteCount: candidate.fileSize, countStyle: .file)) · SHA-256 \(candidate.originalHash)"
+                            )
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            HStack(spacing: 12) {
+                                Button("Vorschau") {
+                                    state.previewMaintenanceFile(
+                                        path: candidate.absolutePath,
+                                        fileName: candidate.fileName,
+                                        relativePath: candidate.relativePath
+                                    )
+                                }
+                                Button(
+                                    "Nur diese PDF aus Findora entfernen …",
+                                    role: .destructive
+                                ) {
+                                    directEmptyPDFPath = candidate.absolutePath
+                                    confirmsEmptyPDFIndexRemoval = true
+                                }
+                                Button(
+                                    "Diese PDF in den Papierkorb …",
+                                    role: .destructive
+                                ) {
+                                    directEmptyPDFPath = candidate.absolutePath
+                                    confirmsEmptyPDFTrash = true
+                                }
                             }
                             .buttonStyle(.borderless)
                         }
                     }
                 }
             }
-            maintenanceActionBar(
-                selectionCount: selectedEmptyPDFs.count,
-                title: "Ausgewählte PDFs in den Papierkorb",
-                enabled: !selectedEmptyPDFs.isEmpty
-            ) {
-                confirmsEmptyPDFTrash = true
-            } reset: {
-                selectedEmptyPDFPaths.removeAll()
+            HStack(spacing: 10) {
+                selectionCountLabel(selectedEmptyPDFs.count)
+                Spacer()
+                Button("Auswahl zurücksetzen") {
+                    selectedEmptyPDFPaths.removeAll()
+                }
+                .disabled(selectedEmptyPDFs.isEmpty)
+                Button("Nur aus Findora entfernen …", role: .destructive) {
+                    directEmptyPDFPath = nil
+                    confirmsEmptyPDFIndexRemoval = true
+                }
+                .disabled(selectedEmptyPDFs.isEmpty)
+                Button(
+                    "Ausgewählte PDFs in den Papierkorb",
+                    role: .destructive
+                ) {
+                    directEmptyPDFPath = nil
+                    confirmsEmptyPDFTrash = true
+                }
+                .disabled(selectedEmptyPDFs.isEmpty)
             }
+            .padding(12)
+            .background(.bar)
         }
     }
 
@@ -5169,9 +5540,17 @@ struct MaintenanceView: View {
                         VStack(alignment: .leading, spacing: 5) {
                             HStack {
                                 Text(candidate.fileName).font(.headline)
-                                Text("Seite \(candidate.pageNumber)")
+                                Text(
+                                    isEnglish
+                                        ? "Page \(candidate.pageNumber)"
+                                        : "Seite \(candidate.pageNumber)"
+                                )
                                 Spacer()
-                                Text(candidate.status.displayName)
+                                Text(
+                                    LocalizedStringKey(
+                                        candidate.status.displayName
+                                    )
+                                )
                                     .font(.caption.bold())
                                     .foregroundStyle(.orange)
                             }
@@ -5184,11 +5563,15 @@ struct MaintenanceView: View {
                                 .textSelection(.enabled)
                             if let best = candidate.bestVariant {
                                 Text(
-                                    "Beste Variante: \(best.strategyName) · \(best.engine.displayName) · \(best.qualityScore, format: .percent.precision(.fractionLength(0)))"
+                                    isEnglish
+                                        ? "Best variant: \(localizedOCRDetail(best.strategyName)) · \(best.engine.displayName) · \(best.qualityScore.formatted(.percent.precision(.fractionLength(0))))"
+                                        : "Beste Variante: \(best.strategyName) · \(best.engine.displayName) · \(best.qualityScore.formatted(.percent.precision(.fractionLength(0))))"
                                 )
                                 .font(.caption)
                                 Text(
-                                    "\(best.characterCount) Zeichen · \(best.wordCount) Wörter · \(best.recognizedLanguage) · \(best.preprocessing)"
+                                    isEnglish
+                                        ? "\(best.characterCount) characters · \(best.wordCount) words · \(localizedOCRDetail(best.recognizedLanguage)) · \(localizedOCRDetail(best.preprocessing))"
+                                        : "\(best.characterCount) Zeichen · \(best.wordCount) Wörter · \(best.recognizedLanguage) · \(best.preprocessing)"
                                 )
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
@@ -5204,7 +5587,9 @@ struct MaintenanceView: View {
                                     .foregroundStyle(.secondary)
                             }
                             Text(
-                                "\(candidate.variants.count) Variante(n) · \(candidate.textKind.displayName)"
+                                isEnglish
+                                    ? "\(candidate.variants.count) variant(s) · \(localizedTextKind(candidate.textKind))"
+                                    : "\(candidate.variants.count) Variante(n) · \(candidate.textKind.displayName)"
                             )
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -5448,6 +5833,16 @@ struct MaintenanceView: View {
                         configuration: sharedBulkOCRConfiguration
                     )
                 }
+                Divider()
+                Button("Nur aus OCR-Prüfliste entfernen …") {
+                    confirmsOCRReviewRemoval = true
+                }
+                Button("Dokumente nur aus Findora entfernen …", role: .destructive) {
+                    confirmsOCRIndexRemoval = true
+                }
+                Button("Originaldateien in den Papierkorb …", role: .destructive) {
+                    confirmsOCRTrash = true
+                }
             }
             .disabled(
                 candidates.isEmpty
@@ -5512,7 +5907,13 @@ struct MaintenanceView: View {
 
     private var selectionToolButtons: some View {
         HStack(spacing: 8) {
-            Button("Alle auswählen") { selectAllVisible() }
+            Button(
+                section == .mailDuplicates
+                    ? "Alle außer Referenz auswählen"
+                    : "Alle auswählen"
+            ) {
+                selectAllVisible()
+            }
                 .disabled(selectableVisibleCount == 0)
                 .help(Text("Alle aktuell sichtbaren und zulässigen Einträge auswählen"))
             Button("Keine auswählen") { clearCurrentSelection() }
@@ -5558,7 +5959,7 @@ struct MaintenanceView: View {
 
     private var availableStatusFilters: [MaintenanceStatusFilter] {
         switch section {
-        case .duplicates, .emptyPDFs:
+        case .mailDuplicates, .duplicates, .emptyPDFs:
             [.all, .confirmed]
         case .emptyPages:
             [.all, .automatic, .confirmed]
@@ -5573,6 +5974,12 @@ struct MaintenanceView: View {
 
     private func selectAllVisible() {
         switch section {
+        case .mailDuplicates:
+            selectedMailExemplarIDs.formUnion(
+                filteredMailDuplicateGroups.flatMap {
+                    $0.exemplars.filter { !$0.isReference }.map(\.id)
+                }
+            )
         case .duplicates:
             for group in filteredDuplicateGroups {
                 let keeper = group.recommendedLocation ?? group.locations.first
@@ -5613,6 +6020,7 @@ struct MaintenanceView: View {
 
     private func clearCurrentSelection() {
         switch section {
+        case .mailDuplicates: selectedMailExemplarIDs.removeAll()
         case .duplicates: selectedDuplicatePaths.removeAll()
         case .emptyPages: selectedPageIDs.removeAll()
         case .ocrReview: selectedOCRReviewIDs.removeAll()
@@ -5624,6 +6032,13 @@ struct MaintenanceView: View {
 
     private func invertVisibleSelection() {
         switch section {
+        case .mailDuplicates:
+            let visible = Set(
+                filteredMailDuplicateGroups.flatMap {
+                    $0.exemplars.filter { !$0.isReference }.map(\.id)
+                }
+            )
+            selectedMailExemplarIDs.formSymmetricDifference(visible)
         case .duplicates:
             let visible = Set(
                 filteredDuplicateGroups.flatMap {
@@ -5681,6 +6096,22 @@ struct MaintenanceView: View {
                 .localizedStandardCompare(
                     $1.recommendedLocation?.fileName ?? $1.contentHash
                 ) == .orderedAscending
+        }
+    }
+
+    private var filteredMailDuplicateGroups: [MailDuplicateGroup] {
+        let query = normalizedFilter
+        guard !query.isEmpty else { return state.mailDuplicateGroups }
+        return state.mailDuplicateGroups.filter { group in
+            group.subject.localizedCaseInsensitiveContains(query)
+                || group.sender.localizedCaseInsensitiveContains(query)
+                || group.recipients.contains {
+                    $0.localizedCaseInsensitiveContains(query)
+                }
+                || group.exemplars.contains {
+                    $0.sourceName.localizedCaseInsensitiveContains(query)
+                        || $0.sourcePath.localizedCaseInsensitiveContains(query)
+                }
         }
     }
 
@@ -5814,6 +6245,20 @@ struct MaintenanceView: View {
         }
     }
 
+    private var selectedMailExemplars: [MailDuplicateExemplar] {
+        filteredMailDuplicateGroups.flatMap(\.exemplars).filter {
+            selectedMailExemplarIDs.contains($0.id) && !$0.isReference
+        }
+    }
+
+    private var selectedStandaloneMailExemplars: [MailDuplicateExemplar] {
+        selectedMailExemplars.filter {
+            $0.isIndividualFile
+                && $0.sourceFilePath != nil
+                && $0.sourceFileHash != nil
+        }
+    }
+
     private var duplicateSelectionIsSafe: Bool {
         guard !selectedDuplicatePaths.isEmpty else { return false }
         return state.duplicateGroups.allSatisfy { group in
@@ -5832,16 +6277,62 @@ struct MaintenanceView: View {
         }
     }
 
+    private var pageRemovalCandidates: [EmptyPageCandidate] {
+        if let directPageRemovalID,
+           let candidate = state.emptyPageCandidates.first(where: {
+               $0.id == directPageRemovalID
+           }) {
+            return [candidate]
+        }
+        return selectedEmptyPages
+    }
+
+    private var pageRemovalSummary: String {
+        Dictionary(grouping: pageRemovalCandidates, by: \.fileName)
+            .sorted { $0.key.localizedStandardCompare($1.key) == .orderedAscending }
+            .map { name, pages in
+                let numbers = pages.map(\.pageNumber).sorted()
+                    .map(String.init).joined(separator: ", ")
+                return "\(name) – Seite(n) \(numbers)"
+            }
+            .joined(separator: "; ")
+    }
+
+    private var emptyPageSelectionIsSafe: Bool {
+        guard !selectedEmptyPages.isEmpty else { return false }
+        return Dictionary(
+            grouping: selectedEmptyPages,
+            by: \.absolutePath
+        ).values.allSatisfy { pages in
+            guard let first = pages.first else { return false }
+            return pages.count < first.pageCount
+        }
+    }
+
     private var selectedOCRReviewCandidates: [OCRReviewCandidate] {
         filteredOCRReviewCandidates.filter {
             selectedOCRReviewIDs.contains($0.id)
         }
     }
 
+    private var selectedOCRDocumentCount: Int {
+        Set(selectedOCRReviewCandidates.map(\.absolutePath)).count
+    }
+
     private var selectedEmptyPDFs: [EmptyPDFCandidate] {
         filteredEmptyPDFs.filter {
             selectedEmptyPDFPaths.contains($0.absolutePath)
         }
+    }
+
+    private var emptyPDFActionCandidates: [EmptyPDFCandidate] {
+        if let directEmptyPDFPath,
+           let candidate = state.emptyPDFCandidates.first(where: {
+               $0.absolutePath == directEmptyPDFPath
+           }) {
+            return [candidate]
+        }
+        return selectedEmptyPDFs
     }
 
     private var selectedMissingCount: Int {
@@ -5852,6 +6343,8 @@ struct MaintenanceView: View {
 
     private var currentSelectionCount: Int {
         switch section {
+        case .mailDuplicates:
+            selectedMailExemplars.count
         case .duplicates:
             selectedDuplicateLocations.count
         case .emptyPages:
@@ -5869,6 +6362,10 @@ struct MaintenanceView: View {
 
     private var selectableVisibleCount: Int {
         switch section {
+        case .mailDuplicates:
+            filteredMailDuplicateGroups.reduce(0) { count, group in
+                count + group.exemplars.filter { !$0.isReference }.count
+            }
         case .duplicates:
             filteredDuplicateGroups.reduce(0) { count, group in
                 count + max(group.locations.count - 1, 0)
@@ -5909,6 +6406,39 @@ struct MaintenanceView: View {
             || candidate.fileName.localizedCaseInsensitiveContains(normalizedFilter)
             || candidate.relativePath.localizedCaseInsensitiveContains(normalizedFilter)
             || candidate.status.displayName.localizedCaseInsensitiveContains(normalizedFilter)
+    }
+
+    private func localizedAnalysisReason(
+        _ candidate: EmptyPageCandidate
+    ) -> String {
+        guard isEnglish else { return candidate.reason }
+        return switch candidate.status {
+        case .safelyEmpty:
+            "White area without text, image, edge, or annotation structure."
+        case .probablyEmpty:
+            "Mostly white area with only minimal pixel and edge structure."
+        case .contentDetected, .content:
+            "Visible content was detected; small or edge-aligned text is treated as content."
+        case .imageWithoutText, .imageWithoutRecognizedText:
+            "Visible image or graphic content was detected without recognized text."
+        case .technicalError, .technicalReviewError:
+            "The page could not be analyzed safely."
+        default:
+            candidate.status.displayName
+        }
+    }
+
+    private func localizedTextKind(_ kind: PageTextKind) -> String {
+        guard isEnglish else { return kind.displayName }
+        return switch kind {
+        case .automatic: "Automatically recognized text"
+        case .manuallyCorrected: "Manually corrected text"
+        case .manuallyEntered: "Completely manually entered text"
+        }
+    }
+
+    private func localizedOCRDetail(_ value: String) -> String {
+        translatedOCRDetail(value, isEnglish: isEnglish)
     }
 
     private func sorted(_ locations: [DuplicateLocation]) -> [DuplicateLocation] {
@@ -6014,6 +6544,10 @@ private struct ManualOCRReviewSheet: View {
             ?? candidate
     }
 
+    private var isEnglish: Bool {
+        state.interfaceLocale.language.languageCode?.identifier == "en"
+    }
+
     var body: some View {
         HSplitView {
             VStack(alignment: .leading, spacing: 8) {
@@ -6086,7 +6620,13 @@ private struct ManualOCRReviewSheet: View {
 
                 Section("OCR-Vorschau") {
                     if let best = latestCandidate.bestVariant {
-                        LabeledContent("Beste Strategie", value: best.strategyName)
+                        LabeledContent(
+                            "Beste Strategie",
+                            value: translatedOCRDetail(
+                                best.strategyName,
+                                isEnglish: isEnglish
+                            )
+                        )
                         LabeledContent("Engine", value: best.engine.displayName)
                         LabeledContent(
                             "Qualität",
@@ -6096,9 +6636,17 @@ private struct ManualOCRReviewSheet: View {
                         )
                         LabeledContent(
                             "Umfang",
-                            value: "\(best.characterCount) Zeichen · \(best.wordCount) Wörter"
+                            value: isEnglish
+                                ? "\(best.characterCount) characters · \(best.wordCount) words"
+                                : "\(best.characterCount) Zeichen · \(best.wordCount) Wörter"
                         )
-                        LabeledContent("Sprache", value: best.recognizedLanguage)
+                        LabeledContent(
+                            "Sprache",
+                            value: translatedOCRDetail(
+                                best.recognizedLanguage,
+                                isEnglish: isEnglish
+                            )
+                        )
                         LabeledContent(
                             "Laufzeit",
                             value: "\(best.durationSeconds.formatted(.number.precision(.fractionLength(1)))) s"
@@ -6837,7 +7385,7 @@ struct SettingsView: View {
                     selection: $state.removedDocumentPolicy
                 ) {
                     ForEach(RemovedDocumentPolicy.allCases) { policy in
-                        Text(policy.displayName).tag(policy)
+                        Text(LocalizedStringKey(policy.displayName)).tag(policy)
                     }
                 }
                 Button("Jetzt synchronisieren") {
@@ -6852,9 +7400,14 @@ struct SettingsView: View {
                     Text("Keine E-Mail-Quelle eingerichtet")
                         .foregroundStyle(.secondary)
                 } else {
+                    let sourceCount = state.mailSources.count
+                    let messageCount = state.mailSources.reduce(0) {
+                        $0 + $1.messageCount
+                    }
                     Text(
-                        "\(state.mailSources.count) Quelle(n), "
-                        + "\(state.mailSources.reduce(0) { $0 + $1.messageCount }) E-Mail(s)"
+                        state.interfaceLocale.language.languageCode?.identifier == "en"
+                            ? "\(sourceCount) source(s), \(messageCount) email(s)"
+                            : "\(sourceCount) Quelle(n), \(messageCount) E-Mail(s)"
                     )
                 }
                 Button("E-Mail-Quellen verwalten …") {
@@ -7001,8 +7554,42 @@ struct SettingsView: View {
                     Text("Speicherdruck")
                 }
             }
+            Section("Crashberichte") {
+                Toggle(
+                    "Crashberichte automatisch über Apple Mail senden",
+                    isOn: $state.automaticCrashReportsEnabled
+                )
+                TextField(
+                    "Empfängeradresse",
+                    text: $state.crashReportRecipient
+                )
+                .textContentType(.emailAddress)
+                .disableAutocorrection(true)
+                LabeledContent("Status") {
+                    Text(state.crashReportStatusText)
+                        .foregroundStyle(
+                            state.hasPendingCrashReport ? .orange : .secondary
+                        )
+                }
+                if state.hasPendingCrashReport {
+                    Button("Ausstehenden Crashbericht jetzt senden") {
+                        state.retryPendingCrashReport()
+                    }
+                    .disabled(
+                        !state.automaticCrashReportsEnabled
+                            || !CrashReportCoordinator.isValidEmailAddress(
+                                state.crashReportRecipient
+                            )
+                    )
+                }
+                Text(
+                    "Nach einem ungeplanten App-Ende wird beim nächsten Start ein bereinigter Bericht über die lokal konfigurierte Apple-Mail-App gesendet. macOS kann beim ersten Versand nach der Erlaubnis für Apple Mail fragen. Dokumentinhalte, Suchanfragen und vollständige private Pfade werden nicht übertragen."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
             Section("Datenschutz") {
-                Text("Dokumente, Suchanfragen, Embeddings und Antworten bleiben lokal. Telemetrie ist deaktiviert.")
+                Text("Dokumente, Suchanfragen, Embeddings und Antworten bleiben lokal. Es gibt keine allgemeine Telemetrie. Nur ausdrücklich aktivierte, bereinigte Crashberichte werden über Apple Mail versendet.")
                     .foregroundStyle(.secondary)
             }
             Section("Indexwartung") {

@@ -142,6 +142,307 @@ public actor DocumentMaintenanceService {
         return try await trashVerifiedFiles(expected)
     }
 
+    public func trashEmptyPDFsIndividually(
+        _ candidates: [EmptyPDFCandidate]
+    ) async -> MaintenanceBatchResult {
+        let current = (try? await database.emptyPDFCandidates()) ?? []
+        let currentByPath = Dictionary(uniqueKeysWithValues: current.map {
+            ($0.absolutePath, $0.originalHash)
+        })
+        var succeeded: [String] = []
+        var skipped: [String] = []
+        var failures: [MaintenanceActionFailure] = []
+        for candidate in candidates {
+            guard currentByPath[candidate.absolutePath] == candidate.originalHash else {
+                skipped.append(candidate.fileName)
+                continue
+            }
+            do {
+                _ = try await trashVerifiedFiles([
+                    candidate.absolutePath: candidate.originalHash
+                ])
+                succeeded.append(candidate.fileName)
+            } catch {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: candidate.absolutePath,
+                        objectName: candidate.fileName,
+                        reason: Self.safeActionReason(error)
+                    )
+                )
+            }
+        }
+        return MaintenanceBatchResult(
+            succeeded: succeeded,
+            skipped: skipped,
+            failures: failures
+        )
+    }
+
+    public func removeEmptyPDFsFromIndex(
+        _ candidates: [EmptyPDFCandidate]
+    ) async -> MaintenanceBatchResult {
+        let current = (try? await database.emptyPDFCandidates()) ?? []
+        let currentByPath = Dictionary(uniqueKeysWithValues: current.map {
+            ($0.absolutePath, $0.originalHash)
+        })
+        var succeeded: [String] = []
+        var skipped: [String] = []
+        var failures: [MaintenanceActionFailure] = []
+        for candidate in candidates {
+            guard currentByPath[candidate.absolutePath] == candidate.originalHash else {
+                skipped.append(candidate.fileName)
+                continue
+            }
+            do {
+                try verifyHash(
+                    of: URL(filePath: candidate.absolutePath),
+                    expected: candidate.originalHash
+                )
+                try await database.markPathsRemoved([candidate.absolutePath])
+                succeeded.append(candidate.fileName)
+            } catch {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: candidate.absolutePath,
+                        objectName: candidate.fileName,
+                        reason: Self.safeActionReason(error)
+                    )
+                )
+            }
+        }
+        return MaintenanceBatchResult(
+            succeeded: succeeded,
+            skipped: skipped,
+            failures: failures
+        )
+    }
+
+    public func removeOCRReviewEntries(
+        _ candidates: [OCRReviewCandidate]
+    ) async -> MaintenanceBatchResult {
+        var succeeded: [String] = []
+        var failures: [MaintenanceActionFailure] = []
+        for candidate in candidates {
+            do {
+                try await database.setPageReviewDecision(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber,
+                    decision: .excluded
+                )
+                succeeded.append("\(candidate.fileName), Seite \(candidate.pageNumber)")
+            } catch {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: candidate.id,
+                        objectName: "\(candidate.fileName), Seite \(candidate.pageNumber)",
+                        reason: Self.safeActionReason(error)
+                    )
+                )
+            }
+        }
+        return MaintenanceBatchResult(succeeded: succeeded, failures: failures)
+    }
+
+    public func removeOCRReviewDocumentsFromIndex(
+        _ candidates: [OCRReviewCandidate]
+    ) async -> MaintenanceBatchResult {
+        let currentIDs = Set(
+            ((try? await database.ocrReviewCandidates()) ?? []).map(\.id)
+        )
+        let byPath = Dictionary(grouping: candidates, by: \.absolutePath)
+        var succeeded: [String] = []
+        var failures: [MaintenanceActionFailure] = []
+        for (path, values) in byPath {
+            guard let candidate = values.first else { continue }
+            guard values.contains(where: { currentIDs.contains($0.id) }) else {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: path,
+                        objectName: candidate.fileName,
+                        reason: "Der OCR-Prüfstatus hat sich geändert. Bitte die Auswahl aktualisieren."
+                    )
+                )
+                continue
+            }
+            do {
+                try verifyHash(
+                    of: URL(filePath: path),
+                    expected: candidate.originalHash
+                )
+                try await database.markPathsRemoved([path])
+                succeeded.append(candidate.fileName)
+            } catch {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: path,
+                        objectName: candidate.fileName,
+                        reason: Self.safeActionReason(error)
+                    )
+                )
+            }
+        }
+        return MaintenanceBatchResult(succeeded: succeeded, failures: failures)
+    }
+
+    public func trashOCRReviewDocuments(
+        _ candidates: [OCRReviewCandidate]
+    ) async -> MaintenanceBatchResult {
+        let currentIDs = Set(
+            ((try? await database.ocrReviewCandidates()) ?? []).map(\.id)
+        )
+        let byPath = Dictionary(grouping: candidates, by: \.absolutePath)
+        var succeeded: [String] = []
+        var failures: [MaintenanceActionFailure] = []
+        for (path, values) in byPath {
+            guard let candidate = values.first else { continue }
+            guard values.contains(where: { currentIDs.contains($0.id) }) else {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: path,
+                        objectName: candidate.fileName,
+                        reason: "Der OCR-Prüfstatus hat sich geändert. Bitte die Auswahl aktualisieren."
+                    )
+                )
+                continue
+            }
+            do {
+                _ = try await trashVerifiedFiles([path: candidate.originalHash])
+                succeeded.append(candidate.fileName)
+            } catch {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: path,
+                        objectName: candidate.fileName,
+                        reason: Self.safeActionReason(error)
+                    )
+                )
+            }
+        }
+        return MaintenanceBatchResult(succeeded: succeeded, failures: failures)
+    }
+
+    public func removeMailDuplicateExemplarsFromIndex(
+        _ exemplars: [MailDuplicateExemplar]
+    ) async -> MaintenanceBatchResult {
+        let currentGroups = (try? await database.mailDuplicateGroups()) ?? []
+        var succeeded: [String] = []
+        var skipped: [String] = []
+        var failures: [MaintenanceActionFailure] = []
+        for exemplar in exemplars {
+            guard !exemplar.isReference else {
+                skipped.append(exemplar.sourceName)
+                continue
+            }
+            do {
+                try verifyCurrentMailDuplicate(
+                    exemplar,
+                    in: currentGroups
+                )
+                _ = try await database.removeMailDuplicateExemplars(
+                    linkIDs: [exemplar.id]
+                )
+                succeeded.append(exemplar.sourceName)
+            } catch {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: String(exemplar.id),
+                        objectName: exemplar.sourceName,
+                        reason: Self.safeActionReason(error)
+                    )
+                )
+            }
+        }
+        return MaintenanceBatchResult(
+            succeeded: succeeded,
+            skipped: skipped,
+            failures: failures
+        )
+    }
+
+    public func trashMailDuplicateExemplars(
+        _ exemplars: [MailDuplicateExemplar]
+    ) async -> MaintenanceBatchResult {
+        let currentGroups = (try? await database.mailDuplicateGroups()) ?? []
+        var succeeded: [String] = []
+        var skipped: [String] = []
+        var failures: [MaintenanceActionFailure] = []
+        for exemplar in exemplars {
+            guard !exemplar.isReference,
+                  exemplar.isIndividualFile,
+                  let path = exemplar.sourceFilePath,
+                  let expectedHash = exemplar.sourceFileHash else {
+                skipped.append(exemplar.sourceName)
+                continue
+            }
+            let originalURL = URL(filePath: path)
+            do {
+                try verifyCurrentMailDuplicate(
+                    exemplar,
+                    in: currentGroups
+                )
+                try verifyHash(of: originalURL, expected: expectedHash)
+                let trashedURL = try trashManager.trashItem(at: originalURL)
+                do {
+                    _ = try await database.removeMailDuplicateExemplars(
+                        linkIDs: [exemplar.id]
+                    )
+                } catch {
+                    try trashManager.restoreItem(from: trashedURL, to: originalURL)
+                    throw error
+                }
+                succeeded.append(originalURL.lastPathComponent)
+            } catch {
+                failures.append(
+                    MaintenanceActionFailure(
+                        id: String(exemplar.id),
+                        objectName: originalURL.lastPathComponent,
+                        reason: Self.safeActionReason(error)
+                    )
+                )
+            }
+        }
+        return MaintenanceBatchResult(
+            succeeded: succeeded,
+            skipped: skipped,
+            failures: failures
+        )
+    }
+
+    private func verifyCurrentMailDuplicate(
+        _ exemplar: MailDuplicateExemplar,
+        in groups: [MailDuplicateGroup]
+    ) throws {
+        guard let group = groups.first(where: {
+            $0.exemplars.contains(where: { $0.id == exemplar.id })
+        }),
+        let current = group.exemplars.first(where: { $0.id == exemplar.id }),
+        !current.isReference,
+        current.sourceFilePath == exemplar.sourceFilePath,
+        current.sourceFileHash == exemplar.sourceFileHash,
+        let reference = group.exemplars.first(where: \.isReference) else {
+            throw FindoraError.processFailed(
+                "Die Mail-Dublettengruppe oder ihr Referenzexemplar ist nicht mehr aktuell."
+            )
+        }
+        if reference.isIndividualFile {
+            guard let path = reference.sourceFilePath,
+                  let hash = reference.sourceFileHash else {
+                throw FindoraError.processFailed(
+                    "Das Referenzexemplar kann nicht sicher geprüft werden."
+                )
+            }
+            try verifyHash(of: URL(filePath: path), expected: hash)
+        } else {
+            let referencePath = reference.sourceFilePath ?? reference.sourcePath
+            guard FileManager.default.fileExists(atPath: referencePath) else {
+                throw FindoraError.processFailed(
+                    "Die Mailquelle des Referenzexemplars ist nicht mehr erreichbar."
+                )
+            }
+        }
+    }
+
     public func removePages(
         from candidate: EmptyPageCandidate,
         pageNumbers: Set<Int>
@@ -303,6 +604,13 @@ public actor DocumentMaintenanceService {
                 "Die Datei wurde seit der Prüfung verändert; die Wartungsaktion wurde abgebrochen."
             )
         }
+    }
+
+    private static func safeActionReason(_ error: Error) -> String {
+        if let error = error as? FindoraError {
+            return error.localizedDescription
+        }
+        return "Der Vorgang konnte für dieses Objekt nicht sicher abgeschlossen werden."
     }
 
     private func pageFingerprints(

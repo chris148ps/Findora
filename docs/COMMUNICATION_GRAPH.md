@@ -1,4 +1,11 @@
-# Kommunikationspartner, Projekte und Verknüpfungen
+# Interne Mail- und Dokumentverknüpfungen
+
+Die früher sichtbaren Bereiche **Kommunikationspartner** und **Projekte** sind
+für ein späteres Update zurückgestellt. Sie erscheinen weder in der
+Navigation noch als Sucherweiterung oder in den Dokumentdetails. Die
+automatische Projektbildung ist deaktiviert. Vorhandene interne Tabellen
+werden nicht gelöscht, damit Bestandsdaten nicht durch eine destruktive
+Migration verloren gehen.
 
 ## Lokales Modell
 
@@ -8,9 +15,9 @@ Identität. Alias-Schreibweisen derselben Adresse werden separat erhalten.
 Firmen-Domains erzeugen Organisationen; verbreitete private Mail-Domains
 werden nicht automatisch als Organisation interpretiert.
 
-Die Übersichten **Kommunikationspartner** und **Projekte** zeigen die lokal
-abgeleiteten Beziehungen. Pro Partner werden E-Mail-, PDF-, Angebots-,
-Rechnungs- und Bildzähler sowie die letzte Aktivität angezeigt.
+Die Adressableitung ist ebenfalls deaktiviert. Bestehende Partner-,
+Organisations- und Projektzeilen bleiben ausschließlich aus
+Kompatibilitätsgründen erhalten.
 
 ## Verknüpfungsregeln
 
@@ -18,8 +25,6 @@ Rechnungs- und Bildzähler sowie die letzte Aktivität angezeigt.
   dasselbe Dokument und erhalten eine sichere automatische Relation.
 - Die Regel funktioniert unabhängig davon, ob zuerst die Mail oder zuerst das
   PDF importiert wird.
-- Eine gemeinsame eindeutige Projektreferenz, beispielsweise `PRJ-1001`, darf
-  automatisch verknüpfen.
 - Hohe lokale Textähnlichkeit darf automatisch verknüpfen; mittlere
   Ähnlichkeit bleibt ein Vorschlag.
 - Gleicher Dateiname bei unterschiedlichem SHA-256 ist immer nur ein Vorschlag.
@@ -30,10 +35,9 @@ Adressen und lokalen Embeddings abgeleitet. Es gibt keine Cloud-Abfrage.
 
 ## Suche und Details
 
-Partner- und Projektnamen erweitern die gemeinsame Suche über E-Mails, PDFs
-und Anhänge. Ein Graph-Treffer wird als **Verknüpfter Kontext** gekennzeichnet.
-Die Detailansicht zeigt erkannte Partner, Projekte sowie verknüpfte E-Mails
-und Dokumente einschließlich Status und Konfidenz.
+Partner- und Projektnamen erweitern die Suche derzeit nicht. Dokumentdetails
+zeigen nur direkte lokal ermittelte Mail-/Dokumentrelationen einschließlich
+Status und Konfidenz.
 
 ## Datenschutz
 

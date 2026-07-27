@@ -2,7 +2,7 @@
 
 ## Schema-Version
 
-Findora erwartet Schema-Version 12. Beim Start werden aktuelle und erwartete
+Findora erwartet Schema-Version 13. Beim Start werden aktuelle und erwartete
 Version verglichen und ausschließlich fehlende Migrationen in aufsteigender
 Reihenfolge ausgeführt. Jede Migration läuft in einer SQLite-Transaktion und
 wird erst danach in `schema_migrations` dokumentiert.
@@ -28,10 +28,10 @@ keine OCR, keine neue Textextraktion und keine Neuerzeugung anderer Analysen.
 
 ## Hintergrund-Upgrades
 
-`analysis_upgrade_jobs` enthält ausschließlich fehlende oder veraltete
-Analysen. Der aktuelle Hintergrundlauf ergänzt Personen- und Projektanalysen
-in kleinen, transaktionalen Batches. Er kann pausiert und später fortgesetzt
-werden.
+`analysis_upgrade_jobs` kann fehlende oder veraltete Analysen
+transaktional speichern. Für die zurückgestellten Partner- und
+Projektfunktionen wird derzeit kein Hintergrundlauf in der Oberfläche
+angeboten.
 
 OCR und Embeddings werden bewusst nicht automatisch erneuert. Die Ansicht
 **Versionen** zeigt fehlende und veraltete Daten und bietet dafür getrennte,
@@ -39,10 +39,15 @@ ausdrücklich zu startende Wartungsaktionen.
 
 ## Kompatibilitätsgarantie
 
-Migrationen 11 und 12 ergänzen Tabellen, Indizes, Beziehungen und Metadaten.
+Migrationen 11 bis 13 ergänzen Tabellen, Indizes, Beziehungen und Metadaten.
 Sie löschen oder ersetzen keine vorhandenen Dokumente, OCR-Texte, Maildaten,
 Chunks oder Embeddings. Eine vollständige Neuindexierung bleibt eine
 bestätigte Nutzeraktion.
+
+Migration 13 ergänzt nur Quelldatei-Metadaten und persistente Unterdrückungen
+für einzeln entfernte Mail-Dubletten. Die Spaltenerweiterung ist
+wiederaufnahmesicher, falls eine Test- oder Reparatursituation die
+Migrationsmarke zurücksetzt.
 
 Migrationstests decken direkte Upgrades von Schema 10 und 11, Rollback und
 Fortsetzung nach einem künstlichen Abbruch, Daten- und Embedding-Erhalt sowie

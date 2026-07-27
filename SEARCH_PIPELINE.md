@@ -59,15 +59,10 @@ wiederverwendet. Es werden höchstens zwölf Cacheeinträge gehalten.
 
 ## Retrieval und Mindestschwellen
 
-Aus dem validierten Plan entstehen drei lokale Kandidatenlisten:
+Aus dem validierten Plan entstehen zwei lokale Kandidatenlisten:
 
 1. SQLite FTS5/BM25 mit sicher escapten Prefix-Begriffen;
 2. Kosinus-Ähnlichkeit der Vektoren des **aktiven** Embeddingmodells;
-3. Partner-, Organisations- und Projekttreffer aus dem Kommunikationsgraphen.
-
-Graphkandidaten werden als **Verknüpfter Kontext** gekennzeichnet und mit
-derselben gespeicherten Dokumentevidenz dargestellt. Es werden keine externen
-Dienste abgefragt.
 
 Die Listen werden mit `0,55 × RRF(FTS) + 0,45 × RRF(Vektor)` fusioniert.
 Kandidaten benötigen aktuell:

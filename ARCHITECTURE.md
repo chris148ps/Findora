@@ -197,10 +197,11 @@ E-Mail-Identität, Quellenzuordnung und Anhangsidentität sind ebenfalls
 getrennt. `MailImportService` streamt Quellen; Mail, PDF und Anhang teilen
 sich Chunk-, FTS- und Embeddingpipeline.
 
-Migrationen 11 und 12 ergänzen den lokalen Kommunikationsgraphen sowie
-unabhängige Analyseversionen je Dokument. Fehlende Personen- und
-Projektanalysen werden inkrementell über fortsetzbare Jobs ergänzt; OCR,
-Embeddings und vollständige Neuindexierungen bleiben ausdrücklich gestartete
+Migrationen 11 bis 13 bewahren historische Tabellen für Partner und Projekte,
+ergänzen unabhängige Analyseversionen je Dokument und sichern die
+Mail-Dublettenwartung. Partner- und Projektprofile werden derzeit weder
+automatisch erzeugt noch in Oberfläche oder Suche verwendet. OCR, Embeddings
+und vollständige Neuindexierungen bleiben ausdrücklich gestartete
 Wartungsaktionen. Details stehen in `docs/COMMUNICATION_GRAPH.md` und
 `docs/DATABASE_MIGRATIONS.md`.
 

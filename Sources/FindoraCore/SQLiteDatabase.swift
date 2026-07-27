@@ -679,6 +679,7 @@ public actor SQLiteDatabase {
             """
             SELECT a.absolute_path, j.relative_path, j.file_name,
                    a.original_hash, MAX(a.page_count) AS page_count,
+                   MAX(j.discovered_size) AS file_size,
                    MIN(a.confidence) AS confidence,
                    COUNT(*) AS analyzed_pages,
                    SUM(CASE WHEN a.status IN ('safelyEmpty', 'probablyEmpty')
@@ -699,6 +700,7 @@ public actor SQLiteDatabase {
                   let name = row.string("file_name"),
                   let hash = row.string("original_hash"),
                   let count = row.int64("page_count"),
+                  let size = row.int64("file_size"),
                   let confidence = row.double("confidence") else { return nil }
             return EmptyPDFCandidate(
                 absolutePath: path,
@@ -706,7 +708,8 @@ public actor SQLiteDatabase {
                 fileName: name,
                 originalHash: hash,
                 pageCount: Int(count),
-                confidence: confidence
+                confidence: confidence,
+                fileSize: size
             )
         }
     }
@@ -1653,6 +1656,10 @@ public actor SQLiteDatabase {
         _ mail: ParsedMail,
         sourceID: Int64,
         sourceEntryKey: String,
+        sourceFilePath: String? = nil,
+        sourceFileSize: Int64? = nil,
+        sourceFileHash: String? = nil,
+        sourceIsIndividual: Bool = false,
         chunks: [TextChunk],
         embeddings: [[Float]],
         indexedAttachments: [IndexedMailAttachment],
@@ -1781,26 +1788,45 @@ public actor SQLiteDatabase {
                 }
             }
 
-            try execute(
+            let isSuppressed = try scalarInt64(
                 """
-                INSERT INTO email_source_links (
-                    email_id, source_id, source_entry_key, source_present,
-                    first_seen_at, last_seen_at, removed_at
-                ) VALUES (?, ?, ?, 1, ?, ?, NULL)
-                ON CONFLICT(source_id, source_entry_key) DO UPDATE SET
-                    email_id = excluded.email_id,
-                    source_present = 1,
-                    last_seen_at = excluded.last_seen_at,
-                    removed_at = NULL
+                SELECT COUNT(*) FROM email_source_link_suppressions
+                WHERE source_id = ? AND source_entry_key = ?
                 """,
-                bindings: [
-                    .integer(emailID),
-                    .integer(sourceID),
-                    .text(sourceEntryKey),
-                    .real(now),
-                    .real(now)
-                ]
-            )
+                bindings: [.integer(sourceID), .text(sourceEntryKey)]
+            ) > 0
+            if !isSuppressed {
+                try execute(
+                    """
+                    INSERT INTO email_source_links (
+                        email_id, source_id, source_entry_key, source_present,
+                        first_seen_at, last_seen_at, removed_at,
+                        source_file_path, source_file_size, source_file_hash,
+                        source_is_individual
+                    ) VALUES (?, ?, ?, 1, ?, ?, NULL, ?, ?, ?, ?)
+                    ON CONFLICT(source_id, source_entry_key) DO UPDATE SET
+                        email_id = excluded.email_id,
+                        source_present = 1,
+                        last_seen_at = excluded.last_seen_at,
+                        removed_at = NULL,
+                        source_file_path = excluded.source_file_path,
+                        source_file_size = excluded.source_file_size,
+                        source_file_hash = excluded.source_file_hash,
+                        source_is_individual = excluded.source_is_individual
+                    """,
+                    bindings: [
+                        .integer(emailID),
+                        .integer(sourceID),
+                        .text(sourceEntryKey),
+                        .real(now),
+                        .real(now),
+                        sourceFilePath.map(SQLiteValue.text) ?? .null,
+                        sourceFileSize.map(SQLiteValue.integer) ?? .null,
+                        sourceFileHash.map(SQLiteValue.text) ?? .null,
+                        .integer(sourceIsIndividual ? 1 : 0)
+                    ]
+                )
+            }
 
             if !unchanged {
                 try deleteSearchRows(documentID: documentID)
@@ -3394,6 +3420,10 @@ public actor SQLiteDatabase {
         }.first ?? "unbekannt"
     }
 
+    public func databaseForeignKeyViolationCount() throws -> Int {
+        try query("PRAGMA foreign_key_check").count
+    }
+
     public func databaseVersionSnapshot(
         embeddingModelID: String = "builtin-token-hash",
         embeddingModelVersion: String = "1"
@@ -3604,6 +3634,173 @@ public actor SQLiteDatabase {
             )
         }
         publishStatusChange(.maintenanceCompleted)
+    }
+
+    public func mailDuplicateGroups() throws -> [MailDuplicateGroup] {
+        let rows = try query(
+            """
+            SELECT e.id AS email_id, e.stable_identity, e.subject,
+                   COALESCE(e.sender_address, '') AS sender,
+                   COALESCE(e.sent_at, e.received_at, e.imported_at) AS mail_date,
+                   e.raw_sha256, sl.id AS link_id, sl.source_id,
+                   sl.source_present, sl.source_file_path, sl.source_file_size,
+                   sl.source_file_hash, sl.source_is_individual,
+                   s.display_name AS source_name, s.source_format, s.source_path,
+                   (
+                       SELECT GROUP_CONCAT(DISTINCT r.address)
+                       FROM email_recipients r WHERE r.email_id = e.id
+                   ) AS recipients,
+                   (
+                       SELECT MIN(reference.id)
+                       FROM email_source_links reference
+                       WHERE reference.email_id = e.id
+                         AND reference.source_present = 1
+                   ) AS reference_link_id
+            FROM emails e
+            JOIN email_source_links sl
+              ON sl.email_id = e.id AND sl.source_present = 1
+            JOIN mail_import_sources s ON s.id = sl.source_id
+            WHERE (
+                SELECT COUNT(*) FROM email_source_links candidate
+                WHERE candidate.email_id = e.id AND candidate.source_present = 1
+            ) > 1
+            ORDER BY COALESCE(e.sent_at, e.received_at, e.imported_at) DESC,
+                     e.id, sl.first_seen_at, sl.id
+            """
+        )
+        var groups: [String: (
+            subject: String,
+            sender: String,
+            recipients: [String],
+            date: Date?,
+            exemplars: [MailDuplicateExemplar]
+        )] = [:]
+        var order: [String] = []
+        for row in rows {
+            guard let identity = row.string("stable_identity"),
+                  let emailID = row.int64("email_id"),
+                  let linkID = row.int64("link_id"),
+                  let sourceID = row.int64("source_id"),
+                  let sourceName = row.string("source_name"),
+                  let formatRaw = row.string("source_format"),
+                  let format = MailSourceFormat(rawValue: formatRaw),
+                  let sourcePath = row.string("source_path"),
+                  let messageHash = row.string("raw_sha256") else { continue }
+            if groups[identity] == nil {
+                order.append(identity)
+                groups[identity] = (
+                    subject: row.string("subject") ?? "(Ohne Betreff)",
+                    sender: row.string("sender") ?? "",
+                    recipients: row.string("recipients")?
+                        .split(separator: ",").map(String.init).sorted() ?? [],
+                    date: row.double("mail_date").map(Date.init(timeIntervalSince1970:)),
+                    exemplars: []
+                )
+            }
+            groups[identity]?.exemplars.append(
+                MailDuplicateExemplar(
+                    id: linkID,
+                    emailID: emailID,
+                    sourceID: sourceID,
+                    sourceName: sourceName,
+                    sourceFormat: format,
+                    sourcePath: sourcePath,
+                    sourceFilePath: row.string("source_file_path"),
+                    sourceFileSize: row.int64("source_file_size"),
+                    sourceFileHash: row.string("source_file_hash"),
+                    messageHash: messageHash,
+                    isIndividualFile: row.int64("source_is_individual") == 1,
+                    isReference: row.int64("reference_link_id") == linkID,
+                    isPresent: row.int64("source_present") == 1
+                )
+            )
+        }
+        return order.compactMap { identity in
+            guard let group = groups[identity] else { return nil }
+            return MailDuplicateGroup(
+                id: identity,
+                subject: group.subject,
+                sender: group.sender,
+                recipients: group.recipients,
+                date: group.date,
+                recognitionBasis: "Identische stabile Mail-Identität und SHA-256",
+                exemplars: group.exemplars
+            )
+        }
+    }
+
+    @discardableResult
+    public func removeMailDuplicateExemplars(linkIDs: Set<Int64>) throws -> Int {
+        guard !linkIDs.isEmpty else { return 0 }
+        return try transaction {
+            let placeholders = Array(repeating: "?", count: linkIDs.count)
+                .joined(separator: ",")
+            let bindings = linkIDs.sorted().map(SQLiteValue.integer)
+            let selectedRows = try query(
+                """
+                SELECT id, email_id, source_id, source_entry_key
+                FROM email_source_links
+                WHERE id IN (\(placeholders)) AND source_present = 1
+                """,
+                bindings: bindings
+            )
+            guard selectedRows.count == linkIDs.count else {
+                throw FindoraError.processFailed(
+                    "Die Mail-Dubletten-Auswahl ist nicht mehr aktuell."
+                )
+            }
+            let selectedByEmail = Dictionary(grouping: selectedRows) {
+                $0.int64("email_id") ?? -1
+            }
+            for (emailID, selected) in selectedByEmail {
+                let referenceID = try scalarInt64(
+                    """
+                    SELECT MIN(id) FROM email_source_links
+                    WHERE email_id = ? AND source_present = 1
+                    """,
+                    bindings: [.integer(emailID)]
+                )
+                guard !selected.contains(where: {
+                    $0.int64("id") == referenceID
+                }) else {
+                    throw FindoraError.processFailed(
+                        "Das Referenzexemplar einer Mail muss erhalten bleiben."
+                    )
+                }
+                let total = try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM email_source_links
+                    WHERE email_id = ? AND source_present = 1
+                    """,
+                    bindings: [.integer(emailID)]
+                )
+                guard selected.count < total else {
+                    throw FindoraError.processFailed(
+                        "Mindestens ein Referenzexemplar jeder Mail muss erhalten bleiben."
+                    )
+                }
+            }
+            let now = Date().timeIntervalSince1970
+            for row in selectedRows {
+                guard let linkID = row.int64("id"),
+                      let sourceID = row.int64("source_id"),
+                      let entryKey = row.string("source_entry_key") else { continue }
+                try execute(
+                    """
+                    INSERT OR REPLACE INTO email_source_link_suppressions
+                        (source_id, source_entry_key, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    bindings: [.integer(sourceID), .text(entryKey), .real(now)]
+                )
+                try execute(
+                    "DELETE FROM email_source_links WHERE id = ?",
+                    bindings: [.integer(linkID)]
+                )
+            }
+            try refreshCommunicationGraphInTransaction()
+            return selectedRows.count
+        }
     }
 
     public func communicationPartners() throws -> [CommunicationPartner] {
@@ -4037,6 +4234,7 @@ public actor SQLiteDatabase {
         let text: String
         let conversationID: String?
         let activity: Double
+        // Nur für die nicht aktive, schema-kompatibel erhaltene Projektroutine.
         let references: Set<String>
         let tokens: Set<String>
         let embedding: GraphEmbedding?
@@ -4047,6 +4245,7 @@ public actor SQLiteDatabase {
         let fileName: String
         let text: String
         let activity: Double
+        // Nur für die nicht aktive, schema-kompatibel erhaltene Projektroutine.
         let references: Set<String>
         let tokens: Set<String>
         let embedding: GraphEmbedding?
@@ -4060,102 +4259,8 @@ public actor SQLiteDatabase {
 
     private func refreshCommunicationGraphInTransaction() throws {
         let now = Date().timeIntervalSince1970
-        try execute("DELETE FROM communication_partner_email_links")
-
-        let addressRows = try query(
-            """
-            SELECT r.email_id, r.role, r.display_name, r.address,
-                   COALESCE(e.sent_at, e.received_at, e.imported_at) AS activity
-            FROM email_recipients r
-            JOIN emails e ON e.id = r.email_id
-            WHERE trim(r.address) != ''
-            """
-        )
-        for row in addressRows {
-            guard let emailID = row.int64("email_id"),
-                  let role = row.string("role"),
-                  let address = row.string("address"),
-                  let activity = row.double("activity") else { continue }
-            let normalized = Self.normalizedEmailAddress(address)
-            guard !normalized.isEmpty else { continue }
-            let displayName = Self.partnerDisplayName(
-                row.string("display_name"),
-                address: normalized
-            )
-            let organizationID = try organizationID(
-                for: normalized,
-                now: now
-            )
-            try execute(
-                """
-                INSERT INTO communication_partners (
-                    organization_id, canonical_name, primary_address,
-                    last_activity_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(primary_address) DO UPDATE SET
-                    organization_id = COALESCE(excluded.organization_id, organization_id),
-                    canonical_name = CASE
-                        WHEN length(excluded.canonical_name) > length(canonical_name)
-                        THEN excluded.canonical_name ELSE canonical_name END,
-                    last_activity_at = MAX(
-                        COALESCE(last_activity_at, 0),
-                        excluded.last_activity_at
-                    ),
-                    updated_at = excluded.updated_at
-                """,
-                bindings: [
-                    organizationID.map(SQLiteValue.integer) ?? .null,
-                    .text(displayName), .text(normalized), .real(activity),
-                    .real(now), .real(now)
-                ]
-            )
-            let partnerID = try scalarInt64(
-                "SELECT id FROM communication_partners WHERE primary_address = ?",
-                bindings: [.text(normalized)]
-            )
-            try execute(
-                """
-                INSERT INTO communication_partner_aliases (
-                    partner_id, display_name, address, normalized_address, created_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(normalized_address) DO UPDATE SET
-                    partner_id = excluded.partner_id,
-                    display_name = COALESCE(excluded.display_name, display_name),
-                    address = excluded.address
-                """,
-                bindings: [
-                    .integer(partnerID),
-                    row.string("display_name").map(SQLiteValue.text) ?? .null,
-                    .text(address), .text(normalized), .real(now)
-                ]
-            )
-            try execute(
-                """
-                INSERT OR IGNORE INTO communication_partner_email_links
-                    (partner_id, email_id, role)
-                VALUES (?, ?, ?)
-                """,
-                bindings: [.integer(partnerID), .integer(emailID), .text(role)]
-            )
-        }
-        try execute(
-            """
-            DELETE FROM communication_partners
-            WHERE NOT EXISTS (
-                SELECT 1 FROM communication_partner_email_links l
-                WHERE l.partner_id = communication_partners.id
-            )
-            """
-        )
-        try execute(
-            """
-            DELETE FROM organizations
-            WHERE NOT EXISTS (
-                SELECT 1 FROM communication_partners p
-                WHERE p.organization_id = organizations.id
-            )
-            """
-        )
+        // Partnerbildung ist wie die zugehörige Oberfläche für ein späteres
+        // Update zurückgestellt. Bestehende Zeilen bleiben verlustfrei erhalten.
 
         try execute(
             "DELETE FROM mail_relations WHERE relation_status IN ('automatic', 'suggested')"
@@ -4163,24 +4268,8 @@ public actor SQLiteDatabase {
         try execute(
             "DELETE FROM document_relations WHERE relation_status IN ('automatic', 'suggested')"
         )
-        try execute(
-            "DELETE FROM project_email_links WHERE relation_status IN ('automatic', 'suggested')"
-        )
-        try execute(
-            "DELETE FROM project_document_links WHERE relation_status IN ('automatic', 'suggested')"
-        )
-        try execute(
-            """
-            DELETE FROM projects
-            WHERE relation_status IN ('automatic', 'suggested')
-              AND NOT EXISTS (
-                  SELECT 1 FROM project_email_links pel WHERE pel.project_id = projects.id
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM project_document_links pdl WHERE pdl.project_id = projects.id
-              )
-            """
-        )
+        // Projektbildung ist für ein späteres Update zurückgestellt.
+        // Bestehende Projektzeilen und Verknüpfungen bleiben unverändert erhalten.
 
         try execute(
             """
@@ -4219,63 +4308,47 @@ public actor SQLiteDatabase {
         let documents = try graphDocumentRecords()
         for email in emails {
             for document in documents where document.id != email.documentID {
-                let sharedReferences = email.references.intersection(document.references)
-                if let reference = sharedReferences.sorted().first {
+                let similarity = Self.jaccard(email.tokens, document.tokens)
+                if similarity >= 0.62 {
                     try upsertMailDocumentRelation(
                         emailID: email.id,
                         documentID: document.id,
-                        kind: .sharedProjectReference,
+                        kind: .contentSimilarity,
                         status: .automatic,
-                        confidence: 0.96,
-                        evidence: "Gemeinsame Projektreferenz: \(reference)",
+                        confidence: min(0.92, similarity),
+                        evidence: "Hohe lokale Textähnlichkeit.",
                         now: now
                     )
-                } else {
-                    let similarity = Self.jaccard(email.tokens, document.tokens)
-                    if similarity >= 0.62 {
-                        try upsertMailDocumentRelation(
-                            emailID: email.id,
-                            documentID: document.id,
-                            kind: .contentSimilarity,
-                            status: .automatic,
-                            confidence: min(0.92, similarity),
-                            evidence: "Hohe lokale Textähnlichkeit.",
-                            now: now
-                        )
-                    } else if similarity >= 0.18 {
-                        try upsertMailDocumentRelation(
-                            emailID: email.id,
-                            documentID: document.id,
-                            kind: .contentSimilarity,
-                            status: .suggested,
-                            confidence: min(0.61, similarity + 0.20),
-                            evidence: "Mögliche lokale Textähnlichkeit; manuelle Prüfung empfohlen.",
-                            now: now
-                        )
-                    }
-                    if let semantic = Self.graphCosine(
-                        email.embedding,
-                        document.embedding
-                    ), semantic >= 0.42 {
-                        try upsertMailDocumentRelation(
-                            emailID: email.id,
-                            documentID: document.id,
-                            kind: .localSemantic,
-                            status: .suggested,
-                            confidence: min(0.79, semantic),
-                            evidence: "Lokale Embeddings deuten auf einen möglichen Zusammenhang hin.",
-                            now: now
-                        )
-                    }
+                } else if similarity >= 0.18 {
+                    try upsertMailDocumentRelation(
+                        emailID: email.id,
+                        documentID: document.id,
+                        kind: .contentSimilarity,
+                        status: .suggested,
+                        confidence: min(0.61, similarity + 0.20),
+                        evidence: "Mögliche lokale Textähnlichkeit; manuelle Prüfung empfohlen.",
+                        now: now
+                    )
+                }
+                if let semantic = Self.graphCosine(
+                    email.embedding,
+                    document.embedding
+                ), semantic >= 0.42 {
+                    try upsertMailDocumentRelation(
+                        emailID: email.id,
+                        documentID: document.id,
+                        kind: .localSemantic,
+                        status: .suggested,
+                        confidence: min(0.79, semantic),
+                        evidence: "Lokale Embeddings deuten auf einen möglichen Zusammenhang hin.",
+                        now: now
+                    )
                 }
             }
         }
 
         try insertFileNameSuggestions(now: now)
-        try rebuildProjects(emails: emails, documents: documents, now: now)
-        try rebuildSuggestedProjects(now: now)
         try rebuildDocumentRelations(now: now)
-        try markCommunicationAnalysisVersionsInTransaction(now: now)
     }
 
     private func organizationID(for address: String, now: Double) throws -> Int64? {
@@ -4413,7 +4486,7 @@ public actor SQLiteDatabase {
                 text: text,
                 conversationID: row.string("conversation_id"),
                 activity: activity,
-                references: Self.projectReferences(in: combined),
+                references: [],
                 tokens: Self.graphTokens(in: combined),
                 embedding: Self.graphEmbedding(row)
             )
@@ -4477,7 +4550,7 @@ public actor SQLiteDatabase {
                 fileName: fileName,
                 text: text,
                 activity: activity,
-                references: Self.projectReferences(in: combined),
+                references: [],
                 tokens: Self.graphTokens(in: combined),
                 embedding: Self.graphEmbedding(row)
             )
@@ -5034,6 +5107,49 @@ public actor SQLiteDatabase {
                 }
                 try execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (12, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+        if current < 13 {
+            try transaction {
+                let hasDocumentSchema = try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'documents'
+                    """
+                ) > 0
+                if hasDocumentSchema {
+                    let sourceLinkColumns = Set(
+                        try query("PRAGMA table_info(email_source_links)")
+                            .compactMap { $0.string("name") }
+                    )
+                    if !sourceLinkColumns.contains("source_file_path") {
+                        try execute(
+                            "ALTER TABLE email_source_links ADD COLUMN source_file_path TEXT"
+                        )
+                    }
+                    if !sourceLinkColumns.contains("source_file_size") {
+                        try execute(
+                            "ALTER TABLE email_source_links ADD COLUMN source_file_size INTEGER"
+                        )
+                    }
+                    if !sourceLinkColumns.contains("source_file_hash") {
+                        try execute(
+                            "ALTER TABLE email_source_links ADD COLUMN source_file_hash TEXT"
+                        )
+                    }
+                    if !sourceLinkColumns.contains("source_is_individual") {
+                        try execute(
+                            "ALTER TABLE email_source_links ADD COLUMN source_is_individual INTEGER NOT NULL DEFAULT 0"
+                        )
+                    }
+                    for statement in Self.migration13 {
+                        try execute(statement)
+                    }
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (13, ?)",
                     bindings: [.real(Date().timeIntervalSince1970)]
                 )
             }
@@ -6046,6 +6162,17 @@ public actor SQLiteDatabase {
         "CREATE INDEX idx_analysis_upgrade_jobs_state ON analysis_upgrade_jobs(state, updated_at)",
         "CREATE INDEX idx_analysis_versions_people ON document_analysis_versions(people_analysis_version)",
         "CREATE INDEX idx_analysis_versions_projects ON document_analysis_versions(project_analysis_version)"
+    ]
+
+    private static let migration13 = [
+        """
+        CREATE TABLE IF NOT EXISTS email_source_link_suppressions (
+            source_id INTEGER NOT NULL REFERENCES mail_import_sources(id) ON DELETE CASCADE,
+            source_entry_key TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(source_id, source_entry_key)
+        )
+        """,
     ]
 }
 

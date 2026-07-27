@@ -5,8 +5,8 @@ public actor FolderBookmarkStore {
     private let bookmarkKey = "documentFolderSecurityScopedBookmark"
     private let displayPathKey = "documentFolderDisplayPath"
 
-    public init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
+    public init(defaults: UserDefaults? = nil) {
+        self.defaults = defaults ?? FindoraRuntimeEnvironment.userDefaults()
     }
 
     public func save(url: URL) throws {
@@ -69,4 +69,3 @@ public final class ResolvedFolder: @unchecked Sendable {
         }
     }
 }
-

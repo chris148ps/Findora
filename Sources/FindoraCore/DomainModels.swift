@@ -983,6 +983,8 @@ public struct EmptyPDFCandidate: Identifiable, Equatable, Hashable, Sendable {
     public let originalHash: String
     public let pageCount: Int
     public let confidence: Double
+    public let fileSize: Int64
+    public let reason: String
 
     public init(
         absolutePath: String,
@@ -990,7 +992,9 @@ public struct EmptyPDFCandidate: Identifiable, Equatable, Hashable, Sendable {
         fileName: String,
         originalHash: String,
         pageCount: Int,
-        confidence: Double
+        confidence: Double,
+        fileSize: Int64 = 0,
+        reason: String = "Alle analysierten Seiten wurden ausdrücklich als leer bestätigt."
     ) {
         self.absolutePath = absolutePath
         self.relativePath = relativePath
@@ -998,6 +1002,8 @@ public struct EmptyPDFCandidate: Identifiable, Equatable, Hashable, Sendable {
         self.originalHash = originalHash
         self.pageCount = pageCount
         self.confidence = confidence
+        self.fileSize = fileSize
+        self.reason = reason
     }
 }
 

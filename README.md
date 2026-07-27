@@ -102,6 +102,13 @@ Status, Warteschlange und technische Fehler erscheinen unter **Status** und
 Das dauerhaft lesbare technische Protokoll liegt unter
 `~/Library/Logs/Findora/Findora.log`.
 
+Automatische Crashberichte sind standardmäßig deaktiviert. Sie können unter
+**Einstellungen → Crashberichte** ausdrücklich aktiviert und über die lokal
+konfigurierte Apple-Mail-App an eine einstellbare Empfängeradresse gesendet
+werden. Vor dem Versand werden E-Mail-Adressen und private Pfade geschwärzt;
+Dokumentinhalte, Suchanfragen und Antworten werden nicht aufgenommen. Details:
+[`CRASH_REPORTING.md`](CRASH_REPORTING.md).
+
 Der Dokumentenstatus aktualisiert sich während Scan, OCR, Indexierung,
 Embedding-Erstellung und Wartung automatisch. Datenbankereignisse werden
 gebündelt innerhalb von etwa 300 ms dargestellt; ein manueller Ansichtswechsel

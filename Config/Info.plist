@@ -28,6 +28,8 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Findora verwendet Apple Mail ausschließlich zum Versand ausdrücklich aktivierter, bereinigter Crashberichte.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Findora contributors</string>
 </dict>

@@ -183,6 +183,7 @@ func confirmedEmptyPageRemovalKeepsPDFValidAndQueuesTargetedReindex() async thro
             .text("INHALT ZWEI " + String(repeating: "Zweite Seite. ", count: 8))
         ]
     )
+    let originalHash = try SHA256Hasher().hash(fileAt: pdf)
     let database = SQLiteDatabase(url: paths.database)
     try await database.initialize()
     let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
@@ -210,6 +211,7 @@ func confirmedEmptyPageRemovalKeepsPDFValidAndQueuesTargetedReindex() async thro
 
     let result = try #require(PDFDocument(url: pdf))
     #expect(result.pageCount == 2)
+    #expect(try SHA256Hasher().hash(fileAt: pdf) != originalHash)
     #expect(result.page(at: 0)?.string?.contains("INHALT EINS") == true)
     #expect(result.page(at: 1)?.string?.contains("INHALT ZWEI") == true)
     #expect(try await database.pendingFiles().map(\.url.path) == [pdf.path])
@@ -225,6 +227,104 @@ func confirmedEmptyPageRemovalKeepsPDFValidAndQueuesTargetedReindex() async thro
         embedder: embedder
     ).search("INHALT ZWEI")
     #expect(reindexed.first?.pageNumber == 2)
+    #expect(
+        (try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil
+        )).allSatisfy { !$0.lastPathComponent.hasPrefix(".Findora-new-") }
+    )
+}
+
+@Test
+func pageRemovalBlocksAllPagesChangedFilesAndRestoresOnTrashFailure() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let pdf = root.appending(path: "Sicherheitsfälle.pdf")
+    try createMaintenancePDF(
+        at: pdf,
+        pages: [.text("FINDORA TEST PAGE 1"), .blank, .text("FINDORA TEST PAGE 3")]
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    try await database.setPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 2,
+        decision: .confirmedEmpty
+    )
+    let candidate = try #require(
+        try await database.emptyPageCandidates().first {
+            $0.absolutePath == pdf.path && $0.pageNumber == 2
+        }
+    )
+    let originalData = try Data(contentsOf: pdf)
+    let service = DocumentMaintenanceService(
+        database: database,
+        trashManager: FailingTrashManager(
+            directory: root.appending(path: "Trash", directoryHint: .isDirectory),
+            failureIndex: 1
+        )
+    )
+    await #expect(throws: Error.self) {
+        try await service.removePages(from: candidate, pageNumbers: [1, 2, 3])
+    }
+    #expect(try Data(contentsOf: pdf) == originalData)
+    await #expect(throws: Error.self) {
+        try await service.removePages(from: candidate, pageNumbers: [2])
+    }
+    #expect(try Data(contentsOf: pdf) == originalData)
+    #expect(
+        (try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil
+        )).allSatisfy { !$0.lastPathComponent.hasPrefix(".Findora-new-") }
+    )
+
+    try Data("bewusst nach Analyse verändert".utf8).write(to: pdf)
+    await #expect(throws: Error.self) {
+        try await DocumentMaintenanceService(database: database)
+            .removePages(from: candidate, pageNumbers: [2])
+    }
+}
+
+@Test
+func corruptAndEncryptedPDFsAreRejectedWithoutModification() throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let corrupt = root.appending(path: "pdf_corrupt.pdf")
+    let corruptData = Data("%PDF-absichtlich-beschaedigt".utf8)
+    try corruptData.write(to: corrupt)
+    #expect(throws: Error.self) {
+        try PageContentAnalyzer().analyze(fileAt: corrupt)
+    }
+    #expect(try Data(contentsOf: corrupt) == corruptData)
+
+    let plain = root.appending(path: "plain.pdf")
+    try createMaintenancePDF(at: plain, pages: [.blank])
+    let encrypted = root.appending(path: "pdf_encrypted.pdf")
+    let document = try #require(PDFDocument(url: plain))
+    #expect(
+        document.write(
+            to: encrypted,
+            withOptions: [
+                .userPasswordOption: "findora-test",
+                .ownerPasswordOption: "findora-owner"
+            ]
+        )
+    )
+    let encryptedData = try Data(contentsOf: encrypted)
+    #expect(throws: Error.self) {
+        try PageContentAnalyzer().analyze(fileAt: encrypted)
+    }
+    #expect(try Data(contentsOf: encrypted) == encryptedData)
 }
 
 @Test
@@ -262,6 +362,88 @@ func emptyPDFTrashUpdatesDatabaseOnlyAfterRecoverableMove() async throws {
     #expect(try await database.emptyPDFCandidates().isEmpty)
     #expect(try await database.statistics().totalPDFs == 0)
     #expect(trash.trashedItemCount == 1)
+}
+
+@Test
+func emptyPDFIndexRemovalPreservesOriginalFile() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let pdf = root.appending(path: "Leer nur Index.pdf")
+    try createMaintenancePDF(at: pdf, pages: [.blank])
+    let originalData = try Data(contentsOf: pdf)
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    try await database.setPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 1,
+        decision: .confirmedEmpty
+    )
+    let candidate = try #require(try await database.emptyPDFCandidates().first)
+
+    let result = await DocumentMaintenanceService(
+        database: database
+    ).removeEmptyPDFsFromIndex([candidate])
+
+    #expect(result.succeeded == [pdf.lastPathComponent])
+    #expect(result.failures.isEmpty)
+    #expect(try Data(contentsOf: pdf) == originalData)
+    #expect(try await database.emptyPDFCandidates().isEmpty)
+    #expect(try await database.statistics().totalPDFs == 0)
+}
+
+@Test
+func emptyPDFBatchReportsIndividualFailureAndKeepsFailedFileIndexed() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let first = root.appending(path: "Leer A.pdf")
+    let second = root.appending(path: "Leer B.pdf")
+    try createMaintenancePDF(at: first, pages: [.blank])
+    try createMaintenancePDF(at: second, pages: [.blank])
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    for url in [first, second] {
+        try await database.setPageReviewDecision(
+            path: url.path,
+            pageNumber: 1,
+            decision: .confirmedEmpty
+        )
+    }
+    let candidates = try await database.emptyPDFCandidates()
+    #expect(candidates.count == 2)
+    let result = await DocumentMaintenanceService(
+        database: database,
+        trashManager: FailingTrashManager(
+            directory: root.appending(path: "Trash", directoryHint: .isDirectory),
+            failureIndex: 2
+        )
+    ).trashEmptyPDFsIndividually(candidates)
+    #expect(result.succeeded.count == 1)
+    #expect(result.failures.count == 1)
+    #expect(
+        [first, second].filter {
+            FileManager.default.fileExists(atPath: $0.path)
+        }.count == 1
+    )
+    #expect(try await database.emptyPDFCandidates().count == 1)
+    #expect(try await database.statistics().totalPDFs == 1)
 }
 
 @Test
@@ -354,6 +536,94 @@ func manualPageTextUpdatesOnlyPageIndexAndPreservesOriginalOCRText() async throw
     #expect(results.first?.pageNumber == 1)
     #expect(try SHA256Hasher().hash(fileAt: pdf) == hashBefore)
     #expect(try await database.statistics().manuallyCorrectedPages == 1)
+}
+
+@Test
+func ocrReviewMaintenanceSeparatesListIndexAndOriginalActions() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let listOnly = root.appending(path: "Nur Prüfliste.pdf")
+    let indexOnly = root.appending(path: "Nur Index.pdf")
+    let original = root.appending(path: "Original Papierkorb.pdf")
+    let batchGood = root.appending(path: "Batch erfolgreich.pdf")
+    let batchChanged = root.appending(path: "Batch geändert.pdf")
+    let batchMissing = root.appending(path: "Batch fehlt.pdf")
+    for url in [
+        listOnly, indexOnly, original, batchGood, batchChanged, batchMissing
+    ] {
+        try createMaintenancePDF(at: url, pages: [.blank])
+    }
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(files: try await scanner.scan(root: root), root: root)
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    for url in [
+        listOnly, indexOnly, original, batchGood, batchChanged, batchMissing
+    ] {
+        try await database.setPageReviewDecision(
+            path: url.path,
+            pageNumber: 1,
+            decision: .notEmpty
+        )
+    }
+    let candidates = try await database.ocrReviewCandidates()
+    let listCandidate = try #require(candidates.first { $0.absolutePath == listOnly.path })
+    let indexCandidate = try #require(candidates.first { $0.absolutePath == indexOnly.path })
+    let originalCandidate = try #require(candidates.first { $0.absolutePath == original.path })
+    let goodCandidate = try #require(candidates.first { $0.absolutePath == batchGood.path })
+    let changedCandidate = try #require(candidates.first {
+        $0.absolutePath == batchChanged.path
+    })
+    let missingCandidate = try #require(candidates.first {
+        $0.absolutePath == batchMissing.path
+    })
+    let trash = TestTrashManager(
+        directory: root.appending(path: "Trash", directoryHint: .isDirectory)
+    )
+    let maintenance = DocumentMaintenanceService(
+        database: database,
+        trashManager: trash
+    )
+
+    let listResult = await maintenance.removeOCRReviewEntries([listCandidate])
+    #expect(listResult.succeeded.count == 1)
+    #expect(FileManager.default.fileExists(atPath: listOnly.path))
+    #expect(try await database.ocrReviewCandidates().allSatisfy {
+        $0.absolutePath != listOnly.path
+    })
+
+    let indexResult = await maintenance.removeOCRReviewDocumentsFromIndex(
+        [indexCandidate]
+    )
+    #expect(indexResult.succeeded.count == 1)
+    #expect(FileManager.default.fileExists(atPath: indexOnly.path))
+    #expect(try await database.ocrReviewCandidates().allSatisfy {
+        $0.absolutePath != indexOnly.path
+    })
+
+    try Data("nach Analyse verändert".utf8).write(to: batchChanged)
+    try FileManager.default.removeItem(at: batchMissing)
+    let batchResult = await maintenance.removeOCRReviewDocumentsFromIndex(
+        [goodCandidate, changedCandidate, missingCandidate]
+    )
+    #expect(batchResult.succeeded.count == 1)
+    #expect(batchResult.failures.count == 2)
+    #expect(FileManager.default.fileExists(atPath: batchGood.path))
+    #expect(FileManager.default.fileExists(atPath: batchChanged.path))
+
+    let trashResult = await maintenance.trashOCRReviewDocuments(
+        [originalCandidate]
+    )
+    #expect(trashResult.succeeded.count == 1)
+    #expect(!FileManager.default.fileExists(atPath: original.path))
+    #expect(trash.trashedItemCount == 1)
 }
 
 @Test

@@ -65,6 +65,14 @@ gehören nicht in Logs. Zulässig sind Dateiname, Pfad, Status, Dauer und
 technische Fehler. Für weitergegebene Logs sollten sensible Pfadteile
 geschwärzt werden.
 
+Automatische Crashberichte sind eine ausdrückliche Opt-in-Ausnahme von der
+sonst vollständig lokalen Verarbeitung. Vor der Übergabe an Apple Mail werden
+Home-Verzeichnisse, absolute Pfade, E-Mail-Adressen sowie `path=`-Logfelder
+geschwärzt. Der Bericht wird nur an die lokal gespeicherte, syntaktisch
+validierte Empfängeradresse gesendet. Findora prüft oder startet Apple Mail
+nur, wenn ein ausstehender Bericht, die Aktivierung und eine gültige Adresse
+gleichzeitig vorliegen.
+
 ## Bekannte Grenzen
 
 - Der SQLite-Index ist nicht anwendungsseitig verschlüsselt.

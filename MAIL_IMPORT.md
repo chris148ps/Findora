@@ -29,11 +29,19 @@ einer Mail wird einmal gespeichert; mehrere Quellen erhalten eigene
 `email_source_links`. Anhänge werden vor Speicherung mit SHA-256 identifiziert,
 aber jede Mail-Anhang-Beziehung bleibt separat erhalten.
 
-Nach jedem Import aktualisiert Findora den lokalen Kommunikationsgraphen.
-Identische PDF-Anhänge werden über SHA-256 mit bereits vorhandenen PDFs
-verknüpft, ohne eine zweite Inhaltskopie anzulegen. Das gilt ebenso, wenn das
-PDF erst nach der Mail erscheint. Gleiche Dateinamen mit abweichendem Inhalt
-bleiben ausschließlich prüfbare Vorschläge.
+Unter **Dokumentenwartung → Mail-Dubletten** werden mehrere Quellenexemplare
+gruppiert angezeigt. Ein Referenzexemplar ist nicht auswählbar. Weitere
+Exemplare können entweder nur dauerhaft aus Findora entfernt werden oder –
+ausschließlich bei einer eigenständigen, unveränderten EML-/MSG-Datei mit
+geprüftem Datei-SHA-256 – nach gesonderter Bestätigung in den
+macOS-Papierkorb verschoben werden. Einzelne Nachrichten innerhalb einer MBOX
+sind nicht als Originaldatei verschiebbar.
+
+Nach jedem Import aktualisiert Findora ausschließlich direkte lokale
+Mail-/Dokumentverknüpfungen. Identische PDF-Anhänge werden über SHA-256 mit
+bereits vorhandenen PDFs verknüpft, ohne eine zweite Inhaltskopie anzulegen.
+Das gilt ebenso, wenn das PDF erst nach der Mail erscheint. Partner- und
+Projektprofile werden dabei nicht erzeugt.
 
 ## Referenzieren oder archivieren
 
@@ -45,8 +53,9 @@ geschätzten Zusatzbedarf.
 - **Archiviert:** Zusätzlich wird eine verifizierte Kopie unter
   `MailArchive/Sources` beziehungsweise `MailArchive/Attachments` angelegt.
 
-Originale werden nie verändert, verschoben oder gelöscht. Das Entfernen einer
-Quellenzuordnung löscht weder indexierte Maildaten noch archivierte Originale.
+Originale werden beim Import und Quellenabgleich nie verändert, verschoben
+oder gelöscht. Nur die ausdrücklich bestätigte Dublettenaktion darf eine
+konkret ausgewählte eigenständige Maildatei in den Papierkorb verschieben.
 
 ## Anhänge, Abgleich und Suche
 

@@ -157,18 +157,18 @@ public final class StorageConfigurationStore: @unchecked Sendable {
     private let fileManager: FileManager
 
     public init(
-        defaults: UserDefaults = .standard,
+        defaults: UserDefaults? = nil,
         fileManager: FileManager = .default
     ) {
         self.defaults = defaults
+            ?? FindoraRuntimeEnvironment.userDefaults(fileManager: fileManager)
         self.fileManager = fileManager
     }
 
     public func startupSelection() throws -> StorageStartupSelection {
-        let defaultSupport = fileManager.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!.appending(path: "Findora", directoryHint: .isDirectory)
+        let defaultSupport = FindoraRuntimeEnvironment.applicationSupportRoot(
+            fileManager: fileManager
+        )
         let data = try resolve(kind: .data, defaultURL: defaultSupport)
         let defaultModels = defaultSupport.appending(path: "Models", directoryHint: .isDirectory)
         let models = try resolve(kind: .models, defaultURL: defaultModels)

@@ -23,6 +23,23 @@ KI-Anbieter. Es gibt
 standardmäßig keine Telemetrie,
 Analyse-, Crash-Upload- oder Tracking-Funktion.
 
+## Optionale Crashberichte
+
+Automatische Crashberichte sind standardmäßig deaktiviert. Der Nutzer kann
+sie in den Einstellungen ausdrücklich aktivieren und eine Empfängeradresse
+festlegen. Nach einem ungeplanten App-Ende erstellt Findora beim nächsten
+Start lokal einen bereinigten Bericht und übergibt ihn automatisch an die
+bereits konfigurierte Apple-Mail-App.
+
+Der Bericht enthält App-/Buildversion, Zeitpunkt, einen begrenzten
+macOS-Diagnoseauszug und die letzten bereinigten technischen Logzeilen.
+Dokumentinhalte, Suchanfragen, Antworten und vollständige private Pfade werden
+nicht aufgenommen; E-Mail-Adressen und erkannte absolute Pfade werden
+geschwärzt. Schlägt der Versand fehl oder fehlt die Apple-Mail-Berechtigung,
+bleibt der Bericht lokal mit Dateirechten `0600` für einen späteren Versuch
+liegen. Die Empfängeradresse bleibt ausschließlich in der lokalen
+Findora-Datenbank.
+
 Suchpläne und Folgefragen werden nur im Arbeitsspeicher der laufenden Sitzung
 gehalten. Der Chatverlauf ist auf sechs Schritte begrenzt, wird nicht
 persistiert und nicht automatisch exportiert.

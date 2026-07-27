@@ -5,6 +5,7 @@
 ```bash
 swift test
 ./scripts/check-product-name.sh
+./scripts/check-retired-features.sh
 ```
 
 Die automatisierten Tests verwenden ausschließlich künstlich erzeugte
@@ -72,8 +73,8 @@ Abgedeckt sind:
 - Mail zuerst/PDF später und PDF zuerst/Mail später;
 - identischer PDF-Anhang per SHA-256 sowie gleicher Dateiname mit
   abweichendem Inhalt nur als Vorschlag;
-- mehrere Kontakte, Organisationen und Projekte, unsichere lokale
-  Ähnlichkeit und Partner-/Projektsuche;
+- direkte lokale Mail-/Dokumentverknüpfungen bei identischem Anhang sowie
+  der Ausschluss von Partner-/Projektprofilen aus Import und Suche;
 - Upgrade von Schema 10 und 11 ohne Verlust von Dokumenten, OCR, Mail oder
   Embeddings;
 - transaktionaler Rollback und Fortsetzung nach unterbrochener Migration;

@@ -161,7 +161,9 @@ public actor MailImportService {
                             let delta = try await importOne(
                                 mail,
                                 sourceID: sourceID,
-                                importMode: importMode
+                                importMode: importMode,
+                                sourceFile: sourceFile.url,
+                                sourceIsIndividual: false
                             )
                             await onProgress(await accumulator.apply(delta))
                         }
@@ -173,7 +175,9 @@ public actor MailImportService {
                         let delta = try await importOne(
                             mail,
                             sourceID: sourceID,
-                            importMode: importMode
+                            importMode: importMode,
+                            sourceFile: sourceFile.url,
+                            sourceIsIndividual: true
                         )
                         await onProgress(await accumulator.apply(delta))
                     }
@@ -249,7 +253,9 @@ public actor MailImportService {
                         let delta = try await importOne(
                             mail,
                             sourceID: sourceID,
-                            importMode: source.importMode
+                            importMode: source.importMode,
+                            sourceFile: sourceFile.url,
+                            sourceIsIndividual: false
                         )
                         await onProgress(await accumulator.apply(delta))
                     }
@@ -261,7 +267,9 @@ public actor MailImportService {
                     let delta = try await importOne(
                         mail,
                         sourceID: sourceID,
-                        importMode: source.importMode
+                        importMode: source.importMode,
+                        sourceFile: sourceFile.url,
+                        sourceIsIndividual: true
                     )
                     await onProgress(await accumulator.apply(delta))
                 }
@@ -282,7 +290,9 @@ public actor MailImportService {
     private func importOne(
         _ mail: ParsedMail,
         sourceID: Int64,
-        importMode: MailImportMode
+        importMode: MailImportMode,
+        sourceFile: URL,
+        sourceIsIndividual: Bool
     ) async throws -> MailImportDelta {
         let searchableText = Self.searchableText(mail)
         let documentHash = SHA256Hasher().hash(
@@ -306,7 +316,21 @@ public actor MailImportService {
         let result = try await database.importMail(
             mail,
             sourceID: sourceID,
-            sourceEntryKey: mail.stableIdentity,
+            sourceEntryKey: SHA256Hasher().hash(
+                data: Data(
+                    "\(mail.stableIdentity)\u{0}\(sourceFile.standardizedFileURL.path)"
+                        .utf8
+                )
+            ),
+            sourceFilePath: sourceFile.path,
+            sourceFileSize: sourceIsIndividual
+                ? (try? sourceFile.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+                    .map(Int64.init)
+                : nil,
+            sourceFileHash: sourceIsIndividual
+                ? try? SHA256Hasher().hash(fileAt: sourceFile)
+                : nil,
+            sourceIsIndividual: sourceIsIndividual,
             chunks: chunks,
             embeddings: embeddings,
             indexedAttachments: indexedAttachments,

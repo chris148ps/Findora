@@ -22,7 +22,11 @@ Diese Datei gilt für alle Arbeiten im Repository.
   Auswahl oder einem echten Fallback-Bedarf auflösen.
 - Produktive App-Daten unter `~/Library/Application Support/Findora` und
   `~/Library/Logs/Findora` nicht für Tests verwenden, migrieren oder löschen.
-- Keine Telemetrie, Cloud-KI oder automatische externe Übertragung ergänzen.
+- Keine allgemeine Telemetrie, Cloud-KI oder automatische externe Übertragung
+  ergänzen. Einzige ausdrücklich freigegebene Ausnahme sind vom Nutzer in den
+  Einstellungen aktivierte, lokal bereinigte Crashberichte über Apple Mail;
+  sie dürfen keine Dokumentinhalte, Suchanfragen oder vollständigen privaten
+  Pfade enthalten.
 - Die Modulgrenzen aus `ARCHITECTURE.md`, die Schutzregeln aus `SECURITY.md`
   und die Datenschutzregeln aus `PRIVACY.md` einhalten.
 

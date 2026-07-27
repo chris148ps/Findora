@@ -16,17 +16,13 @@ public struct AppPaths: Sendable {
         createModelDirectory: Bool = true,
         fileManager: FileManager = .default
     ) throws {
-        let supportRoot = applicationSupport ?? fileManager.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!.appending(path: "Findora", directoryHint: .isDirectory)
+        let supportRoot = applicationSupport
+            ?? FindoraRuntimeEnvironment.applicationSupportRoot(
+                fileManager: fileManager
+            )
 
-        let logRoot = logs ?? fileManager.urls(
-            for: .libraryDirectory,
-            in: .userDomainMask
-        ).first!
-            .appending(path: "Logs", directoryHint: .isDirectory)
-            .appending(path: "Findora", directoryHint: .isDirectory)
+        let logRoot = logs
+            ?? FindoraRuntimeEnvironment.logRoot(fileManager: fileManager)
 
         self.applicationSupport = supportRoot
         self.models = modelStorage
