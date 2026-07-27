@@ -624,7 +624,13 @@ public actor SQLiteDatabase {
             """
             UPDATE page_content_analysis
             SET user_decision = ?, decision_at = ?,
-                decision_source = ?, updated_at = ?
+                decision_source = ?,
+                status = CASE ?
+                    WHEN 'confirmedEmpty' THEN 'manuallyConfirmedEmpty'
+                    WHEN 'notEmpty' THEN 'manuallyConfirmedNotEmpty'
+                    ELSE status
+                END,
+                updated_at = ?
             WHERE absolute_path = ? AND page_number = ?
             """,
             bindings: [
@@ -633,6 +639,7 @@ public actor SQLiteDatabase {
                 decision == .undecided
                     ? .null
                     : .text("manuelle Prüfung"),
+                .text(decision.rawValue),
                 .real(Date().timeIntervalSince1970),
                 .text(path),
                 .integer(Int64(pageNumber))
@@ -646,7 +653,15 @@ public actor SQLiteDatabase {
             """
             UPDATE page_content_analysis
             SET user_decision = 'undecided', decision_at = NULL,
-                decision_source = NULL, updated_at = ?
+                decision_source = NULL,
+                status = CASE
+                    WHEN status IN (
+                        'manuallyConfirmedEmpty',
+                        'manuallyConfirmedNotEmpty'
+                    ) THEN 'unreviewed'
+                    ELSE status
+                END,
+                updated_at = ?
             WHERE absolute_path = ? AND page_number = ?
             """,
             bindings: [
@@ -666,7 +681,10 @@ public actor SQLiteDatabase {
             JOIN processing_jobs j ON j.job_key = a.absolute_path
             WHERE j.state NOT IN ('retired', 'unavailable')
               AND j.content_hash = a.original_hash
-              AND a.status IN ('unreviewed', 'safelyEmpty', 'probablyEmpty')
+              AND a.status IN (
+                  'unreviewed', 'safelyEmpty', 'probablyEmpty',
+                  'manuallyConfirmedEmpty'
+              )
               AND a.user_decision NOT IN ('notEmpty', 'excluded')
             ORDER BY j.file_name, a.page_number
             """
@@ -682,7 +700,10 @@ public actor SQLiteDatabase {
                    MAX(j.discovered_size) AS file_size,
                    MIN(a.confidence) AS confidence,
                    COUNT(*) AS analyzed_pages,
-                   SUM(CASE WHEN a.status IN ('safelyEmpty', 'probablyEmpty')
+                   SUM(CASE WHEN a.status IN (
+                                     'safelyEmpty', 'probablyEmpty',
+                                     'manuallyConfirmedEmpty'
+                                 )
                                  AND a.user_decision = 'confirmedEmpty'
                             THEN 1 ELSE 0 END) AS empty_pages
             FROM page_content_analysis a

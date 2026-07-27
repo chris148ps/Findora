@@ -8,7 +8,7 @@ public struct OCRRetryPolicy: Equatable, Sendable {
     public init(
         maximumAttempts: Int = 8,
         maximumDuration: Duration = .seconds(120),
-        automaticAcceptanceScore: Double = 0.68
+        automaticAcceptanceScore: Double = 0.50
     ) {
         self.maximumAttempts = min(8, max(1, maximumAttempts))
         self.maximumDuration = maximumDuration

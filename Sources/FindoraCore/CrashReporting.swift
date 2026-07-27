@@ -188,7 +188,7 @@ public enum CrashReportCoordinator {
         let data = try? Data(contentsOf: diagnostic),
         let text = String(data: data.prefix(200_000), encoding: .utf8) {
             sections.append("\n--- macOS-Diagnoseauszug ---\n")
-            sections.append(sanitize(text))
+            sections.append(sanitizedDiagnosticText(text))
         } else {
             sections.append(
                 "\nKein passender macOS-Diagnosebericht gefunden; "
@@ -202,7 +202,7 @@ public enum CrashReportCoordinator {
                 .suffix(200)
                 .joined(separator: "\n")
             sections.append("\n--- Bereinigtes Findora-Protokoll ---\n")
-            sections.append(sanitize(tail))
+            sections.append(sanitizedDiagnosticText(tail))
         }
         sections.append(
             "\nDokumentinhalte, Suchanfragen und vollständige private Pfade "
@@ -243,7 +243,7 @@ public enum CrashReportCoordinator {
         .0
     }
 
-    private static func sanitize(_ input: String) -> String {
+    public static func sanitizedDiagnosticText(_ input: String) -> String {
         var value = input
             .replacingOccurrences(of: NSHomeDirectory(), with: "~")
         let replacements: [(String, String)] = [
@@ -254,7 +254,7 @@ public enum CrashReportCoordinator {
                 "<redacted-email>"
             ),
             (
-                #"(?:/Users|/Volumes|/private|/tmp)/[^\s\"",}]+"#,
+                #"(?:/Users|/Volumes|/private|/tmp|/var/folders)/[^\s\"",}]+"#,
                 "<redacted-path>"
             )
         ]

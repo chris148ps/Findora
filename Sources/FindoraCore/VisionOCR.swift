@@ -56,6 +56,7 @@ public actor VisionOCRProvider: OCRProvider {
 
         var pages: [ExtractedPage] = []
         var confidences: [Int: Double] = [:]
+        var messages: [String] = []
         pages.reserveCapacity(document.numberOfPages)
         let existingPages = try extractor.extractPages(from: file.url)
 
@@ -66,49 +67,51 @@ public actor VisionOCRProvider: OCRProvider {
                 pages.append(existing)
                 continue
             }
-            guard let page = document.page(at: pageNumber) else {
-                throw FindoraError.invalidPDF(
-                    "Apple Vision konnte Seite \(pageNumber) nicht laden."
+            do {
+                guard let page = document.page(at: pageNumber) else {
+                    throw FindoraError.invalidPDF(
+                        "Apple Vision konnte Seite \(pageNumber) nicht laden."
+                    )
+                }
+                let image = try render(page, configuration: configuration)
+                let rotations = configuration.manualRotationDegrees == 0
+                    && configuration.rotatePages
+                    ? [0, 90, 180, 270]
+                    : [configuration.manualRotationDegrees]
+                let recognized = try rotations.map {
+                    try recognize(
+                        image,
+                        configuredLanguages: configuration.languages,
+                        rotationDegrees: $0
+                    )
+                }.max { lhs, rhs in
+                    let left = Double(lhs.text.count) + (lhs.meanConfidence ?? 0)
+                    let right = Double(rhs.text.count) + (rhs.meanConfidence ?? 0)
+                    return left < right
+                } ?? (text: "", meanConfidence: nil)
+                pages.append(
+                    ExtractedPage(
+                        pageNumber: pageNumber,
+                        text: recognized.text
+                    )
                 )
-            }
-            let image = try render(page, configuration: configuration)
-            let rotations = configuration.manualRotationDegrees == 0
-                && configuration.rotatePages
-                ? [0, 90, 180, 270]
-                : [configuration.manualRotationDegrees]
-            let recognized = try rotations.map {
-                try recognize(
-                    image,
-                    configuredLanguages: configuration.languages,
-                    rotationDegrees: $0
+                if let confidence = recognized.meanConfidence {
+                    confidences[pageNumber] = confidence
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                pages.append(ExtractedPage(pageNumber: pageNumber, text: ""))
+                messages.append(
+                    "Seite \(pageNumber) konnte nicht per OCR verarbeitet werden: "
+                        + error.localizedDescription
                 )
-            }.max { lhs, rhs in
-                let left = Double(lhs.text.count) + (lhs.meanConfidence ?? 0)
-                let right = Double(rhs.text.count) + (rhs.meanConfidence ?? 0)
-                return left < right
-            } ?? (text: "", meanConfidence: nil)
-            pages.append(
-                ExtractedPage(
-                    pageNumber: pageNumber,
-                    text: recognized.text
-                )
-            )
-            if let confidence = recognized.meanConfidence {
-                confidences[pageNumber] = confidence
             }
         }
 
         guard try hasher.hash(fileAt: file.url) == inputHash else {
             throw FindoraError.unstableFile(file.url.path)
         }
-        guard pages.contains(where: {
-            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }) else {
-            throw FindoraError.invalidPDF(
-                "Apple Vision hat keinen verwertbaren Text erkannt."
-            )
-        }
-
         return OCRResult(
             inputHash: inputHash,
             outputHash: inputHash,
@@ -122,6 +125,7 @@ public actor VisionOCRProvider: OCRProvider {
             ),
             engine: engine,
             duration: started.duration(to: .now),
+            messages: messages,
             completedAt: .now
         )
     }
@@ -387,7 +391,20 @@ public actor OCRProviderRouter: OCRProcessing {
             if let visionProvider {
                 do {
                     await onEngineChange(.appleVision)
-                    return try await visionProvider.process(file, configuration: configuration)
+                    let result = try await visionProvider.process(
+                        file,
+                        configuration: configuration
+                    )
+                    if result.pages.contains(where: {
+                        !$0.text.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty
+                    }) {
+                        return result
+                    }
+                    throw FindoraError.processFailed(
+                        "Apple Vision hat auf keiner Seite verwertbaren Text erkannt."
+                    )
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {

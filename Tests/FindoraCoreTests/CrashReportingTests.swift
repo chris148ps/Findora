@@ -194,6 +194,52 @@ func failedCrashReportDeliveryKeepsPendingReport() async throws {
     #expect(CrashReportCoordinator.hasPendingReport(session: session))
 }
 
+@Test
+func diagnosticsSanitizerRemovesPrivatePathsAndEmailAddresses() {
+    let source = """
+    path=/Users/private/Documents/secret.pdf
+    Kontakt: secret@example.com
+    Datei: /Volumes/Archive/private.pdf
+    Test: /var/folders/ab/private/Findora-Test/Documents/file.pdf
+    """
+    let sanitized = CrashReportCoordinator.sanitizedDiagnosticText(source)
+    #expect(!sanitized.contains("/Users/private"))
+    #expect(!sanitized.contains("/Volumes/Archive"))
+    #expect(!sanitized.contains("/var/folders/ab"))
+    #expect(!sanitized.contains("secret@example.com"))
+    #expect(sanitized.contains("<redacted-email>"))
+}
+
+@Test
+func mailParserErrorsRemainUnderstandableForTheUser() {
+    let error = MailParsingError.malformedMailbox(
+        "synthetischer Testdatensatz"
+    )
+    let classification = AppErrorClassifier.classify(error)
+    #expect(classification.category == .requiresAttention)
+    #expect(
+        classification.userMessage?
+            .contains("MBOX-Archiv ist beschädigt") == true
+    )
+}
+
+@Test
+func mailImportSummaryReportsProcessedDuplicatesAndFailureCategory() {
+    var progress = MailImportProgress()
+    progress.processed = 4
+    progress.imported = 1
+    progress.updated = 1
+    progress.skipped = 1
+    progress.duplicates = 1
+    progress.failed = 1
+    progress.lastFailureCategory = "Parserfehler"
+    let summary = MailImportSummary(progress: progress)
+    #expect(summary.processed == 4)
+    #expect(summary.duplicates == 1)
+    #expect(summary.failed == 1)
+    #expect(summary.lastFailureCategory == "Parserfehler")
+}
+
 private actor CrashReportTestSender: CrashReportSending {
     private let shouldFail: Bool
     private(set) var recipients: [String] = []

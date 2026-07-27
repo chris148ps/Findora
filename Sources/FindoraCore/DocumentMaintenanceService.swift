@@ -467,12 +467,58 @@ public actor DocumentMaintenanceService {
                 "Alle ausgewählten Seiten müssen zuvor ausdrücklich als leer bestätigt werden."
             )
         }
+        try await removePagesVerified(
+            absolutePath: candidate.absolutePath,
+            originalHash: candidate.originalHash,
+            pageCount: candidate.pageCount,
+            pageNumbers: pageNumbers
+        )
+    }
 
-        let originalURL = URL(filePath: candidate.absolutePath)
-        try verifyHash(of: originalURL, expected: candidate.originalHash)
+    public func removeOCRReviewPage(
+        _ candidate: OCRReviewCandidate
+    ) async throws {
+        guard candidate.pageCount > 1 else {
+            throw FindoraError.processFailed(
+                "Die einzige Seite einer PDF kann nicht einzeln entfernt werden."
+            )
+        }
+        let currentCandidates = try await database.ocrReviewCandidates()
+        guard currentCandidates.contains(where: {
+            $0.id == candidate.id
+                && $0.originalHash == candidate.originalHash
+                && $0.pageCount == candidate.pageCount
+        }) else {
+            throw FindoraError.processFailed(
+                "Die Seite ist nicht mehr im aktuellen OCR-Prüfstand."
+            )
+        }
+        try await removePagesVerified(
+            absolutePath: candidate.absolutePath,
+            originalHash: candidate.originalHash,
+            pageCount: candidate.pageCount,
+            pageNumbers: [candidate.pageNumber]
+        )
+    }
+
+    private func removePagesVerified(
+        absolutePath: String,
+        originalHash: String,
+        pageCount: Int,
+        pageNumbers: Set<Int>
+    ) async throws {
+        guard !pageNumbers.isEmpty,
+              pageNumbers.allSatisfy({ (1...pageCount).contains($0) }),
+              pageNumbers.count < pageCount else {
+            throw FindoraError.processFailed(
+                "Einzelne Seiten dürfen nur entfernt werden, wenn mindestens eine Seite erhalten bleibt."
+            )
+        }
+        let originalURL = URL(filePath: absolutePath)
+        try verifyHash(of: originalURL, expected: originalHash)
         guard let source = PDFDocument(url: originalURL),
               !source.isLocked,
-              source.pageCount == candidate.pageCount else {
+              source.pageCount == pageCount else {
             throw FindoraError.invalidPDF(
                 "Die Ausgangs-PDF ist nicht mehr in dem geprüften Zustand."
             )
@@ -522,7 +568,7 @@ public actor DocumentMaintenanceService {
                 "Reihenfolge oder Darstellung der zu erhaltenden Seiten stimmt nicht überein."
             )
         }
-        try verifyHash(of: originalURL, expected: candidate.originalHash)
+        try verifyHash(of: originalURL, expected: originalHash)
 
         try Self.atomicSwap(originalURL, temporaryURL)
         let trashedOriginal: URL

@@ -627,6 +627,100 @@ func ocrReviewMaintenanceSeparatesListIndexAndOriginalActions() async throws {
 }
 
 @Test
+func directOCRReviewPageRemovalNeedsNoBulkSelectionAndKeepsOnePage() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let pdf = root.appending(path: "Einzelseite entfernen.pdf")
+    try createMaintenancePDF(
+        at: pdf,
+        pages: [.blank, .text("DIESE SEITE BLEIBT ERHALTEN")]
+    )
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(
+        files: try await scanner.scan(root: root),
+        root: root
+    )
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    try await database.setPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 1,
+        decision: .notEmpty
+    )
+    let candidate = try #require(
+        try await database.ocrReviewCandidates().first {
+            $0.absolutePath == pdf.path && $0.pageNumber == 1
+        }
+    )
+    let trash = TestTrashManager(
+        directory: root.appending(path: "Trash", directoryHint: .isDirectory)
+    )
+
+    try await DocumentMaintenanceService(
+        database: database,
+        trashManager: trash
+    ).removeOCRReviewPage(candidate)
+
+    let remaining = try #require(PDFDocument(url: pdf))
+    #expect(remaining.pageCount == 1)
+    #expect(
+        remaining.page(at: 0)?.string?
+            .contains("DIESE SEITE BLEIBT ERHALTEN") == true
+    )
+    #expect(trash.trashedItemCount == 1)
+}
+
+@Test
+func manualEmptyDecisionUpdatesStatusAndResetRestoresAutomaticReviewState() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let pdf = root.appending(path: "Bewertung.pdf")
+    try createMaintenancePDF(at: pdf, pages: [.blank])
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(
+        files: try await scanner.scan(root: root),
+        root: root
+    )
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+
+    try await database.setPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 1,
+        decision: .confirmedEmpty
+    )
+    let confirmed = try #require(
+        try await database.emptyPageCandidates().first
+    )
+    #expect(confirmed.status == .manuallyConfirmedEmpty)
+    #expect(confirmed.decision == .confirmedEmpty)
+
+    try await database.resetPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 1
+    )
+    let reset = try #require(
+        try await database.emptyPageCandidates().first
+    )
+    #expect(reset.status == .unreviewed)
+    #expect(reset.decision == .undecided)
+}
+
+@Test
 func duplicatesRequireIdenticalSHA256AcrossDifferentLocations() async throws {
     let root = maintenanceTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

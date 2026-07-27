@@ -31,9 +31,10 @@ private actor MailImportProgressAccumulator {
         return progress
     }
 
-    func recordFailure() -> MailImportProgress {
+    func recordFailure(category: String) -> MailImportProgress {
         progress.failed += 1
         progress.processed += 1
+        progress.lastFailureCategory = category
         return progress
     }
 
@@ -184,11 +185,14 @@ public actor MailImportService {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    let category = Self.safeErrorCategory(error)
                     try? await database.recordMailImportError(
                         sourceID: sourceID,
-                        category: Self.safeErrorCategory(error)
+                        category: category
                     )
-                    await onProgress(await accumulator.recordFailure())
+                    await onProgress(
+                        await accumulator.recordFailure(category: category)
+                    )
                 }
             }
             try await database.finishMailSourceSynchronization(sourceID: sourceID)
@@ -276,11 +280,14 @@ public actor MailImportService {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                let category = Self.safeErrorCategory(error)
                 try? await database.recordMailImportError(
                     sourceID: sourceID,
-                    category: Self.safeErrorCategory(error)
+                    category: category
                 )
-                await onProgress(await accumulator.recordFailure())
+                await onProgress(
+                    await accumulator.recordFailure(category: category)
+                )
             }
         }
         try await database.finishMailSourceSynchronization(sourceID: sourceID)

@@ -19,11 +19,39 @@ func ocrRetryStrategiesAreBoundedUniqueAndProgressivelyPrepared() {
     #expect(strategies[7].renderDPI == 400)
     #expect(OCRRetryPolicy.default.maximumAttempts == 8)
     #expect(OCRRetryPolicy.default.maximumDuration == .seconds(120))
+    #expect(OCRRetryPolicy.default.automaticAcceptanceScore == 0.50)
     #expect(
         !OCRRetryStrategy.defaults(
             baseLanguages: ["deu"],
             baseEngine: .appleVision
         ).contains { $0.engineSelection == .tesseractOCRmyPDF }
+    )
+}
+
+@Test
+func defaultOCRAcceptanceKeepsShortHighQualityPageTextSearchable() {
+    let text = "Findora RC1 Rechnung 2026 Betrag 42 Euro"
+    let quality = OCRPageQuality(
+        pageNumber: 1,
+        meanConfidence: nil,
+        characterCount: text.count,
+        wordCount: text.split(separator: " ").count,
+        unusualCharacterCount: 0,
+        suspectedBrokenWordCount: 0,
+        recognizedLanguage: "deu",
+        isEmpty: false,
+        imageToTextRatio: 0.9,
+        status: .good
+    )
+    let scorer = OCRQualityScorer()
+    let score = scorer.score(quality, text: text)
+    #expect(
+        scorer.isAutomaticallyAcceptable(
+            quality: quality,
+            text: text,
+            score: score,
+            threshold: OCRRetryPolicy.default.automaticAcceptanceScore
+        )
     )
 }
 

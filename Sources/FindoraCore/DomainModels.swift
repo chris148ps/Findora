@@ -510,6 +510,13 @@ public enum AppErrorClassifier {
                 technicalMessage: error.localizedDescription
             )
         }
+        if let parsingError = error as? MailParsingError {
+            return AppErrorClassification(
+                category: .requiresAttention,
+                userMessage: parsingError.localizedDescription,
+                technicalMessage: parsingError.localizedDescription
+            )
+        }
         if let privateError {
             switch privateError {
             case .database:
@@ -708,7 +715,9 @@ public enum PageContentStatus: String, Codable, CaseIterable, Hashable, Sendable
     }
 
     public var isEmptyCandidate: Bool {
-        self == .safelyEmpty || self == .probablyEmpty
+        self == .safelyEmpty
+            || self == .probablyEmpty
+            || self == .manuallyConfirmedEmpty
     }
 
     public var hasVisibleContent: Bool {

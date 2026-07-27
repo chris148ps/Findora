@@ -299,25 +299,30 @@ public struct MailImportProgress: Equatable, Sendable {
     public var attachments = 0
     public var duplicates = 0
     public var currentSubject: String?
+    public var lastFailureCategory: String?
 
     public init() {}
 }
 
 public struct MailImportSummary: Equatable, Sendable {
+    public let processed: Int
     public let imported: Int
     public let updated: Int
     public let skipped: Int
     public let failed: Int
     public let attachments: Int
     public let duplicates: Int
+    public let lastFailureCategory: String?
 
     public init(progress: MailImportProgress) {
+        self.processed = progress.processed
         self.imported = progress.imported
         self.updated = progress.updated
         self.skipped = progress.skipped
         self.failed = progress.failed
         self.attachments = progress.attachments
         self.duplicates = progress.duplicates
+        self.lastFailureCategory = progress.lastFailureCategory
     }
 }
 
