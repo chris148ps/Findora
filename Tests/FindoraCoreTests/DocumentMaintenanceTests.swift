@@ -460,7 +460,8 @@ func manualNotEmptyDecisionSurvivesReanalysisAndResetsForChangedHash() async thr
     try await database.initialize()
     let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
     try await database.saveScan(files: try await scanner.scan(root: root), root: root)
-    await maintenanceProcessor(database: database).processPending(
+    let processor = maintenanceProcessor(database: database)
+    await processor.processPending(
         ocrConfiguration: OCRConfiguration(isEnabled: false)
     ) { _ in }
     let original = try #require(
@@ -471,6 +472,13 @@ func manualNotEmptyDecisionSurvivesReanalysisAndResetsForChangedHash() async thr
         pageNumber: 1,
         decision: .notEmpty
     )
+    try await processor.updatePageText(
+        path: pdf.path,
+        pageNumber: 1,
+        text: "AUTOMATISCH WIEDERHERGESTELLTER TEXT",
+        kind: .automatic
+    )
+    #expect(try await database.statistics().manuallyNotEmptyPages == 1)
     try await database.replacePageContentAnalyses(
         path: pdf.path,
         originalHash: original.originalHash,
@@ -516,6 +524,11 @@ func manualPageTextUpdatesOnlyPageIndexAndPreservesOriginalOCRText() async throw
         pageNumber: 1,
         text: "URSPRÜNGLICHE SYNTHETISCHE OCR FASSUNG",
         kind: .automatic
+    )
+    #expect(
+        try await database.ocrReviewCandidates().allSatisfy {
+            $0.absolutePath != pdf.path
+        }
     )
     try await processor.updatePageText(
         path: pdf.path,
@@ -675,6 +688,119 @@ func directOCRReviewPageRemovalNeedsNoBulkSelectionAndKeepsOnePage() async throw
             .contains("DIESE SEITE BLEIBT ERHALTEN") == true
     )
     #expect(trash.trashedItemCount == 1)
+}
+
+@Test
+func directOCRReviewRemovalHandlesFirstMiddleAndLastPageSafely() async throws {
+    for pageToRemove in 1...3 {
+        let root = maintenanceTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = try AppPaths(
+            applicationSupport: root.appending(path: "Support"),
+            logs: root.appending(path: "Logs")
+        )
+        let pdf = root.appending(path: "remove-\(pageToRemove).pdf")
+        try createMaintenancePDF(
+            at: pdf,
+            pages: [
+                .text("SEITE EINS BLEIBT NUR WENN NICHT GEWÄHLT"),
+                .text("SEITE ZWEI BLEIBT NUR WENN NICHT GEWÄHLT"),
+                .text("SEITE DREI BLEIBT NUR WENN NICHT GEWÄHLT")
+            ]
+        )
+        let database = SQLiteDatabase(url: paths.database)
+        try await database.initialize()
+        let scanner = RecursivePDFScanner(
+            excludedRoots: [paths.applicationSupport]
+        )
+        try await database.saveScan(
+            files: try await scanner.scan(root: root),
+            root: root
+        )
+        await maintenanceProcessor(database: database).processPending(
+            ocrConfiguration: OCRConfiguration(isEnabled: false)
+        ) { _ in }
+        try await database.setPageReviewDecision(
+            path: pdf.path,
+            pageNumber: pageToRemove,
+            decision: .notEmpty
+        )
+        let candidate = try #require(
+            try await database.ocrReviewCandidates().first {
+                $0.absolutePath == pdf.path
+                    && $0.pageNumber == pageToRemove
+            }
+        )
+        let trash = TestTrashManager(
+            directory: root.appending(
+                path: "Trash",
+                directoryHint: .isDirectory
+            )
+        )
+
+        try await DocumentMaintenanceService(
+            database: database,
+            trashManager: trash
+        ).removeOCRReviewPage(candidate)
+
+        let remaining = try #require(PDFDocument(url: pdf))
+        #expect(remaining.pageCount == 2)
+        let retainedText = (0..<remaining.pageCount).compactMap {
+            remaining.page(at: $0)?.string
+        }.joined(separator: "\n")
+        let removedWord = ["EINS", "ZWEI", "DREI"][pageToRemove - 1]
+        #expect(!retainedText.contains("SEITE \(removedWord) "))
+        #expect(trash.trashedItemCount == 1)
+    }
+}
+
+@Test
+func directOCRReviewRemovalRejectsTheOnlyPageAndLeavesOriginalUnchanged() async throws {
+    let root = maintenanceTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let pdf = root.appending(path: "single.pdf")
+    try createMaintenancePDF(at: pdf, pages: [.blank])
+    let database = SQLiteDatabase(url: paths.database)
+    try await database.initialize()
+    let scanner = RecursivePDFScanner(excludedRoots: [paths.applicationSupport])
+    try await database.saveScan(
+        files: try await scanner.scan(root: root),
+        root: root
+    )
+    await maintenanceProcessor(database: database).processPending(
+        ocrConfiguration: OCRConfiguration(isEnabled: false)
+    ) { _ in }
+    try await database.setPageReviewDecision(
+        path: pdf.path,
+        pageNumber: 1,
+        decision: .notEmpty
+    )
+    let candidate = try #require(
+        try await database.ocrReviewCandidates().first {
+            $0.absolutePath == pdf.path
+        }
+    )
+    let before = try Data(contentsOf: pdf)
+    do {
+        try await DocumentMaintenanceService(
+            database: database,
+            trashManager: TestTrashManager(
+                directory: root.appending(path: "Trash")
+            )
+        ).removeOCRReviewPage(candidate)
+        Issue.record("Die einzige Seite hätte nicht entfernt werden dürfen.")
+    } catch let error as PDFPageEditError {
+        if case .lastPage = error {
+            // Erwarteter sicherer Abbruch.
+        } else {
+            Issue.record("Unerwarteter Seitenfehler: \(error)")
+        }
+    }
+    #expect(try Data(contentsOf: pdf) == before)
 }
 
 @Test

@@ -19,26 +19,26 @@ Findora ist als lokale Einzelbenutzer-Anwendung entworfen.
 
 Es erfolgt keine Übertragung von Dokument-, E-Mail- oder Anhangsinhalten,
 Kommunikationsbeziehungen, Suchanfragen oder Antworten an OpenAI oder andere
-KI-Anbieter. Es gibt
-standardmäßig keine Telemetrie,
-Analyse-, Crash-Upload- oder Tracking-Funktion.
+KI-Anbieter. Es gibt keine allgemeine Telemetrie, Analyse- oder
+Tracking-Funktion. Die einzige Ausnahme ist der nachfolgend beschriebene,
+lokal bereinigte Versand technischer Crashberichte über Apple Mail.
 
 ## Optionale Crashberichte
 
-Automatische Crashberichte sind standardmäßig deaktiviert. Der Nutzer kann
-sie in den Einstellungen ausdrücklich aktivieren und eine Empfängeradresse
-festlegen. Nach einem ungeplanten App-Ende erstellt Findora beim nächsten
-Start lokal einen bereinigten Bericht und übergibt ihn automatisch an die
-bereits konfigurierte Apple-Mail-App.
+Automatische Crashberichte sind standardmäßig aktiviert und können in den
+Einstellungen jederzeit deaktiviert werden. Die feste Zieladresse gehört zum
+Findora-Support und wird nicht als bearbeitbares Feld angezeigt. Nach einem
+ungeplanten App-Ende erstellt Findora beim nächsten Start lokal einen
+bereinigten Bericht und übergibt ihn automatisch an die bereits konfigurierte
+Apple-Mail-App.
 
-Der Bericht enthält App-/Buildversion, Zeitpunkt, einen begrenzten
-macOS-Diagnoseauszug und die letzten bereinigten technischen Logzeilen.
-Dokumentinhalte, Suchanfragen, Antworten und vollständige private Pfade werden
-nicht aufgenommen; E-Mail-Adressen und erkannte absolute Pfade werden
-geschwärzt. Schlägt der Versand fehl oder fehlt die Apple-Mail-Berechtigung,
-bleibt der Bericht lokal mit Dateirechten `0600` für einen späteren Versuch
-liegen. Die Empfängeradresse bleibt ausschließlich in der lokalen
-Findora-Datenbank.
+Der Bericht enthält App-/Buildversion, Zeitpunkt, Laufzeit, macOS-Version,
+Architektur, CPU- und RAM-Angaben, einen begrenzten macOS-Diagnoseauszug und
+die letzten bereinigten technischen Logzeilen. Dokumentinhalte, Suchanfragen,
+Antworten, OCR-Texte, Dateinamen und vollständige private Pfade werden nicht
+aufgenommen; E-Mail-Adressen und erkannte absolute Pfade werden geschwärzt.
+Schlägt der Versand fehl oder fehlt die Apple-Mail-Berechtigung, bleibt der
+Bericht lokal mit Dateirechten `0600` für einen späteren Versuch liegen.
 
 Suchpläne und Folgefragen werden nur im Arbeitsspeicher der laufenden Sitzung
 gehalten. Der Chatverlauf ist auf sechs Schritte begrenzt, wird nicht
@@ -53,7 +53,9 @@ Größe und SHA-256 jeder Datei geprüft.
 
 Der Modellhost kann beim Download technisch übliche Metadaten wie IP-Adresse,
 Zeitpunkt, User-Agent und angeforderte Modellpfade sehen. PDF-Inhalte oder
-Suchanfragen werden dabei nicht übertragen.
+OCR-Texte werden nie an den Modellhost übertragen. Das optionale GLM-OCR-
+Dokumentmodell analysiert gerenderte Seiten nach dem Download ausschließlich
+lokal. Suchanfragen werden dabei nicht übertragen.
 
 ## Lokale Speicherung
 

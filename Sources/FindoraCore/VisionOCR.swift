@@ -2,6 +2,19 @@ import CoreGraphics
 import Foundation
 @preconcurrency import Vision
 
+private struct VisionRecognizedBox: Sendable {
+    let text: String
+    let boundingBox: CGRect
+    let confidence: Double
+}
+
+private struct VisionPageRecognition: Sendable {
+    let text: String
+    let meanConfidence: Double?
+    let boxes: [VisionRecognizedBox]
+    let rotation: Int
+}
+
 public actor VisionOCRProvider: OCRProvider {
     public nonisolated let engine = OCREngine.appleVision
 
@@ -57,14 +70,40 @@ public actor VisionOCRProvider: OCRProvider {
         var pages: [ExtractedPage] = []
         var confidences: [Int: Double] = [:]
         var messages: [String] = []
+        var textBoxes: [OCRTextBox] = []
         pages.reserveCapacity(document.numberOfPages)
-        let existingPages = try extractor.extractPages(from: file.url)
+        let existingPages = try extractor.assessPages(from: file.url)
+        let targets = configuration.targetPageNumbers
 
         for pageNumber in 1...document.numberOfPages {
             try Task.checkCancellation()
-            if let existing = existingPages.first(where: { $0.pageNumber == pageNumber }),
-               existing.text.filter({ !$0.isWhitespace }).count >= 20 {
-                pages.append(existing)
+            if let targets, !targets.contains(pageNumber),
+               let existing = existingPages.first(where: {
+                   $0.pageNumber == pageNumber
+               }) {
+                pages.append(
+                    ExtractedPage(
+                        pageNumber: pageNumber,
+                        text: existing.text,
+                        source: existing.isUsable ? .nativePDF : .none,
+                        qualityScore: existing.qualityScore
+                    )
+                )
+                continue
+            }
+            if targets == nil,
+               let existing = existingPages.first(where: {
+                   $0.pageNumber == pageNumber
+               }),
+               existing.isUsable {
+                pages.append(
+                    ExtractedPage(
+                        pageNumber: pageNumber,
+                        text: existing.text,
+                        source: .nativePDF,
+                        qualityScore: existing.qualityScore
+                    )
+                )
                 continue
             }
             do {
@@ -73,28 +112,58 @@ public actor VisionOCRProvider: OCRProvider {
                         "Apple Vision konnte Seite \(pageNumber) nicht laden."
                     )
                 }
-                let image = try render(page, configuration: configuration)
+                let renderedPage = try render(
+                    page,
+                    configuration: configuration
+                )
                 let rotations = configuration.manualRotationDegrees == 0
                     && configuration.rotatePages
                     ? [0, 90, 180, 270]
                     : [configuration.manualRotationDegrees]
-                let recognized = try rotations.map {
+                let recognized = try rotations.map { rotation in
                     try recognize(
-                        image,
+                        renderedPage.image,
                         configuredLanguages: configuration.languages,
-                        rotationDegrees: $0
+                        rotationDegrees: rotation
                     )
                 }.max { lhs, rhs in
                     let left = Double(lhs.text.count) + (lhs.meanConfidence ?? 0)
                     let right = Double(rhs.text.count) + (rhs.meanConfidence ?? 0)
                     return left < right
-                } ?? (text: "", meanConfidence: nil)
+                } ?? VisionPageRecognition(
+                    text: "",
+                    meanConfidence: nil,
+                    boxes: [],
+                    rotation: 0
+                )
                 pages.append(
                     ExtractedPage(
                         pageNumber: pageNumber,
-                        text: recognized.text
+                        text: recognized.text,
+                        source: configuration.retryStrategyID == nil
+                            ? .visionOCR
+                            : .postprocessedOCR
                     )
                 )
+                textBoxes.append(contentsOf: recognized.boxes.map {
+                    let unrotated = VisionOCRGeometry.unrotated(
+                        $0.boundingBox,
+                        rotationDegrees: recognized.rotation
+                    )
+                    let rect = VisionOCRGeometry.mapToFullPage(
+                        unrotated,
+                        renderedContentRect: renderedPage.contentRect
+                    )
+                    return OCRTextBox(
+                        pageNumber: pageNumber,
+                        text: $0.text,
+                        normalizedX: rect.minX,
+                        normalizedY: rect.minY,
+                        normalizedWidth: rect.width,
+                        normalizedHeight: rect.height,
+                        confidence: $0.confidence
+                    )
+                })
                 if let confidence = recognized.meanConfidence {
                     confidences[pageNumber] = confidence
                 }
@@ -126,6 +195,7 @@ public actor VisionOCRProvider: OCRProvider {
             engine: engine,
             duration: started.duration(to: .now),
             messages: messages,
+            textBoxes: textBoxes,
             completedAt: .now
         )
     }
@@ -133,7 +203,7 @@ public actor VisionOCRProvider: OCRProvider {
     private func render(
         _ page: CGPDFPage,
         configuration: OCRConfiguration
-    ) throws -> CGImage {
+    ) throws -> (image: CGImage, contentRect: CGRect) {
         let bounds = page.getBoxRect(.mediaBox)
         let longestEdge = max(bounds.width, bounds.height)
         let requestedScale = max(rendererScale, CGFloat(configuration.renderDPI) / 72)
@@ -144,6 +214,12 @@ public actor VisionOCRProvider: OCRProvider {
         )
         let width = max(1, Int(ceil(bounds.width * scale)))
         let height = max(1, Int(ceil(bounds.height * scale)))
+        let cropInsetX = configuration.cropBorders
+            ? max(1, width / 100)
+            : 0
+        let cropInsetY = configuration.cropBorders
+            ? max(1, height / 100)
+            : 0
         var pixels = [UInt8](repeating: 255, count: width * height * 4)
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
             throw FindoraError.processFailed(
@@ -162,13 +238,25 @@ public actor VisionOCRProvider: OCRProvider {
             ) else {
                 return nil
             }
-            let target = CGRect(x: 0, y: 0, width: width, height: height)
+            let pixelBounds = CGRect(
+                x: 0,
+                y: 0,
+                width: width,
+                height: height
+            )
+            let pageBounds = CGRect(
+                x: 0,
+                y: 0,
+                width: bounds.width,
+                height: bounds.height
+            )
             context.setFillColor(CGColor(gray: 1, alpha: 1))
-            context.fill(target)
+            context.fill(pixelBounds)
+            context.scaleBy(x: scale, y: scale)
             context.concatenate(
                 page.getDrawingTransform(
                     .mediaBox,
-                    rect: target,
+                    rect: pageBounds,
                     rotate: 0,
                     preserveAspectRatio: true
                 )
@@ -255,14 +343,12 @@ public actor VisionOCRProvider: OCRProvider {
             }
             guard let rendered = context.makeImage() else { return nil }
             if configuration.cropBorders {
-                let insetX = max(1, rendered.width / 100)
-                let insetY = max(1, rendered.height / 100)
                 return rendered.cropping(
                     to: CGRect(
-                        x: insetX,
-                        y: insetY,
-                        width: rendered.width - insetX * 2,
-                        height: rendered.height - insetY * 2
+                        x: cropInsetX,
+                        y: cropInsetY,
+                        width: rendered.width - cropInsetX * 2,
+                        height: rendered.height - cropInsetY * 2
                     )
                 )
             }
@@ -273,14 +359,28 @@ public actor VisionOCRProvider: OCRProvider {
                 "Apple Vision konnte die PDF-Seite nicht rendern."
             )
         }
-        return image
+        if configuration.cropBorders {
+            let contentRect = CGRect(
+                x: CGFloat(cropInsetX) / CGFloat(width),
+                y: CGFloat(cropInsetY) / CGFloat(height),
+                width: CGFloat(width - cropInsetX * 2)
+                    / CGFloat(width),
+                height: CGFloat(height - cropInsetY * 2)
+                    / CGFloat(height)
+            )
+            return (image, contentRect)
+        }
+        return (
+            image,
+            CGRect(x: 0, y: 0, width: 1, height: 1)
+        )
     }
 
     private func recognize(
         _ image: CGImage,
         configuredLanguages: [String],
         rotationDegrees: Int
-    ) throws -> (text: String, meanConfidence: Double?) {
+    ) throws -> VisionPageRecognition {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
@@ -305,14 +405,85 @@ public actor VisionOCRProvider: OCRProvider {
             }
             return $0.boundingBox.minX < $1.boundingBox.minX
         }
-        let candidates = observations.compactMap { $0.topCandidates(1).first }
-        let text = candidates.map(\.string).joined(separator: "\n")
-        let meanConfidence = candidates.isEmpty
+        let recognized = observations.compactMap { observation in
+            observation.topCandidates(1).first.map {
+                (observation: observation, candidate: $0)
+            }
+        }
+        let text = recognized.map(\.candidate.string).joined(separator: "\n")
+        let meanConfidence = recognized.isEmpty
             ? nil
-            : candidates.reduce(0) { $0 + Double($1.confidence) } / Double(candidates.count) * 100
-        return (text, meanConfidence)
+            : recognized.reduce(0) {
+                $0 + Double($1.candidate.confidence)
+            } / Double(recognized.count) * 100
+        let boxes = recognized.map {
+            VisionRecognizedBox(
+                text: $0.candidate.string,
+                boundingBox: $0.observation.boundingBox,
+                confidence: Double($0.candidate.confidence)
+            )
+        }
+        return VisionPageRecognition(
+            text: text,
+            meanConfidence: meanConfidence,
+            boxes: boxes,
+            rotation: rotationDegrees
+        )
     }
 
+}
+
+enum VisionOCRGeometry {
+    nonisolated static func unrotated(
+        _ rect: CGRect,
+        rotationDegrees: Int
+    ) -> CGRect {
+        let transformed: CGRect = switch rotationDegrees {
+        case 90:
+            CGRect(
+                x: 1 - rect.maxY,
+                y: rect.minX,
+                width: rect.height,
+                height: rect.width
+            )
+        case 180:
+            CGRect(
+                x: 1 - rect.maxX,
+                y: 1 - rect.maxY,
+                width: rect.width,
+                height: rect.height
+            )
+        case 270:
+            CGRect(
+                x: rect.minY,
+                y: 1 - rect.maxX,
+                width: rect.height,
+                height: rect.width
+            )
+        default:
+            rect
+        }
+        return transformed.intersection(
+            CGRect(x: 0, y: 0, width: 1, height: 1)
+        )
+    }
+
+    nonisolated static func mapToFullPage(
+        _ rect: CGRect,
+        renderedContentRect: CGRect
+    ) -> CGRect {
+        CGRect(
+            x: renderedContentRect.minX
+                + rect.minX * renderedContentRect.width,
+            y: renderedContentRect.minY
+                + rect.minY * renderedContentRect.height,
+            width: rect.width * renderedContentRect.width,
+            height: rect.height * renderedContentRect.height
+        ).intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+}
+
+extension VisionOCRProvider {
     private nonisolated static func visionLanguage(_ language: String) -> String {
         switch language {
         case "deu": "de-DE"
@@ -433,6 +604,7 @@ public actor OCRProviderRouter: OCRProcessing {
                             messages: fallback.messages + [
                                 "Apple Vision ist fehlgeschlagen; Tesseract wurde automatisch verwendet: \(visionFailure)"
                             ],
+                            textBoxes: fallback.textBoxes,
                             completedAt: fallback.completedAt
                         )
                     } catch {

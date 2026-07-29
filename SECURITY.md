@@ -46,6 +46,10 @@ unverändert.
 - Neue Versionen ersetzen eine funktionierende alte Version erst nach Prüfung.
 - Beliebige Modell-URLs aus Nutzereingaben werden nicht unterstützt.
 - Modelllizenzen werden in der UI angezeigt.
+- Das optische Dokumentmodell wird nur nach ausdrücklichem Download aktiviert,
+  ausschließlich lokal ausgeführt und erhält jeweils nur eine gerenderte
+  Problemseite. Es kann keine Dateioperation auslösen oder manuelle
+  Bewertungen überschreiben.
 
 Swift-Paketversionen sind in `Package.resolved` festgehalten. Vor einer
 externen Distribution sind zusätzlich SBOM, Signierung, Notarisierung und
@@ -65,13 +69,16 @@ gehören nicht in Logs. Zulässig sind Dateiname, Pfad, Status, Dauer und
 technische Fehler. Für weitergegebene Logs sollten sensible Pfadteile
 geschwärzt werden.
 
-Automatische Crashberichte sind eine ausdrückliche Opt-in-Ausnahme von der
-sonst vollständig lokalen Verarbeitung. Vor der Übergabe an Apple Mail werden
-Home-Verzeichnisse, absolute Pfade, E-Mail-Adressen sowie `path=`-Logfelder
-geschwärzt. Der Bericht wird nur an die lokal gespeicherte, syntaktisch
-validierte Empfängeradresse gesendet. Findora prüft oder startet Apple Mail
-nur, wenn ein ausstehender Bericht, die Aktivierung und eine gültige Adresse
-gleichzeitig vorliegen.
+Automatische Crashberichte sind die einzige ausdrücklich freigegebene
+Ausnahme von der sonst vollständig lokalen Verarbeitung. Sie sind
+standardmäßig aktiviert und in den Einstellungen jederzeit abschaltbar. Vor
+der Übergabe an Apple Mail werden Home-Verzeichnisse, absolute Pfade,
+E-Mail-Adressen sowie `path=`-Logfelder geschwärzt; Dokumentinhalte,
+Suchanfragen, OCR-Texte und Dateinamen werden nicht aufgenommen. Der Bericht
+wird ausschließlich an die fest im Build konfigurierte, syntaktisch
+validierte Findora-Supportadresse gesendet. Findora prüft oder startet Apple
+Mail nur, wenn ein ausstehender Bericht, die Aktivierung und eine gültige
+Supportadresse gleichzeitig vorliegen.
 
 ## Bekannte Grenzen
 

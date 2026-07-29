@@ -50,6 +50,19 @@ public protocol OCRProvider: OCRProcessing {
     var engine: OCREngine { get }
 }
 
+public protocol OpticalDocumentAnalyzing: Sendable {
+    var modelID: String { get }
+    var modelVersion: String { get }
+
+    func analyzePage(
+        fileURL: URL,
+        pageNumber: Int,
+        timeout: Duration
+    ) async throws -> OpticalPageAnalysis
+
+    func unload() async
+}
+
 public protocol AnswerGenerating: Sendable {
     func answer(question: String, sources: [SearchSource]) async throws -> String
     func unload() async

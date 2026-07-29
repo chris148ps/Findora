@@ -33,12 +33,39 @@ public protocol CrashReportSending: Sendable {
 }
 
 public enum CrashReportCoordinator {
+    private struct SystemSnapshot: Codable {
+        let operatingSystem: String
+        let architecture: String
+        let activeProcessorCount: Int
+        let physicalMemoryBytes: UInt64
+
+        static var current: SystemSnapshot {
+            SystemSnapshot(
+                operatingSystem:
+                    ProcessInfo.processInfo.operatingSystemVersionString,
+                architecture: {
+#if arch(arm64)
+                    "arm64"
+#elseif arch(x86_64)
+                    "x86_64"
+#else
+                    "unbekannt"
+#endif
+                }(),
+                activeProcessorCount:
+                    ProcessInfo.processInfo.activeProcessorCount,
+                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory
+            )
+        }
+    }
+
     private struct RunMarker: Codable {
         let sessionID: UUID
         let startedAt: Date
         let appVersion: String
         let buildVersion: String
         let processID: Int32
+        let system: SystemSnapshot?
     }
 
     public static func defaultDirectory(
@@ -93,7 +120,8 @@ public enum CrashReportCoordinator {
             startedAt: now,
             appVersion: appVersion,
             buildVersion: buildVersion,
-            processID: processID
+            processID: processID,
+            system: .current
         )
         let data = try JSONEncoder().encode(current)
         try data.write(to: markerURL, options: .atomic)
@@ -177,7 +205,12 @@ public enum CrashReportCoordinator {
             "Start: \(previous?.startedAt.ISO8601Format() ?? "unbekannt")",
             "App-Version: \(previous?.appVersion ?? "unbekannt")",
             "Build: \(previous?.buildVersion ?? "unbekannt")",
-            "Prozess-ID: \(previous.map { String($0.processID) } ?? "unbekannt")"
+            "Prozess-ID: \(previous.map { String($0.processID) } ?? "unbekannt")",
+            "Laufzeit bis zum ungeplanten Ende: \(previous.map { generatedAt.timeIntervalSince($0.startedAt).formatted(.number.precision(.fractionLength(1))) + " s" } ?? "unbekannt")",
+            "macOS: \(previous?.system?.operatingSystem ?? "unbekannt")",
+            "Architektur: \(previous?.system?.architecture ?? "unbekannt")",
+            "Aktive CPU-Kerne: \(previous?.system.map { String($0.activeProcessorCount) } ?? "unbekannt")",
+            "Arbeitsspeicher: \(previous?.system.map { ByteCountFormatter.string(fromByteCount: Int64(clamping: $0.physicalMemoryBytes), countStyle: .memory) } ?? "unbekannt")"
         ]
 
         if let diagnostic = newestDiagnosticReport(
@@ -205,8 +238,8 @@ public enum CrashReportCoordinator {
             sections.append(sanitizedDiagnosticText(tail))
         }
         sections.append(
-            "\nDokumentinhalte, Suchanfragen und vollständige private Pfade "
-            + "werden nicht in diesen Bericht aufgenommen."
+            "\nDokumentinhalte, Suchanfragen, OCR-Texte, Dateinamen und "
+            + "vollständige private Pfade werden nicht in diesen Bericht aufgenommen."
         )
         return sections.joined(separator: "\n")
     }
@@ -248,6 +281,10 @@ public enum CrashReportCoordinator {
             .replacingOccurrences(of: NSHomeDirectory(), with: "~")
         let replacements: [(String, String)] = [
             (#"(?im)\bpath=[^\r\n]*"#, "path=<redacted>"),
+            (
+                #"(?im)\b(?:file|filename|datei|document|dokument)=[^\r\n]*"#,
+                "file=<redacted>"
+            ),
             (#"~/[^\s\"",}]+"#, "<redacted-path>"),
             (
                 #"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,63}\b"#,
@@ -256,6 +293,10 @@ public enum CrashReportCoordinator {
             (
                 #"(?:/Users|/Volumes|/private|/tmp|/var/folders)/[^\s\"",}]+"#,
                 "<redacted-path>"
+            ),
+            (
+                #"(?i)\b[^\s/\\:\"']+\.(?:pdf|eml|msg|mbox)\b"#,
+                "<redacted-file>"
             )
         ]
         for (pattern, replacement) in replacements {

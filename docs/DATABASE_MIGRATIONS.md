@@ -2,7 +2,7 @@
 
 ## Schema-Version
 
-Findora erwartet Schema-Version 13. Beim Start werden aktuelle und erwartete
+Findora erwartet Schema-Version 14. Beim Start werden aktuelle und erwartete
 Version verglichen und ausschließlich fehlende Migrationen in aufsteigender
 Reihenfolge ausgeführt. Jede Migration läuft in einer SQLite-Transaktion und
 wird erst danach in `schema_migrations` dokumentiert.
@@ -39,7 +39,7 @@ ausdrücklich zu startende Wartungsaktionen.
 
 ## Kompatibilitätsgarantie
 
-Migrationen 11 bis 13 ergänzen Tabellen, Indizes, Beziehungen und Metadaten.
+Migrationen 11 bis 14 ergänzen Tabellen, Indizes, Beziehungen und Metadaten.
 Sie löschen oder ersetzen keine vorhandenen Dokumente, OCR-Texte, Maildaten,
 Chunks oder Embeddings. Eine vollständige Neuindexierung bleibt eine
 bestätigte Nutzeraktion.
@@ -48,6 +48,14 @@ Migration 13 ergänzt nur Quelldatei-Metadaten und persistente Unterdrückungen
 für einzeln entfernte Mail-Dubletten. Die Spaltenerweiterung ist
 wiederaufnahmesicher, falls eine Test- oder Reparatursituation die
 Migrationsmarke zurücksetzt.
+
+Migration 14 ergänzt pro Seite die ausgewählte Textquelle, getrennte native,
+OCR- und optische Textvorschläge, Qualitäts-/Engine-/Analysemetadaten,
+Apple-Vision-Bounding-Boxes und lokale optische Analyseergebnisse. Außerdem
+werden Reparaturstatus und konkrete Dateibearbeitungsfehler gespeichert. Alle
+Spalten und Tabellen werden vor dem Anlegen geprüft, sodass die Migration
+wiederholbar bleibt. Bestehende manuelle Texte werden als `manual` erhalten;
+es gibt keinen Datenbankreset.
 
 Migrationstests decken direkte Upgrades von Schema 10 und 11, Rollback und
 Fortsetzung nach einem künstlichen Abbruch, Daten- und Embedding-Erhalt sowie

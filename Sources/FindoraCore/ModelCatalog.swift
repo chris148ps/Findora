@@ -3,6 +3,7 @@ import Foundation
 public enum ModelKind: String, Codable, Sendable {
     case embedding
     case answer
+    case documentVision
 }
 
 public enum ModelCompatibility: String, Codable, Comparable, Sendable {
@@ -125,7 +126,7 @@ public struct ModelCatalog: Codable, Sendable {
                 .map { "\($0.relativePath):\($0.checksumSHA256.lowercased())\n" }
                 .joined()
             let manifestHash = SHA256Hasher().hash(data: Data(manifest.utf8))
-            guard model.backend == "mlx",
+            guard ["mlx", "mlx-vlm"].contains(model.backend),
                   !model.files.isEmpty,
                   model.downloadURL.scheme == "https",
                   model.checksumSHA256.lowercased() == manifestHash,
@@ -231,6 +232,7 @@ public struct InstalledModel: Identifiable, Equatable, Sendable {
     public let compatibility: ModelCompatibility
     public let installedVersion: String?
     public let updateAvailable: Bool
+    public let integrityFailed: Bool
 
     public init(
         descriptor: LocalModelDescriptor,
@@ -239,7 +241,8 @@ public struct InstalledModel: Identifiable, Equatable, Sendable {
         isActive: Bool,
         compatibility: ModelCompatibility,
         installedVersion: String? = nil,
-        updateAvailable: Bool = false
+        updateAvailable: Bool = false,
+        integrityFailed: Bool = false
     ) {
         self.id = descriptor.id
         self.descriptor = descriptor
@@ -249,5 +252,6 @@ public struct InstalledModel: Identifiable, Equatable, Sendable {
         self.compatibility = compatibility
         self.installedVersion = installedVersion
         self.updateAvailable = updateAvailable
+        self.integrityFailed = integrityFailed
     }
 }

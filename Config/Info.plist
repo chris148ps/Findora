@@ -10,6 +10,8 @@
     <string>Findora</string>
     <key>CFBundleIdentifier</key>
     <string>de.findora.app</string>
+    <key>FindoraCrashReportRecipient</key>
+    <string>support.findora@icloud.com</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -29,7 +31,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Findora verwendet Apple Mail ausschließlich zum Versand ausdrücklich aktivierter, bereinigter Crashberichte.</string>
+    <string>Findora verwendet Apple Mail ausschließlich zum Versand lokal bereinigter, in den Einstellungen abschaltbarer Crashberichte an den Findora-Support.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Findora contributors</string>
 </dict>

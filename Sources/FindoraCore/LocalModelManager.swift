@@ -56,7 +56,14 @@ public actor LocalModelManager {
     public func models(profile: HardwareProfile) -> [InstalledModel] {
         catalog.models.map { descriptor in
             let directory = installedDirectory(for: descriptor)
-            let currentInstalled = validateInstalledFiles(descriptor, directory: directory)
+            let directoryExists = fileManager.fileExists(
+                atPath: directory.path
+            )
+            let currentInstalled = validateInstalledFiles(
+                descriptor,
+                directory: directory,
+                checkHashes: true
+            )
             let installedVersion = currentInstalled
                 ? descriptor.modelVersion
                 : olderInstalledVersion(for: descriptor)
@@ -67,7 +74,8 @@ public actor LocalModelManager {
                 isActive: activeModelIDs[descriptor.kind] == descriptor.id,
                 compatibility: profile.compatibility(for: descriptor),
                 installedVersion: installedVersion,
-                updateAvailable: installedVersion != nil && !currentInstalled
+                updateAvailable: installedVersion != nil && !currentInstalled,
+                integrityFailed: directoryExists && !currentInstalled
             )
         }
     }
@@ -227,6 +235,7 @@ public actor LocalModelManager {
             } else {
                 try fileManager.moveItem(at: staging, to: destination)
             }
+            removeEmptyDownloadAncestors(startingAt: staging)
             await progress(
                 ModelDownloadProgress(
                     modelID: descriptor.id,
@@ -242,6 +251,7 @@ public actor LocalModelManager {
             currentDownload = nil
             pendingDownload = nil
             try? fileManager.removeItem(at: staging)
+            removeEmptyDownloadAncestors(startingAt: staging)
             throw error
         }
     }
@@ -257,6 +267,9 @@ public actor LocalModelManager {
     public func discardPausedDownload() {
         if let pendingDownload {
             try? fileManager.removeItem(at: pendingDownload.staging)
+            removeEmptyDownloadAncestors(
+                startingAt: pendingDownload.staging
+            )
         }
         pendingDownload = nil
     }
@@ -292,6 +305,21 @@ public actor LocalModelManager {
         modelsDirectory
             .appending(path: descriptor.id.replacingOccurrences(of: "/", with: "_"))
             .appending(path: descriptor.modelVersion)
+    }
+
+    private func removeEmptyDownloadAncestors(startingAt staging: URL) {
+        var directory = staging.deletingLastPathComponent()
+        let rootPath = downloadsDirectory.standardizedFileURL.path
+        while directory.standardizedFileURL.path != rootPath,
+              directory.standardizedFileURL.path.hasPrefix(rootPath + "/"),
+              let children = try? fileManager.contentsOfDirectory(
+                  at: directory,
+                  includingPropertiesForKeys: nil
+              ),
+              children.isEmpty {
+            try? fileManager.removeItem(at: directory)
+            directory.deleteLastPathComponent()
+        }
     }
 
     private func olderInstalledVersion(for descriptor: LocalModelDescriptor) -> String? {

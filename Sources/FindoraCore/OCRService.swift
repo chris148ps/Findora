@@ -77,6 +77,7 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
     public var cropBorders: Bool
     public var manualRotationDegrees: Int
     public var retryStrategyID: String?
+    public var targetPageNumbers: Set<Int>?
 
     public init(
         isEnabled: Bool = true,
@@ -100,7 +101,8 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
         sharpen: Bool = false,
         cropBorders: Bool = false,
         manualRotationDegrees: Int = 0,
-        retryStrategyID: String? = nil
+        retryStrategyID: String? = nil,
+        targetPageNumbers: Set<Int>? = nil
     ) {
         self.isEnabled = isEnabled
         self.languages = languages
@@ -126,6 +128,7 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
             ? manualRotationDegrees
             : 0
         self.retryStrategyID = retryStrategyID
+        self.targetPageNumbers = targetPageNumbers
     }
 
     public static let `default` = OCRConfiguration()
@@ -135,7 +138,7 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
         case createPDFA, maximumParallelFiles, cpuMode, persistenceMode, engineSelection
         case renderDPI, enhanceContrast, binarize, adaptiveBinarize
         case backgroundLightening, reduceShadows, denoise, sharpen, cropBorders
-        case manualRotationDegrees, retryStrategyID
+        case manualRotationDegrees, retryStrategyID, targetPageNumbers
     }
 
     public init(from decoder: Decoder) throws {
@@ -165,7 +168,8 @@ public struct OCRConfiguration: Codable, Equatable, Sendable {
             sharpen: try values.decodeIfPresent(Bool.self, forKey: .sharpen) ?? false,
             cropBorders: try values.decodeIfPresent(Bool.self, forKey: .cropBorders) ?? false,
             manualRotationDegrees: try values.decodeIfPresent(Int.self, forKey: .manualRotationDegrees) ?? 0,
-            retryStrategyID: try values.decodeIfPresent(String.self, forKey: .retryStrategyID)
+            retryStrategyID: try values.decodeIfPresent(String.self, forKey: .retryStrategyID),
+            targetPageNumbers: try values.decodeIfPresent(Set<Int>.self, forKey: .targetPageNumbers)
         )
     }
 
@@ -407,7 +411,7 @@ public struct OCRDependencyChecker: Sendable {
         pdfText: URL,
         environmentPATH: String
     ) -> Bool {
-        let directory = FileManager.default.temporaryDirectory.appending(
+        let directory = FindoraRuntimeEnvironment.temporaryRoot().appending(
             path: "Findora-selftest-\(UUID().uuidString)",
             directoryHint: .isDirectory
         )
@@ -484,6 +488,7 @@ public struct OCRResult: Equatable, Sendable {
     public let engine: OCREngine
     public let duration: Duration
     public let messages: [String]
+    public let textBoxes: [OCRTextBox]
     public let completedAt: Date
 
     public init(
@@ -496,6 +501,7 @@ public struct OCRResult: Equatable, Sendable {
         engine: OCREngine = .tesseract,
         duration: Duration = .zero,
         messages: [String] = [],
+        textBoxes: [OCRTextBox] = [],
         completedAt: Date
     ) {
         self.inputHash = inputHash
@@ -507,6 +513,7 @@ public struct OCRResult: Equatable, Sendable {
         self.engine = engine
         self.duration = duration
         self.messages = messages
+        self.textBoxes = textBoxes
         self.completedAt = completedAt
     }
 }
@@ -946,7 +953,9 @@ public actor OCRmyPDFProcessor: OCRProvider {
     ) -> Double? {
         guard let renderer = dependencies.pdfToPPM,
               let tesseract = dependencies.tesseract else { return nil }
-        let directory = fileManager.temporaryDirectory.appending(
+        let directory = FindoraRuntimeEnvironment.temporaryRoot(
+            fileManager: fileManager
+        ).appending(
             path: "Findora-quality-\(UUID().uuidString)",
             directoryHint: .isDirectory
         )

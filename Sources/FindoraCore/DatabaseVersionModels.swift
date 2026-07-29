@@ -73,9 +73,9 @@ public struct DatabaseVersionSnapshot: Equatable, Sendable {
 }
 
 public enum FindoraAnalysisVersions {
-    public static let schema = 13
-    public static let ocr = "ocr-v1"
-    public static let parser = "parser-v1"
+    public static let schema = 14
+    public static let ocr = "ocr-v2-multistage"
+    public static let parser = "pdfkit-hybrid-v2"
     public static let chunks = PageChunker.version
     public static let aiAnalysis = "local-ai-v1"
     public static let peopleAnalysis = "communication-people-v1"

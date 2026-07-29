@@ -479,9 +479,7 @@ public actor DocumentMaintenanceService {
         _ candidate: OCRReviewCandidate
     ) async throws {
         guard candidate.pageCount > 1 else {
-            throw FindoraError.processFailed(
-                "Die einzige Seite einer PDF kann nicht einzeln entfernt werden."
-            )
+            throw PDFPageEditError.lastPage
         }
         let currentCandidates = try await database.ocrReviewCandidates()
         guard currentCandidates.contains(where: {
@@ -489,16 +487,22 @@ public actor DocumentMaintenanceService {
                 && $0.originalHash == candidate.originalHash
                 && $0.pageCount == candidate.pageCount
         }) else {
-            throw FindoraError.processFailed(
-                "Die Seite ist nicht mehr im aktuellen OCR-Prüfstand."
-            )
+            throw PDFPageEditError.invalidPageIndex
         }
-        try await removePagesVerified(
-            absolutePath: candidate.absolutePath,
-            originalHash: candidate.originalHash,
-            pageCount: candidate.pageCount,
-            pageNumbers: [candidate.pageNumber]
-        )
+        do {
+            try await removePagesVerified(
+                absolutePath: candidate.absolutePath,
+                originalHash: candidate.currentFileHash,
+                pageCount: candidate.pageCount,
+                pageNumbers: [candidate.pageNumber]
+            )
+        } catch {
+            try? await database.recordPageEditFailure(
+                path: candidate.absolutePath,
+                error: error
+            )
+            throw error
+        }
     }
 
     private func removePagesVerified(
@@ -510,18 +514,44 @@ public actor DocumentMaintenanceService {
         guard !pageNumbers.isEmpty,
               pageNumbers.allSatisfy({ (1...pageCount).contains($0) }),
               pageNumbers.count < pageCount else {
-            throw FindoraError.processFailed(
-                "Einzelne Seiten dürfen nur entfernt werden, wenn mindestens eine Seite erhalten bleibt."
-            )
+            throw pageNumbers.count >= pageCount
+                ? PDFPageEditError.lastPage
+                : PDFPageEditError.invalidPageIndex
         }
         let originalURL = URL(filePath: absolutePath)
-        try verifyHash(of: originalURL, expected: originalHash)
-        guard let source = PDFDocument(url: originalURL),
-              !source.isLocked,
-              source.pageCount == pageCount else {
-            throw FindoraError.invalidPDF(
-                "Die Ausgangs-PDF ist nicht mehr in dem geprüften Zustand."
-            )
+        guard FileManager.default.fileExists(atPath: originalURL.path) else {
+            throw PDFPageEditError.accessLost
+        }
+        let resourceValues = try? originalURL.resourceValues(forKeys: [
+            .isUbiquitousItemKey,
+            .ubiquitousItemDownloadingStatusKey,
+            .isWritableKey
+        ])
+        if resourceValues?.isUbiquitousItem == true,
+           resourceValues?.ubiquitousItemDownloadingStatus
+                != .current {
+            throw PDFPageEditError.cloudFileUnavailable
+        }
+        guard FileManager.default.isWritableFile(atPath: originalURL.path),
+              resourceValues?.isWritable != false,
+              FileManager.default.isWritableFile(
+                  atPath: originalURL.deletingLastPathComponent().path
+              ) else {
+            throw PDFPageEditError.notWritable
+        }
+        do {
+            try verifyHash(of: originalURL, expected: originalHash)
+        } catch {
+            throw PDFPageEditError.changedExternally
+        }
+        guard let source = PDFDocument(url: originalURL) else {
+            throw PDFPageEditError.damaged
+        }
+        guard !source.isLocked else {
+            throw PDFPageEditError.passwordProtected
+        }
+        guard source.pageCount == pageCount else {
+            throw PDFPageEditError.changedExternally
         }
         let remainingIndexes = (0..<source.pageCount).filter {
             !pageNumbers.contains($0 + 1)
@@ -533,9 +563,7 @@ public actor DocumentMaintenanceService {
         let output = PDFDocument()
         for index in remainingIndexes {
             guard let page = source.page(at: index)?.copy() as? PDFPage else {
-                throw FindoraError.invalidPDF(
-                    "Eine zu erhaltende Seite konnte nicht kopiert werden."
-                )
+                throw PDFPageEditError.damaged
             }
             output.insert(page, at: output.pageCount)
         }
@@ -555,27 +583,27 @@ public actor DocumentMaintenanceService {
               let validation = PDFDocument(url: temporaryURL),
               !validation.isLocked,
               validation.pageCount == remainingIndexes.count else {
-            throw FindoraError.invalidPDF(
-                "Die neu erzeugte PDF hat die Seitenzahl- oder Lesbarkeitsprüfung nicht bestanden."
-            )
+            throw PDFPageEditError.temporaryWriteFailed
         }
         let outputFingerprints = try pageFingerprints(
             document: validation,
             indexes: Array(0..<validation.pageCount)
         )
         guard originalFingerprints == outputFingerprints else {
-            throw FindoraError.invalidPDF(
-                "Reihenfolge oder Darstellung der zu erhaltenden Seiten stimmt nicht überein."
-            )
+            throw PDFPageEditError.validationFailed
         }
-        try verifyHash(of: originalURL, expected: originalHash)
+        do {
+            try verifyHash(of: originalURL, expected: originalHash)
+        } catch {
+            throw PDFPageEditError.changedExternally
+        }
 
-        try Self.atomicSwap(originalURL, temporaryURL)
+        try Self.coordinatedAtomicSwap(originalURL, temporaryURL)
         let trashedOriginal: URL
         do {
             trashedOriginal = try trashManager.trashItem(at: temporaryURL)
         } catch {
-            try? Self.atomicSwap(originalURL, temporaryURL)
+            try? Self.coordinatedAtomicSwap(originalURL, temporaryURL)
             throw error
         }
 
@@ -588,19 +616,27 @@ public actor DocumentMaintenanceService {
                 size: (attributes[.size] as? NSNumber)?.int64Value ?? 0,
                 modifiedAt: attributes[.modificationDate] as? Date ?? .now
             )
+            try? await database.setPageEditRepairStatus(
+                path: originalURL.path,
+                status: nil
+            )
         } catch {
             do {
                 try trashManager.restoreItem(
                     from: trashedOriginal,
                     to: temporaryURL
                 )
-                try Self.atomicSwap(originalURL, temporaryURL)
+                try Self.coordinatedAtomicSwap(originalURL, temporaryURL)
             } catch let rollbackError {
-                throw FindoraError.processFailed(
-                    "Datenbankaktualisierung und Wiederherstellung sind fehlgeschlagen: \(rollbackError.localizedDescription)"
+                try? await database.setPageEditRepairStatus(
+                    path: originalURL.path,
+                    status: "Neuindexierung nach Seitenentfernung erforderlich"
+                )
+                throw PDFPageEditError.reindexFailed(
+                    rollbackError.localizedDescription
                 )
             }
-            throw error
+            throw PDFPageEditError.reindexFailed(error.localizedDescription)
         }
     }
 
@@ -724,8 +760,41 @@ public actor DocumentMaintenanceService {
             }
         }
         guard result == 0 else {
-            throw FindoraError.processFailed(
-                "Der atomare PDF-Austausch ist fehlgeschlagen: \(String(cString: strerror(errno)))"
+            let code = Int(errno)
+            throw PDFPageEditError.replacementFailed(
+                domain: NSPOSIXErrorDomain,
+                code: code,
+                detail: String(cString: strerror(errno))
+            )
+        }
+    }
+
+    private static func coordinatedAtomicSwap(
+        _ first: URL,
+        _ second: URL
+    ) throws {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordinationError: NSError?
+        var operationError: Error?
+        coordinator.coordinate(
+            writingItemAt: first,
+            options: .forReplacing,
+            writingItemAt: second,
+            options: .forReplacing,
+            error: &coordinationError
+        ) { coordinatedFirst, coordinatedSecond in
+            do {
+                try atomicSwap(coordinatedFirst, coordinatedSecond)
+            } catch {
+                operationError = error
+            }
+        }
+        if let operationError { throw operationError }
+        if let coordinationError {
+            throw PDFPageEditError.replacementFailed(
+                domain: coordinationError.domain,
+                code: coordinationError.code,
+                detail: coordinationError.localizedDescription
             )
         }
     }

@@ -65,9 +65,10 @@ Arbeitsdateien werden nicht verfolgt. Der Ordner wird rekursiv durchsucht.
 
 ## OCR
 
-Findora prüft jede PDF seitenweise. Eine bereits brauchbare
-Textschicht bleibt unverändert. Im empfohlenen Automatikmodus verwendet macOS
-zuerst Apple Vision. Scheitert Vision, versucht die App automatisch Tesseract.
+Findora prüft jede PDF mit PDFKit seitenweise. Zeichen-, Wort- und
+Plausibilitätswerte sowie die Verfügbarkeit echter PDFKit-Selektionen
+entscheiden, ob die native Textschicht brauchbar ist. Nur unbrauchbare,
+fehlende oder unvollständige Seiten gehen in die OCR-Pipeline.
 
 Standard ist die nicht-destruktive OCR: Vision liefert den Text ohne
 temporäre OCR-PDF direkt an die gemeinsame Qualitäts- und Indexpipeline.
@@ -81,7 +82,10 @@ Engine-Wechsel verarbeitet bekannte Dokumente nicht automatisch neu.
 Unter **OCR** lassen sich Sprachen und konservative Optionen ändern. OCR und
 Indexierung können pausiert und fehlgeschlagene Jobs erneut eingeplant werden.
 
-Reicht der erste OCR-Lauf nicht aus, probiert die App zentral begrenzt bis zu
+Auch ein formal guter erster OCR-Lauf wird nicht allein wegen Textlänge
+übernommen: Die Automatik führt mindestens drei unterschiedliche Versuche aus
+und vergleicht Wörter, Artefakte, Fragmentierung und Konfidenz. Insgesamt
+probiert die App zentral begrenzt bis zu
 acht unterschiedliche Strategien in höchstens 120 Sekunden: Standard,
 300 dpi, Kontrast-/Hintergrundkorrektur, Binarisierung,
 Begradigung/Randbereinigung, Deutsch + Englisch, eine verfügbare alternative
@@ -90,6 +94,10 @@ verwendet; eine spätere schlechtere Variante ersetzt niemals die bisher beste.
 Unsichere Seiten erscheinen unter **Dokumentenwartung > OCR prüfen**. Dort
 können sie als nicht leer bestätigt, mit manuellen OCR-Einstellungen getestet
 oder textlich korrigiert beziehungsweise vollständig erfasst werden.
+Die Aktion **Diese Seite löschen** arbeitet ohne vorherige Markierung,
+validiert Hash und Seitenzahl, schreibt zunächst eine neue PDF und ersetzt das
+Original erst nach erneuter Prüfung. Die geprüfte Originalfassung landet im
+macOS-Papierkorb.
 
 ## Erstindexierung
 
@@ -102,11 +110,12 @@ Status, Warteschlange und technische Fehler erscheinen unter **Status** und
 Das dauerhaft lesbare technische Protokoll liegt unter
 `~/Library/Logs/Findora/Findora.log`.
 
-Automatische Crashberichte sind standardmäßig deaktiviert. Sie können unter
-**Einstellungen → Crashberichte** ausdrücklich aktiviert und über die lokal
-konfigurierte Apple-Mail-App an eine einstellbare Empfängeradresse gesendet
-werden. Vor dem Versand werden E-Mail-Adressen und private Pfade geschwärzt;
-Dokumentinhalte, Suchanfragen und Antworten werden nicht aufgenommen. Details:
+Automatische Crashberichte sind standardmäßig aktiviert und können unter
+**Einstellungen → Crashberichte** jederzeit deaktiviert werden. Sie werden
+über die lokal konfigurierte Apple-Mail-App an den fest konfigurierten
+Findora-Support gesendet. Vor dem Versand werden E-Mail-Adressen und private
+Pfade geschwärzt; Dokumentinhalte, Suchanfragen, OCR-Texte, Dateinamen und
+Antworten werden nicht aufgenommen. Details:
 [`CRASH_REPORTING.md`](CRASH_REPORTING.md).
 
 Der Dokumentenstatus aktualisiert sich während Scan, OCR, Indexierung,
@@ -154,11 +163,16 @@ Downloadgröße und RAM-Einstufung. Jede Datei wird per SHA-256 validiert.
 - Antworten: Qwen3 1.7B 4 Bit für 8-GB-Macs empfohlen
 - Qwen3 4B 4 Bit bei ausreichendem Speicher
 - Qwen3 8B 4 Bit auf 8-GB-Macs nur experimentell
+- Optische Dokumenteskalation: GLM-OCR 4 Bit, Revision
+  `97f587506984cc92fa69b2694b4128e53db6b081`, MIT, rund 1,25 GB Download
 
 Downloads lassen sich pausieren, fortsetzen und abbrechen. Ein
 Embedding-Modellwechsel erfordert eine Neuindexierung. Das Sprachmodell wird
 erst für eine Antwort geladen und bei Speicherdruck oder nach Inaktivität
 entladen.
+GLM-OCR wird nur nach ausdrücklichem Download und nur für ungelöste Seiten
+verwendet. Unsichere Ergebnisse bleiben in **OCR prüfen**; das Modell darf
+weder PDFs ändern noch Seiten löschen oder manuelle Bewertungen überschreiben.
 
 ## Suche und Quellen
 
@@ -175,6 +189,10 @@ und „Passend“ erscheinen regulär. Unsichere Treffer bleiben getrennt und
 eingeklappt. Trefferkarten zeigen Dateiname, Pfad, Seite, hervorgehobenen
 Auszug, Relevanz, belegte Person und Thema, OCR-Qualität, Suchart und eine
 regelbasierte Begründung.
+PDF-Treffer öffnen direkt auf der gespeicherten Seite. PDFKit markiert
+native Fundstellen über Selektionen; Apple-Vision-Fundstellen verwenden
+temporäre Bounding-Box-Overlays. Fehlen Positionsdaten, bleibt die
+seitenrichtige Anzeige erhalten und wird als solche gekennzeichnet.
 
 Für eine formulierte Antwort werden nur die besten lokalen Fundstellen an das
 lokale Modell übergeben. Quellen-IDs werden von der App erzeugt und nachher

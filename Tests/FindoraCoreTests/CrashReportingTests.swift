@@ -19,6 +19,10 @@ func runtimeTestRootIsTemporaryIsolatedAndStableAcrossRestarts() {
         FindoraRuntimeEnvironment.logRoot(environment: environment).path
             == root.appending(path: "Logs").path
     )
+    #expect(
+        FindoraRuntimeEnvironment.temporaryRoot(environment: environment).path
+            == root.appending(path: "Temporary").path
+    )
 
     let firstDefaults = FindoraRuntimeEnvironment.userDefaults(
         environment: environment
@@ -41,7 +45,7 @@ func runtimeTestRootIsTemporaryIsolatedAndStableAcrossRestarts() {
 }
 
 @Test
-func crashReportIsOptInSanitizedAndRetriedUntilDelivered() async throws {
+func crashReportHonorsEnabledSettingIsSanitizedAndRetriesUntilDelivered() async throws {
     let root = FileManager.default.temporaryDirectory
         .appending(path: "FindoraCrashReportTests-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -57,6 +61,7 @@ func crashReportIsOptInSanitizedAndRetriedUntilDelivered() async throws {
         2026-07-27T10:00:00Z [ERROR] [Test] Kontrollierter Fehler \
         path=\(NSHomeDirectory())/Private/vertrag.pdf
         Kontakt secret@example.com unter /Volumes/Privat/scan.pdf
+        file=Kundenakte-Geheim.pdf
         """.utf8
     ).write(to: log)
 
@@ -100,8 +105,15 @@ func crashReportIsOptInSanitizedAndRetriedUntilDelivered() async throws {
     #expect(!sanitized.contains("secret@example.com"))
     #expect(!sanitized.contains("diagnostic@example.com"))
     #expect(!sanitized.contains("/Volumes/Privat"))
+    #expect(!sanitized.contains("Kundenakte-Geheim.pdf"))
     #expect(sanitized.contains("<redacted-email>"))
     #expect(sanitized.contains("path=<redacted>"))
+    #expect(sanitized.contains("file=<redacted>"))
+    #expect(sanitized.contains("Laufzeit bis zum ungeplanten Ende:"))
+    #expect(sanitized.contains("macOS:"))
+    #expect(sanitized.contains("Architektur:"))
+    #expect(sanitized.contains("Aktive CPU-Kerne:"))
+    #expect(sanitized.contains("Arbeitsspeicher:"))
 
     let sender = CrashReportTestSender()
     #expect(
@@ -201,13 +213,18 @@ func diagnosticsSanitizerRemovesPrivatePathsAndEmailAddresses() {
     Kontakt: secret@example.com
     Datei: /Volumes/Archive/private.pdf
     Test: /var/folders/ab/private/Findora-Test/Documents/file.pdf
+    filename=Kündigung-2026.pdf
+    Anhang: sensible-rechnung.eml
     """
     let sanitized = CrashReportCoordinator.sanitizedDiagnosticText(source)
     #expect(!sanitized.contains("/Users/private"))
     #expect(!sanitized.contains("/Volumes/Archive"))
     #expect(!sanitized.contains("/var/folders/ab"))
     #expect(!sanitized.contains("secret@example.com"))
+    #expect(!sanitized.contains("Kündigung-2026.pdf"))
+    #expect(!sanitized.contains("sensible-rechnung.eml"))
     #expect(sanitized.contains("<redacted-email>"))
+    #expect(sanitized.contains("<redacted-file>"))
 }
 
 @Test

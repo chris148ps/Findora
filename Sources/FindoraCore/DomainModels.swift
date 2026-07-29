@@ -95,13 +95,143 @@ public struct DiscoveredPDF: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum PDFPageTextSource: String, Codable, CaseIterable, Hashable, Sendable {
+    case none
+    case nativePDF
+    case manual
+    case verifiedOCR
+    case visionOCR
+    case postprocessedOCR
+    case opticalDocumentModel
+
+    public var displayName: String {
+        switch self {
+        case .none: "Kein brauchbarer Text"
+        case .nativePDF: "Native PDF-Textschicht"
+        case .manual: "Manuell bestätigter Text"
+        case .verifiedOCR: "Verifizierter OCR-Text"
+        case .visionOCR: "Apple Vision OCR"
+        case .postprocessedOCR: "Automatisch nachbearbeitete OCR"
+        case .opticalDocumentModel: "Lokales optisches Dokumentmodell"
+        }
+    }
+}
+
 public struct ExtractedPage: Hashable, Sendable {
     public let pageNumber: Int
     public let text: String
+    public let source: PDFPageTextSource
+    public let qualityScore: Double
 
-    public init(pageNumber: Int, text: String) {
+    public init(
+        pageNumber: Int,
+        text: String,
+        source: PDFPageTextSource = .none,
+        qualityScore: Double = 0
+    ) {
         self.pageNumber = pageNumber
         self.text = text
+        self.source = source
+        self.qualityScore = min(1, max(0, qualityScore))
+    }
+}
+
+public struct OCRTextBox: Codable, Equatable, Hashable, Sendable {
+    public let pageNumber: Int
+    public let text: String
+    public let normalizedX: Double
+    public let normalizedY: Double
+    public let normalizedWidth: Double
+    public let normalizedHeight: Double
+    public let confidence: Double?
+
+    public init(
+        pageNumber: Int,
+        text: String,
+        normalizedX: Double,
+        normalizedY: Double,
+        normalizedWidth: Double,
+        normalizedHeight: Double,
+        confidence: Double?
+    ) {
+        self.pageNumber = pageNumber
+        self.text = text
+        self.normalizedX = min(1, max(0, normalizedX))
+        self.normalizedY = min(1, max(0, normalizedY))
+        self.normalizedWidth = min(1, max(0, normalizedWidth))
+        self.normalizedHeight = min(1, max(0, normalizedHeight))
+        self.confidence = confidence.map { min(1, max(0, $0)) }
+    }
+}
+
+public enum PDFHighlightGeometry {
+    /// Vision and PDF drawing use lower-left normalized coordinates. PDFKit
+    /// applies page rotation, zoom and the view transform to annotations.
+    public static func pageRect(
+        normalized box: OCRTextBox,
+        in pageBounds: CGRect
+    ) -> CGRect {
+        CGRect(
+            x: pageBounds.minX + box.normalizedX * pageBounds.width,
+            y: pageBounds.minY + box.normalizedY * pageBounds.height,
+            width: max(2, box.normalizedWidth * pageBounds.width),
+            height: max(2, box.normalizedHeight * pageBounds.height)
+        )
+    }
+}
+
+public enum OpticalPageClassification: String, Codable, CaseIterable, Sendable {
+    case textRecovered
+    case safelyEmpty
+    case probablyEmpty
+    case visibleTextOCRFailed
+    case complexLayout
+    case imageWithoutRelevantText
+    case unreadable
+    case manualReviewRequired
+
+    public var displayName: String {
+        switch self {
+        case .textRecovered: "Text wiederhergestellt"
+        case .safelyEmpty: "Sicher leer"
+        case .probablyEmpty: "Wahrscheinlich leer"
+        case .visibleTextOCRFailed: "Sichtbarer Text, OCR bisher fehlgeschlagen"
+        case .complexLayout: "Tabelle oder komplexes Layout"
+        case .imageWithoutRelevantText: "Bild ohne relevanten Text"
+        case .unreadable: "Beschädigt oder unlesbar"
+        case .manualReviewRequired: "Manuelle Prüfung erforderlich"
+        }
+    }
+}
+
+public struct OpticalPageAnalysis: Codable, Equatable, Sendable {
+    public let pageNumber: Int
+    public let classification: OpticalPageClassification
+    public let proposedText: String
+    public let confidence: Double
+    public let modelID: String
+    public let modelVersion: String
+    public let durationSeconds: Double
+    public let explanation: String
+
+    public init(
+        pageNumber: Int,
+        classification: OpticalPageClassification,
+        proposedText: String,
+        confidence: Double,
+        modelID: String,
+        modelVersion: String,
+        durationSeconds: Double,
+        explanation: String
+    ) {
+        self.pageNumber = pageNumber
+        self.classification = classification
+        self.proposedText = proposedText
+        self.confidence = min(1, max(0, confidence))
+        self.modelID = modelID
+        self.modelVersion = modelVersion
+        self.durationSeconds = max(0, durationSeconds)
+        self.explanation = explanation
     }
 }
 
@@ -166,6 +296,7 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
     public let relevance: SearchRelevance
     public let matchedEntities: [String]
     public let matchedTopics: [String]
+    public let matchedTerms: [String]
     public let reason: String
     public let ocrQuality: String?
     public let textSource: String
@@ -192,6 +323,7 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
         relevance: SearchRelevance = .relevant,
         matchedEntities: [String] = [],
         matchedTopics: [String] = [],
+        matchedTerms: [String] = [],
         reason: String = "",
         ocrQuality: String? = nil,
         textSource: String = "extracted",
@@ -217,6 +349,7 @@ public struct SearchSource: Identifiable, Hashable, Sendable {
         self.relevance = relevance
         self.matchedEntities = matchedEntities
         self.matchedTopics = matchedTopics
+        self.matchedTerms = matchedTerms
         self.reason = reason
         self.ocrQuality = ocrQuality
         self.textSource = textSource
@@ -515,6 +648,13 @@ public enum AppErrorClassifier {
                 category: .requiresAttention,
                 userMessage: parsingError.localizedDescription,
                 technicalMessage: parsingError.localizedDescription
+            )
+        }
+        if let pageEditError = error as? PDFPageEditError {
+            return AppErrorClassification(
+                category: .requiresAttention,
+                userMessage: pageEditError.localizedDescription,
+                technicalMessage: pageEditError.localizedDescription
             )
         }
         if let privateError {
@@ -818,6 +958,7 @@ public struct OCRReviewCandidate: Identifiable, Equatable, Hashable, Sendable {
     public let relativePath: String
     public let fileName: String
     public let originalHash: String
+    public let currentFileHash: String
     public let pageNumber: Int
     public let pageCount: Int
     public let status: PageContentStatus
@@ -832,6 +973,7 @@ public struct OCRReviewCandidate: Identifiable, Equatable, Hashable, Sendable {
         relativePath: String,
         fileName: String,
         originalHash: String,
+        currentFileHash: String? = nil,
         pageNumber: Int,
         pageCount: Int,
         status: PageContentStatus,
@@ -845,6 +987,7 @@ public struct OCRReviewCandidate: Identifiable, Equatable, Hashable, Sendable {
         self.relativePath = relativePath
         self.fileName = fileName
         self.originalHash = originalHash
+        self.currentFileHash = currentFileHash ?? originalHash
         self.pageNumber = pageNumber
         self.pageCount = pageCount
         self.status = status
@@ -1136,6 +1279,50 @@ public enum FindoraError: LocalizedError, Sendable {
             "Datenbankfehler: \(detail)"
         case .cancelled:
             "Der Vorgang wurde abgebrochen."
+        }
+    }
+}
+
+public enum PDFPageEditError: LocalizedError, Sendable {
+    case accessLost
+    case notWritable
+    case changedExternally
+    case damaged
+    case passwordProtected
+    case lastPage
+    case invalidPageIndex
+    case temporaryWriteFailed
+    case validationFailed
+    case replacementFailed(domain: String, code: Int, detail: String)
+    case reindexFailed(String)
+    case cloudFileUnavailable
+
+    public var errorDescription: String? {
+        switch self {
+        case .accessLost:
+            "Der Zugriff auf die PDF wurde verloren. Bitte den Dokumentenordner erneut freigeben."
+        case .notWritable:
+            "Die PDF oder ihr Ordner ist schreibgeschützt. Die Seite wurde nicht entfernt."
+        case .changedExternally:
+            "Die PDF wurde seit der Prüfung extern verändert. Bitte neu laden und erneut prüfen."
+        case .damaged:
+            "Die PDF ist beschädigt oder eine Seite kann nicht sicher gelesen werden."
+        case .passwordProtected:
+            "Eine passwortgeschützte PDF kann nicht seitenweise bearbeitet werden."
+        case .lastPage:
+            "Die einzige beziehungsweise letzte Seite einer PDF kann nicht entfernt werden."
+        case .invalidPageIndex:
+            "Die gewählte Seite existiert in der aktuellen PDF nicht mehr."
+        case .temporaryWriteFailed:
+            "Die neue temporäre PDF konnte im Zielordner nicht geschrieben werden."
+        case .validationFailed:
+            "Die neu erzeugte PDF hat die Sicherheits- und Seitenprüfung nicht bestanden."
+        case .replacementFailed(_, _, let detail):
+            "Der atomare Dateiaustausch ist fehlgeschlagen: \(detail)"
+        case .reindexFailed(let detail):
+            "Die PDF wurde sicher ersetzt, aber die Neuindexierung benötigt eine Reparatur: \(detail)"
+        case .cloudFileUnavailable:
+            "Die Cloud-PDF ist noch nicht vollständig lokal verfügbar."
         }
     }
 }

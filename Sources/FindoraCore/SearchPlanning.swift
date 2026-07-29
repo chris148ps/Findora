@@ -228,6 +228,9 @@ public struct RuleBasedSearchPlanner: Sendable {
         var entities = uniqueIdentifiers(in: trimmed)
         entities.append(contentsOf: capitalizedEntities(in: trimmed))
         entities.removeAll { entity in
+            if entity.contains(where: \.isNumber) {
+                return false
+            }
             let normalizedEntity = entity.folding(
                 options: [.caseInsensitive, .diacriticInsensitive],
                 locale: Locale(identifier: "de_DE")
@@ -283,7 +286,7 @@ public struct RuleBasedSearchPlanner: Sendable {
 
     private func capitalizedEntities(in text: String) -> [String] {
         let tokens = matches(
-            #"\b[A-ZÄÖÜ][A-Za-zÄÖÜäöüß'’\-]{2,}\b"#,
+            #"\b[A-ZÄÖÜ][A-Za-zÄÖÜäöüß'’]+(?:[-/][A-Za-zÄÖÜäöüß0-9'’]+)*\b"#,
             in: text
         )
         return tokens.compactMap { token in
@@ -302,7 +305,7 @@ public struct RuleBasedSearchPlanner: Sendable {
         var values: [String] = []
         let patterns = [
             #"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b"#,
-            #"\b[A-ZÄÖÜ]{1,5}[-/]\d{2,}(?:[-/]\d+)*\b"#,
+            #"\b[A-ZÄÖÜ]{1,16}[-/]\d{2,}(?:[-/]\d+)*\b"#,
             #"\b(?:Kunden|Vertrags|Akten|Vorgangs)(?:nummer|zeichen)?[: ]+[A-Z0-9][A-Z0-9./-]{3,}\b"#
         ]
         for pattern in patterns {

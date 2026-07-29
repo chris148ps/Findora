@@ -97,7 +97,8 @@ public actor DocumentProcessor {
         path: String,
         pageNumber: Int,
         text: String,
-        kind: PageTextKind
+        kind: PageTextKind,
+        source: PDFPageTextSource? = nil
     ) async throws {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if kind != .automatic, normalized.isEmpty {
@@ -125,6 +126,9 @@ public actor DocumentProcessor {
             pageNumber: pageNumber,
             text: normalized,
             textKind: kind,
+            selectedSource: source ?? (
+                kind == .automatic ? .verifiedOCR : .manual
+            ),
             chunks: chunks,
             embeddings: embeddings,
             embeddingModelID: embedder.modelID,
@@ -185,13 +189,15 @@ public actor DocumentProcessor {
                 )
             ]
         }
+        var targetedConfiguration = configuration
+        targetedConfiguration.targetPageNumbers = [pageNumber]
         let outcome = try await OCRRetryCoordinator(
             provider: selectedOCRProcessor,
-            baseConfiguration: configuration,
+            baseConfiguration: targetedConfiguration,
             strategies: manualStrategies
         ).run(
             file: file,
-            baseConfiguration: configuration,
+            baseConfiguration: targetedConfiguration,
             pageAnalyses: analyses.filter { $0.pageNumber == pageNumber },
             onProgress: onProgress
         )
@@ -226,7 +232,8 @@ public actor DocumentProcessor {
                 path: path,
                 pageNumber: pageNumber,
                 text: best.text,
-                kind: .automatic
+                kind: .automatic,
+                source: .postprocessedOCR
             )
         }
         return outcome
@@ -355,8 +362,20 @@ public actor DocumentProcessor {
         var currentFileHash = inputHash
         var pageQualities: [OCRPageQuality] = []
 
-        let needsOCR = !extractor.hasUsableTextLayer(pages)
-            || extractor.needsMixedDocumentOCR(pages)
+        let analysesByPage = Dictionary(
+            uniqueKeysWithValues: initialPageAnalyses.map {
+                ($0.pageNumber, $0)
+            }
+        )
+        let targetPages: [Int] = pages.compactMap { page -> Int? in
+            guard page.source != .nativePDF,
+                  analysesByPage[page.pageNumber]?.status != .safelyEmpty else {
+                return nil
+            }
+            return page.pageNumber
+        }
+        let ocrTargetPageNumbers = Set<Int>(targetPages)
+        let needsOCR = !ocrTargetPageNumbers.isEmpty
         if needsOCR, ocrConfiguration.isEnabled {
             guard let selectedOCRProcessor = ocrProcessorFactory?() ?? ocrProcessor else {
                 throw FindoraError.dependencyMissing("OCR-Verarbeitung ist nicht verfügbar.")
@@ -374,13 +393,17 @@ public actor DocumentProcessor {
                     : "Persistente OCR wurde gestartet.",
                 path: stable.url.path
             )
+            var targetedConfiguration = ocrConfiguration
+            targetedConfiguration.targetPageNumbers = ocrTargetPageNumbers
             let retryOutcome = try await OCRRetryCoordinator(
                 provider: selectedOCRProcessor,
-                baseConfiguration: ocrConfiguration
+                baseConfiguration: targetedConfiguration
             ).run(
                 file: stable,
-                baseConfiguration: ocrConfiguration,
-                pageAnalyses: initialPageAnalyses
+                baseConfiguration: targetedConfiguration,
+                pageAnalyses: initialPageAnalyses.filter {
+                    ocrTargetPageNumbers.contains($0.pageNumber)
+                }
             ) { [database] attempt, total, strategy in
                 try? await database.updateOCRRetryProgress(
                     path: file.id,
@@ -397,21 +420,11 @@ public actor DocumentProcessor {
                 attempts: retryOutcome.attempts,
                 bestStrategyByPage: retryOutcome.bestStrategyByPage
             )
-            let originalTextsByPage = Dictionary(
-                uniqueKeysWithValues: originalExtractedPages.map {
-                    ($0.pageNumber, $0.text)
-                }
-            )
-            let attemptedPages = Set(initialPageAnalyses.compactMap { analysis in
-                let originalCharacters = originalTextsByPage[analysis.pageNumber]?
-                    .filter { !$0.isWhitespace }
-                    .count ?? 0
-                return analysis.status != .safelyEmpty && originalCharacters < 20
-                    ? analysis.pageNumber
-                    : nil
-            })
+            let attemptedPages = ocrTargetPageNumbers
             let pagesWithAnyText = Set(retryOutcome.attempts.compactMap {
-                $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                $0.text.trimmingCharacters(
+                    in: CharacterSet.whitespacesAndNewlines
+                ).isEmpty
                     ? nil
                     : $0.pageNumber
             })
@@ -448,38 +461,40 @@ public actor DocumentProcessor {
                     completedAt: .now
                 )
             }
-            let originalByPage = Dictionary(uniqueKeysWithValues: originalExtractedPages.map {
-                ($0.pageNumber, $0.text)
+            let resultByPage = Dictionary(uniqueKeysWithValues: result.pages.map {
+                ($0.pageNumber, $0)
             })
-            pages = result.pages.map { page in
-                if retryOutcome.acceptedPageNumbers.contains(page.pageNumber) {
-                    return page
+            pages = originalExtractedPages.map { originalPage in
+                if retryOutcome.acceptedPageNumbers.contains(
+                    originalPage.pageNumber
+                ), let resultPage = resultByPage[originalPage.pageNumber] {
+                    return resultPage
                 }
-                return ExtractedPage(
-                    pageNumber: page.pageNumber,
-                    text: originalByPage[page.pageNumber] ?? ""
-                )
+                return originalPage
             }
             pageQualities = result.pageQualities.filter {
                 retryOutcome.acceptedPageNumbers.contains($0.pageNumber)
             }
             if ocrConfiguration.persistenceMode == .persistent,
                !retryOutcome.acceptedPageNumbers.isEmpty {
-                let preferred = retryOutcome.attempts
-                    .filter { attempt in
-                        retryOutcome.bestStrategyByPage[attempt.pageNumber]?.id
+                let bestStrategies = retryOutcome.bestStrategyByPage
+                let preferredAttempts: [OCRAttemptRecord] =
+                    retryOutcome.attempts.filter { attempt in
+                        bestStrategies[attempt.pageNumber]?.id
                             == attempt.strategy.id
                     }
-                    .max { lhs, rhs in
-                        lhs.qualityScore < rhs.qualityScore
-                    }?
-                    .strategy
+                let preferred = preferredAttempts.max {
+                    $0.qualityScore < $1.qualityScore
+                }?.strategy
                 if let preferred {
-                    var persistentConfiguration = preferred.configuration(
+                    var persistentConfiguration: OCRConfiguration =
+                        preferred.configuration(
                         from: ocrConfiguration
                     )
-                    persistentConfiguration.persistenceMode = .persistent
-                    persistentConfiguration.engineSelection = .tesseractOCRmyPDF
+                    persistentConfiguration.persistenceMode =
+                        OCRPersistenceMode.persistent
+                    persistentConfiguration.engineSelection =
+                        OCREngineSelection.tesseractOCRmyPDF
                     result = try await selectedOCRProcessor.process(
                         stable,
                         configuration: persistentConfiguration
@@ -562,7 +577,9 @@ public actor DocumentProcessor {
                 if let manual = manualPageTexts[pageNumber] {
                     return ExtractedPage(
                         pageNumber: pageNumber,
-                        text: manual.text
+                        text: manual.text,
+                        source: .manual,
+                        qualityScore: 1
                     )
                 }
                 return automaticPages[pageNumber]
@@ -584,7 +601,9 @@ public actor DocumentProcessor {
             ocrPerformed: ocrPerformed,
             ocrPageNumbers: ocrPageNumbers,
             pageQualities: pageQualities,
-            textLayerPresent: extractor.hasUsableTextLayer(pages),
+            textLayerPresent: pages.contains(where: {
+                $0.source == .nativePDF
+            }),
             manualPageTexts: manualPageTexts
         )
     }

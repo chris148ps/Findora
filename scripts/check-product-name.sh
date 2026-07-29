@@ -18,6 +18,7 @@ assert_equal "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")
 assert_equal "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$plist")" "Findora" "CFBundleDisplayName"
 assert_equal "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$plist")" "Findora" "CFBundleName"
 assert_equal "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" "de.findora.app" "CFBundleIdentifier"
+assert_equal "$(/usr/libexec/PlistBuddy -c 'Print :FindoraCrashReportRecipient' "$plist")" "support.findora@icloud.com" "FindoraCrashReportRecipient"
 
 rg -q 'name: "Findora"' "$project_root/Package.swift"
 rg -q 'name: "FindoraCore"' "$project_root/Package.swift"

@@ -8,6 +8,14 @@ import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum CrashReportDestination {
+    static var recipient: String {
+        Bundle.main.object(
+            forInfoDictionaryKey: "FindoraCrashReportRecipient"
+        ) as? String ?? ""
+    }
+}
+
 final class FindoraApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         CrashReportCoordinator.endCurrentSession()
@@ -229,6 +237,7 @@ final class AppState {
     var modelDownloadProgress: ModelDownloadProgress?
     var activeEmbeddingModelID: String?
     var activeAnswerModelID: String?
+    var activeDocumentVisionModelID: String?
     var modelMessage: String?
     var isInstallingOCRComponents = false
     var ocrInstallationMessage: String?
@@ -248,6 +257,7 @@ final class AppState {
     var interfaceAppearance: InterfaceAppearance = .system
     var isAnswerModelLoaded = false
     var isEmbeddingModelLoaded = false
+    var isDocumentVisionModelLoaded = false
     var mailSources: [MailImportSource] = []
     var databaseVersionSnapshot: DatabaseVersionSnapshot?
     var pendingMailImport: PendingMailImport?
@@ -267,8 +277,8 @@ final class AppState {
     var isStorageMigrationInProgress = false
     var removedDocumentPolicy: RemovedDocumentPolicy = .removeAfterSuccessfulScan
     var lastSynchronizationMessage: String?
-    var automaticCrashReportsEnabled = false
-    var crashReportRecipient = ""
+    var automaticCrashReportsEnabled = true
+    private(set) var crashReportRecipient = CrashReportDestination.recipient
     var crashReportDeliveryResult: CrashReportDeliveryResult?
     var hasPendingCrashReport = false
     var hardwareProfile: HardwareProfile
@@ -347,6 +357,7 @@ final class AppState {
     private var mailImportTask: Task<Void, Never>?
     private var mailWatchLoop: Task<Void, Never>?
     private var answerGenerator: (any AnswerGenerating)?
+    private var documentVisionAnalyzer: (any OpticalDocumentAnalyzing)?
     private var resolvedFolder: ResolvedFolder?
     private var scanLoop: Task<Void, Never>?
     private var eventScanTask: Task<Void, Never>?
@@ -1289,14 +1300,6 @@ final class AppState {
     func saveSettings() {
         Task {
             do {
-                guard !automaticCrashReportsEnabled
-                        || CrashReportCoordinator.isValidEmailAddress(
-                            crashReportRecipient
-                        ) else {
-                    lastError =
-                        "Bitte eine gültige E-Mail-Adresse für Crashberichte eingeben."
-                    return
-                }
                 let data = try JSONEncoder().encode(ocrConfiguration)
                 guard let ocrJSON = String(data: data, encoding: .utf8) else {
                     throw FindoraError.processFailed("OCR-Einstellungen konnten nicht codiert werden.")
@@ -1310,12 +1313,6 @@ final class AppState {
                 try await database.setSetting(
                     key: "automaticCrashReportsEnabled",
                     value: automaticCrashReportsEnabled ? "1" : "0"
-                )
-                try await database.setSetting(
-                    key: "crashReportRecipient",
-                    value: crashReportRecipient.trimmingCharacters(
-                        in: .whitespacesAndNewlines
-                    )
                 )
                 try await database.setSetting(
                     key: "removedDocumentPolicy",
@@ -1691,6 +1688,137 @@ final class AppState {
         }
     }
 
+    func analyzeOptically(_ candidate: OCRReviewCandidate) {
+        guard !isMaintainingDocuments, !isProcessing else { return }
+        guard documentVisionAnalyzer != nil else {
+            selectedSection = .models
+            modelMessage =
+                "Für diese schwer lesbare Seite kann Findora GLM-OCR lokal verwenden. Laden und aktivieren Sie das Dokumentmodell; Dokumentinhalte werden nicht übertragen."
+            return
+        }
+        isMaintainingDocuments = true
+        maintenanceMessage =
+            "Seite \(candidate.pageNumber) wird lokal optisch geprüft …"
+        Task {
+            defer { isMaintainingDocuments = false }
+            do {
+                let result = try await performOpticalAnalysis(candidate)
+                if result.accepted {
+                    maintenanceMessage =
+                        "Das lokale Dokumentmodell hat plausiblen Text wiederhergestellt."
+                } else {
+                    maintenanceMessage =
+                        "\(result.classification.displayName): Das Ergebnis wurde nicht automatisch übernommen und bleibt zur Prüfung sichtbar."
+                }
+                await refreshMaintenance()
+                await refreshDocumentStatus()
+            } catch {
+                report(error, taskType: "Lokale optische Dokumentanalyse")
+            }
+        }
+    }
+
+    func analyzeDifficultPagesOptically() {
+        let candidates = ocrReviewCandidates.filter {
+            $0.decision == .undecided && $0.textKind == .automatic
+        }
+        guard !candidates.isEmpty else { return }
+        guard documentVisionAnalyzer != nil else {
+            selectedSection = .models
+            modelMessage =
+                "Das lokale Dokumentmodell ist nicht installiert oder nicht aktiviert."
+            return
+        }
+        Task {
+            var textRecovered = 0
+            var safelyEmpty = 0
+            var probablyEmpty = 0
+            var unresolved = 0
+            var modelErrors = 0
+            for (index, candidate) in candidates.enumerated() {
+                guard !Task.isCancelled else { return }
+                while isPaused {
+                    maintenanceMessage =
+                        "Optische Prüfung pausiert (\(index) von \(candidates.count))."
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard !Task.isCancelled else { return }
+                }
+                maintenanceMessage =
+                    "Optische Prüfung \(index + 1) von \(candidates.count): \(candidate.fileName), Seite \(candidate.pageNumber)"
+                while isMaintainingDocuments {
+                    try? await Task.sleep(for: .milliseconds(150))
+                }
+                isMaintainingDocuments = true
+                do {
+                    let result = try await performOpticalAnalysis(candidate)
+                    switch result.classification {
+                    case .textRecovered where result.accepted:
+                        textRecovered += 1
+                    case .safelyEmpty:
+                        safelyEmpty += 1
+                    case .probablyEmpty:
+                        probablyEmpty += 1
+                    default:
+                        unresolved += 1
+                    }
+                } catch {
+                    modelErrors += 1
+                    report(
+                        error,
+                        taskType:
+                            "Lokale optische Batchanalyse: \(candidate.fileName), Seite \(candidate.pageNumber)"
+                    )
+                }
+                isMaintainingDocuments = false
+                await refreshMaintenance()
+            }
+            maintenanceMessage = interfaceLanguage == .english
+                ? "Optical review completed: text recovered \(textRecovered), safely empty \(safelyEmpty), probably empty \(probablyEmpty), still unclear \(unresolved), model errors \(modelErrors)."
+                : "Optische Prüfung abgeschlossen: Text wiederhergestellt \(textRecovered), sicher leer \(safelyEmpty), wahrscheinlich leer \(probablyEmpty), weiterhin unklar \(unresolved), Modellfehler \(modelErrors)."
+            await refreshDocumentStatus()
+        }
+    }
+
+    private func performOpticalAnalysis(
+        _ candidate: OCRReviewCandidate
+    ) async throws -> (
+        classification: OpticalPageClassification,
+        accepted: Bool
+    ) {
+        guard let analyzer = documentVisionAnalyzer else {
+            throw FindoraError.processFailed(
+                "Das optische Dokumentmodell ist nicht aktiviert."
+            )
+        }
+        let analysis = try await analyzer.analyzePage(
+            fileURL: URL(filePath: candidate.absolutePath),
+            pageNumber: candidate.pageNumber,
+            timeout: .seconds(90)
+        )
+        isDocumentVisionModelLoaded = true
+        let accepted =
+            candidate.textKind == .automatic
+            && analysis.classification == .textRecovered
+            && analysis.confidence >= 0.58
+            && analysis.proposedText.split(whereSeparator: \.isWhitespace).count >= 2
+        try await database.saveOpticalPageAnalysis(
+            path: candidate.absolutePath,
+            originalHash: candidate.originalHash,
+            analysis: analysis,
+            accepted: accepted
+        )
+        if accepted {
+            try await processor.updatePageText(
+                path: candidate.absolutePath,
+                pageNumber: candidate.pageNumber,
+                text: analysis.proposedText,
+                kind: .automatic,
+                source: .opticalDocumentModel
+            )
+        }
+        return (analysis.classification, accepted)
+    }
+
     func savePageText(
         _ candidate: OCRReviewCandidate,
         text: String,
@@ -1735,11 +1863,47 @@ final class AppState {
                     path: candidate.absolutePath,
                     pageNumber: candidate.pageNumber
                 )
-                _ = try await maintenanceService.reanalyzePage(
+                let analysis = try await maintenanceService.reanalyzePage(
+                    path: candidate.absolutePath,
+                    expectedHash: candidate.currentFileHash,
+                    pageNumber: candidate.pageNumber
+                )
+                if analysis.metrics.characterCount == 0,
+                   analysis.status.hasVisibleContent {
+                    await retryOCRPage(
+                        path: candidate.absolutePath,
+                        pageNumber: candidate.pageNumber
+                    )
+                    return
+                }
+                await refreshMaintenance()
+                await refreshDocumentStatus()
+            } catch {
+                report(error)
+            }
+        }
+    }
+
+    func resetPageReview(_ candidate: EmptyPageCandidate) {
+        Task {
+            do {
+                try await database.resetPageReviewDecision(
+                    path: candidate.absolutePath,
+                    pageNumber: candidate.pageNumber
+                )
+                let analysis = try await maintenanceService.reanalyzePage(
                     path: candidate.absolutePath,
                     expectedHash: candidate.originalHash,
                     pageNumber: candidate.pageNumber
                 )
+                if analysis.metrics.characterCount == 0,
+                   analysis.status.hasVisibleContent {
+                    await retryOCRPage(
+                        path: candidate.absolutePath,
+                        pageNumber: candidate.pageNumber
+                    )
+                    return
+                }
                 await refreshMaintenance()
                 await refreshDocumentStatus()
             } catch {
@@ -2209,6 +2373,48 @@ final class AppState {
         previewSource = source
     }
 
+    func adjacentPreviewSource(from source: SearchSource, offset: Int) {
+        let sameDocument = searchResults
+            .filter { $0.absolutePath == source.absolutePath }
+            .sorted {
+                if $0.pageNumber == $1.pageNumber {
+                    return $0.score > $1.score
+                }
+                return $0.pageNumber < $1.pageNumber
+            }
+        guard let index = sameDocument.firstIndex(where: { $0.id == source.id }),
+              sameDocument.indices.contains(index + offset) else { return }
+        previewSource = sameDocument[index + offset]
+    }
+
+    func hasAdjacentPreviewSource(
+        from source: SearchSource,
+        offset: Int
+    ) -> Bool {
+        let sameDocument = searchResults
+            .filter { $0.absolutePath == source.absolutePath }
+            .sorted {
+                if $0.pageNumber == $1.pageNumber {
+                    return $0.score > $1.score
+                }
+                return $0.pageNumber < $1.pageNumber
+            }
+        guard let index = sameDocument.firstIndex(where: { $0.id == source.id }) else {
+            return false
+        }
+        return sameDocument.indices.contains(index + offset)
+    }
+
+    func ocrBoxes(for source: SearchSource) async -> [OCRTextBox] {
+        (try? await database.ocrTextBoxes(
+            path: source.absolutePath,
+            pageNumber: source.pageNumber,
+            matching: source.matchedTerms
+                + source.matchedEntities
+                + source.matchedTopics
+        )) ?? []
+    }
+
     func refreshDatabaseState() async {
         do {
             await refreshDocumentStatus()
@@ -2352,6 +2558,15 @@ final class AppState {
                                 contextLength: descriptor.defaultContextLength
                             )
                             try await generator.test()
+                        case .documentVision:
+                            let analyzer = MLXDocumentVisionAnalyzer(
+                                modelID: descriptor.id,
+                                modelVersion: descriptor.modelVersion,
+                                directory: directory,
+                                contextLength: descriptor.defaultContextLength
+                            )
+                            try await analyzer.test()
+                            await analyzer.unload()
                         }
                     }
                 ) { [weak self] progress in
@@ -2470,6 +2685,32 @@ final class AppState {
                     )
                     try await database.setSetting(key: "activeAnswerModelID", value: model.id)
                     modelMessage = "Antwortmodell wurde getestet und aktiviert."
+                case .documentVision:
+                    let analyzer = MLXDocumentVisionAnalyzer(
+                        modelID: model.id,
+                        modelVersion: model.descriptor.modelVersion,
+                        directory: directory,
+                        contextLength: model.descriptor.defaultContextLength
+                    )
+                    try await analyzer.test()
+                    try await modelManager.activate(modelID: model.id)
+                    if let previous = documentVisionAnalyzer {
+                        await previous.unload()
+                    }
+                    documentVisionAnalyzer = analyzer
+                    activeDocumentVisionModelID = model.id
+                    isDocumentVisionModelLoaded = true
+                    try await database.setModelEnabled(
+                        modelID: model.id,
+                        modelVersion: model.descriptor.modelVersion,
+                        kind: .documentVision
+                    )
+                    try await database.setSetting(
+                        key: "activeDocumentVisionModelID",
+                        value: model.id
+                    )
+                    modelMessage =
+                        "Das lokale Dokumentmodell wurde geprüft und aktiviert."
                 }
                 await refreshModels()
             } catch {
@@ -2522,6 +2763,24 @@ final class AppState {
                     )
                     modelMessage =
                         "Embedding-Modell deaktiviert. Die Volltextsuche bleibt aktiv; vorhandene Embeddings wurden nicht gelöscht."
+                case .documentVision:
+                    guard activeDocumentVisionModelID == model.id else { return }
+                    await documentVisionAnalyzer?.unload()
+                    documentVisionAnalyzer = nil
+                    activeDocumentVisionModelID = nil
+                    isDocumentVisionModelLoaded = false
+                    await modelManager.deactivate(kind: .documentVision)
+                    try await database.setModelEnabled(
+                        modelID: nil,
+                        modelVersion: nil,
+                        kind: .documentVision
+                    )
+                    try await database.setSetting(
+                        key: "activeDocumentVisionModelID",
+                        value: ""
+                    )
+                    modelMessage =
+                        "Das optische Dokumentmodell ist deaktiviert. Seiten bleiben zur manuellen Prüfung erhalten."
                 }
                 await refreshModels()
             } catch {
@@ -2544,12 +2803,21 @@ final class AppState {
                     )
                     try await provider.test()
                     await provider.unload()
-                } else {
+                } else if model.descriptor.kind == .answer {
                     let generator = MLXAnswerGenerator(
                         directory: directory,
                         contextLength: model.descriptor.defaultContextLength
                     )
                     try await generator.test()
+                } else {
+                    let analyzer = MLXDocumentVisionAnalyzer(
+                        modelID: model.id,
+                        modelVersion: model.descriptor.modelVersion,
+                        directory: directory,
+                        contextLength: model.descriptor.defaultContextLength
+                    )
+                    try await analyzer.test()
+                    await analyzer.unload()
                 }
                 modelMessage = "Modelltest erfolgreich: \(model.descriptor.displayName)"
             } catch {
@@ -2589,6 +2857,22 @@ final class AppState {
                         kind: .embedding
                     )
                     try await database.setSetting(key: "activeEmbeddingModelID", value: "")
+                }
+                if model.descriptor.kind == .documentVision,
+                   activeDocumentVisionModelID == model.id {
+                    await documentVisionAnalyzer?.unload()
+                    documentVisionAnalyzer = nil
+                    activeDocumentVisionModelID = nil
+                    isDocumentVisionModelLoaded = false
+                    try await database.setModelEnabled(
+                        modelID: nil,
+                        modelVersion: nil,
+                        kind: .documentVision
+                    )
+                    try await database.setSetting(
+                        key: "activeDocumentVisionModelID",
+                        value: ""
+                    )
                 }
                 try await modelManager.remove(modelID: model.id)
                 try await database.removeModelState(
@@ -2725,6 +3009,9 @@ final class AppState {
             let storedAnswerID = storedStates.first {
                 $0.kind == .answer && $0.enabled
             }?.modelID
+            let storedDocumentVisionID = storedStates.first {
+                $0.kind == .documentVision && $0.enabled
+            }?.modelID
             let legacyEmbeddingID = try await database.setting(
                 key: "activeEmbeddingModelID"
             )
@@ -2773,6 +3060,31 @@ final class AppState {
                     kind: .answer
                 )
             }
+            let legacyDocumentVisionID = try await database.setting(
+                key: "activeDocumentVisionModelID"
+            )
+            let documentVisionID =
+                storedDocumentVisionID ?? legacyDocumentVisionID
+            if let documentVisionID, !documentVisionID.isEmpty,
+               let descriptor = await modelManager.descriptor(id: documentVisionID),
+               let directory = await modelManager.installedDirectory(
+                    modelID: documentVisionID
+               ) {
+                documentVisionAnalyzer = MLXDocumentVisionAnalyzer(
+                    modelID: documentVisionID,
+                    modelVersion: descriptor.modelVersion,
+                    directory: directory,
+                    contextLength: descriptor.defaultContextLength
+                )
+                try await modelManager.activate(modelID: documentVisionID)
+                activeDocumentVisionModelID = documentVisionID
+                isDocumentVisionModelLoaded = false
+                try await database.setModelEnabled(
+                    modelID: documentVisionID,
+                    modelVersion: descriptor.modelVersion,
+                    kind: .documentVision
+                )
+            }
         } catch {
             report(error)
         }
@@ -2802,10 +3114,14 @@ final class AppState {
                let appearance = InterfaceAppearance(rawValue: value) {
                 interfaceAppearance = appearance
             }
-            automaticCrashReportsEnabled =
-                try await database.setting(key: "automaticCrashReportsEnabled") == "1"
-            crashReportRecipient =
-                try await database.setting(key: "crashReportRecipient") ?? ""
+            if let crashSetting = try await database.setting(
+                key: "automaticCrashReportsEnabled"
+            ) {
+                automaticCrashReportsEnabled = crashSetting != "0"
+            } else {
+                automaticCrashReportsEnabled = true
+            }
+            crashReportRecipient = CrashReportDestination.recipient
             if let value = try await database.setting(key: "removedDocumentPolicy"),
                let policy = RemovedDocumentPolicy(rawValue: value) {
                 removedDocumentPolicy = policy
@@ -2959,6 +3275,16 @@ final class AppState {
 
         if level == .critical {
             await unloadAnswerModel(reason: "kritischer Speicherdruck")
+            if let documentVisionAnalyzer {
+                await documentVisionAnalyzer.unload()
+                isDocumentVisionModelLoaded = false
+                try? await fileLogger.log(
+                    .warning,
+                    category: "Modelle",
+                    message:
+                        "Optisches Dokumentmodell wurde wegen kritischen Speicherdrucks entladen."
+                )
+            }
         }
     }
 
@@ -3409,36 +3735,48 @@ struct HelpView: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("Findora-Hilfe")
-                    .font(.largeTitle.bold())
+        Form {
+            Section {
                 Text(
                     "Findora durchsucht PDFs und E-Mails lokal, verbessert gescannte Seiten per OCR und bietet sichere Werkzeuge zur Dokumentpflege."
                 )
                 .foregroundStyle(.secondary)
+            } header: {
+                Text("Findora-Hilfe")
+            }
 
-                helpCard(
-                    "Erste Schritte",
-                    "Wählen Sie in den Einstellungen einen Dokumentenordner. Findora erfasst PDFs rekursiv und lässt Originale unverändert. E-Mail-Dateien und Apple-Mail-Postfächer können im Bereich E-Mail-Quellen hinzugefügt werden.",
-                    symbol: "1.circle"
-                )
-                helpCard(
-                    "OCR prüfen",
-                    "Findora behandelt OCR seitenweise. Sie können eine Seite als leer bestätigen, automatisch oder manuell nachbearbeiten und nach einer gesonderten Bestätigung nur diese Seite entfernen.",
-                    symbol: "text.viewfinder"
-                )
-                helpCard(
-                    "Dokumentenwartung",
-                    "Duplikate werden anhand stabiler Inhaltswerte gruppiert. Dateiaktionen erfolgen erst nach Bestätigung; entfernte Originalfassungen landen im macOS-Papierkorb.",
-                    symbol: "wrench.and.screwdriver"
-                )
-                helpCard(
-                    "Datenschutz und Diagnose",
-                    "Es gibt keine allgemeine Telemetrie. Crashberichte sind freiwillig und werden bereinigt über Apple Mail versendet. Ein Diagnoseexport enthält technische Zustände, aber keine Dokumentinhalte, Suchanfragen oder vollständigen privaten Pfade.",
-                    symbol: "lock.shield"
-                )
+            helpSection(
+                "Erste Schritte",
+                "Wählen Sie in den Einstellungen einen Dokumentenordner. Findora erfasst PDFs rekursiv und lässt Originale unverändert. E-Mail-Dateien und Apple-Mail-Postfächer können im Bereich E-Mail-Quellen hinzugefügt werden.",
+                symbol: "1.circle"
+            )
+            helpSection(
+                "PDFKit- und Hybridsuche",
+                "Findora bevorzugt eine plausible native PDF-Textschicht und kombiniert exakte Volltexttreffer mit der lokalen semantischen Suche. Beim Öffnen springt Findora zur richtigen Seite und markiert native Treffer direkt; OCR-Treffer werden mit gespeicherten Positionen oder seitenrichtigem Fallback angezeigt.",
+                symbol: "doc.text.magnifyingglass"
+            )
+            helpSection(
+                "OCR prüfen",
+                "Findora behandelt OCR seitenweise und probiert automatisch mehrere Einstellungen mit einer Wort- und Plausibilitätsprüfung. Sie können eine Seite als leer bestätigen, automatisch oder manuell nachbearbeiten und nach einer gesonderten Bestätigung nur diese Seite entfernen. Bei Zugriff, Schreibschutz, externer Änderung, Passwortschutz oder einer letzten Seite bleibt das Original unverändert und Findora zeigt den konkreten Grund.",
+                symbol: "text.viewfinder"
+            )
+            helpSection(
+                "Lokales optisches Dokumentmodell",
+                "GLM-OCR kann schwierige Seiten nach PDFKit und Apple Vision optional lokal prüfen. Downloadgröße, RAM-Eignung, Version und Lizenz stehen unter Modelle. Download, Aktivierung, Deaktivierung und Löschen erfolgen nur auf Ihre Aktion; unsichere Vorschläge bleiben in OCR prüfen und lösen keine Dateiaktion aus.",
+                symbol: "eye.trianglebadge.exclamationmark"
+            )
+            helpSection(
+                "Dokumentenwartung",
+                "Duplikate werden anhand stabiler Inhaltswerte gruppiert. Dateiaktionen erfolgen erst nach Bestätigung; entfernte Originalfassungen landen im macOS-Papierkorb.",
+                symbol: "wrench.and.screwdriver"
+            )
+            helpSection(
+                "Datenschutz und Diagnose",
+                "Es gibt keine allgemeine Telemetrie. Crashberichte sind freiwillig und werden bereinigt über Apple Mail versendet. Ein Diagnoseexport enthält technische Zustände, aber keine Dokumentinhalte, Suchanfragen oder vollständigen privaten Pfade.",
+                symbol: "lock.shield"
+            )
 
+            Section {
                 HStack {
                     Button("Einführung erneut anzeigen") {
                         state.restartOnboarding()
@@ -3451,24 +3789,21 @@ struct HelpView: View {
                     }
                 }
             }
-            .frame(maxWidth: 820, alignment: .leading)
-            .padding(28)
         }
+        .formStyle(.grouped)
         .navigationTitle(state.localizedSectionTitle(.help))
     }
 
-    private func helpCard(
+    private func helpSection(
         _ title: LocalizedStringKey,
         _ text: LocalizedStringKey,
         symbol: String
     ) -> some View {
-        GroupBox {
+        Section {
             Text(text)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 4)
-        } label: {
+        } header: {
             Label(title, systemImage: symbol)
-                .font(.headline)
         }
     }
 }
@@ -4178,10 +4513,7 @@ struct SourceCard: View {
                 SearchBadge(text: "Thema: \(topic)", color: .blue)
             }
             if source.contentType == .pdf {
-                SearchBadge(
-                    text: source.textSource == "ocr" ? "OCR-Text" : "Digitale Textschicht",
-                    color: .secondary
-                )
+                SearchBadge(text: textSourceLabel, color: .secondary)
             }
             if let sender = source.mailSender, !sender.isEmpty {
                 SearchBadge(text: "Von: \(sender)", color: .teal)
@@ -4200,7 +4532,9 @@ struct SourceCard: View {
 
     private var highlightedExcerpt: AttributedString {
         let attributed = NSMutableAttributedString(string: source.excerpt)
-        let terms = source.matchedEntities + source.matchedTopics
+        let terms = source.matchedTerms
+            + source.matchedEntities
+            + source.matchedTopics
         for term in terms {
             guard let expression = try? NSRegularExpression(
                 pattern: NSRegularExpression.escapedPattern(for: term),
@@ -4226,6 +4560,18 @@ struct SourceCard: View {
         case .review: "OCR prüfen"
         case .likelyFailed: "OCR schwach"
         case nil: "OCR"
+        }
+    }
+
+    private var textSourceLabel: String {
+        switch PDFPageTextSource(rawValue: source.textSource) {
+        case .nativePDF: "PDFKit-Text"
+        case .manual: "Manuell bestätigt"
+        case .verifiedOCR: "Verifizierte OCR"
+        case .visionOCR: "Apple Vision OCR"
+        case .postprocessedOCR: "OCR-Nachbearbeitung"
+        case .opticalDocumentModel: "Lokales Dokumentmodell"
+        case .some(.none), nil: "Textquelle unbekannt"
         }
     }
 }
@@ -4311,7 +4657,26 @@ struct MailSourcePreview: View {
 struct PDFSourcePreview: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.locale) private var locale
+    @Environment(AppState.self) private var state
     let source: SearchSource
+    @State private var ocrBoxes: [OCRTextBox] = []
+
+    private var searchTerms: [String] {
+        Array(Set(
+            source.matchedTerms
+                + source.matchedEntities
+                + source.matchedTopics
+        )).filter { !$0.isEmpty }
+    }
+
+    private var usesOCRCoordinates: Bool {
+        switch PDFPageTextSource(rawValue: source.textSource) {
+        case .verifiedOCR, .visionOCR, .postprocessedOCR, .opticalDocumentModel:
+            true
+        default:
+            false
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -4327,16 +4692,46 @@ struct PDFSourcePreview: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button {
+                    state.adjacentPreviewSource(from: source, offset: -1)
+                } label: {
+                    Label("Vorheriger Treffer", systemImage: "chevron.left")
+                }
+                .disabled(!state.hasAdjacentPreviewSource(from: source, offset: -1))
+                Button {
+                    state.adjacentPreviewSource(from: source, offset: 1)
+                } label: {
+                    Label("Nächster Treffer", systemImage: "chevron.right")
+                }
+                .disabled(!state.hasAdjacentPreviewSource(from: source, offset: 1))
                 Button("Schließen") { dismiss() }
             }
             .padding()
             GraphContextPanel(documentID: source.documentID)
                 .padding(.horizontal)
                 .padding(.bottom, 10)
+            if usesOCRCoordinates, ocrBoxes.isEmpty {
+                Label(
+                    "Die richtige Seite ist geöffnet. Für diesen OCR-Treffer ist keine exakte Seitenposition gespeichert.",
+                    systemImage: "info.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
+            }
             Divider()
-            PDFKitView(url: URL(filePath: source.absolutePath), pageNumber: source.pageNumber)
+            PDFKitView(
+                url: URL(filePath: source.absolutePath),
+                pageNumber: source.pageNumber,
+                searchTerms: searchTerms,
+                ocrBoxes: ocrBoxes
+            )
         }
         .frame(minWidth: 760, minHeight: 700)
+        .task(id: source.id) {
+            ocrBoxes = usesOCRCoordinates ? await state.ocrBoxes(for: source) : []
+        }
     }
 }
 
@@ -4386,26 +4781,87 @@ private struct GraphContextPanel: View {
 struct PDFKitView: NSViewRepresentable {
     let url: URL
     let pageNumber: Int
+    var searchTerms: [String] = []
+    var ocrBoxes: [OCRTextBox] = []
+
+    final class Coordinator {
+        var annotations: [PDFAnnotation] = []
+        var configurationKey = ""
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
     func makeNSView(context: Context) -> PDFView {
         let view = PDFView()
         view.autoScales = true
         view.displayMode = .singlePageContinuous
         view.displaysPageBreaks = true
-        configure(view)
+        configure(view, coordinator: context.coordinator)
         return view
     }
 
     func updateNSView(_ nsView: PDFView, context: Context) {
-        configure(nsView)
+        configure(nsView, coordinator: context.coordinator)
     }
 
-    private func configure(_ view: PDFView) {
+    private func configure(_ view: PDFView, coordinator: Coordinator) {
         if view.document?.documentURL != url {
             view.document = PDFDocument(url: url)
+            coordinator.configurationKey = ""
         }
-        if let page = view.document?.page(at: max(0, pageNumber - 1)) {
+        guard let document = view.document,
+              let page = document.page(at: max(0, pageNumber - 1)) else {
+            return
+        }
+        let boxKey = ocrBoxes.map {
+            "\($0.text):\($0.normalizedX):\($0.normalizedY):\($0.normalizedWidth):\($0.normalizedHeight)"
+        }.joined(separator: "|")
+        let key =
+            "\(url.path)#\(pageNumber)#\(searchTerms.joined(separator: "|"))#\(boxKey)"
+        guard coordinator.configurationKey != key else { return }
+        coordinator.configurationKey = key
+        view.highlightedSelections = nil
+        for annotation in coordinator.annotations {
+            annotation.page?.removeAnnotation(annotation)
+        }
+        coordinator.annotations.removeAll()
+
+        let selections = searchTerms.flatMap { term in
+            document.findString(
+                term,
+                withOptions: [.caseInsensitive, .diacriticInsensitive]
+            ).filter { $0.pages.contains(page) }
+        }
+        if !selections.isEmpty {
+            for selection in selections {
+                selection.color = NSColor.systemYellow.withAlphaComponent(0.42)
+            }
+            view.highlightedSelections = selections
+            view.setCurrentSelection(selections[0], animate: false)
+            view.go(to: selections[0])
+        } else {
             view.go(to: page)
+        }
+
+        let mediaBox = page.bounds(for: .mediaBox)
+        for box in ocrBoxes where box.pageNumber == pageNumber {
+            let bounds = PDFHighlightGeometry.pageRect(
+                normalized: box,
+                in: mediaBox
+            )
+            let annotation = PDFAnnotation(
+                bounds: bounds,
+                forType: .highlight,
+                withProperties: nil
+            )
+            annotation.color = NSColor.systemOrange.withAlphaComponent(0.45)
+            page.addAnnotation(annotation)
+            coordinator.annotations.append(annotation)
+        }
+        if let first = coordinator.annotations.first {
+            view.go(to: first.bounds, on: page)
         }
     }
 }
@@ -5711,6 +6167,16 @@ struct MaintenanceView: View {
                                     state.isMaintainingDocuments
                                         || state.isProcessing
                                 )
+                                if candidate.decision != .undecided {
+                                    Button("Manuelle Bewertung zurücksetzen") {
+                                        selectedPageIDs.remove(candidate.id)
+                                        state.resetPageReview(candidate)
+                                    }
+                                    .disabled(
+                                        state.isMaintainingDocuments
+                                            || state.isProcessing
+                                    )
+                                }
                                 Button("Nicht leer") {
                                     selectedPageIDs.remove(candidate.id)
                                     state.setPageDecision(
@@ -5852,6 +6318,24 @@ struct MaintenanceView: View {
 
     private var ocrReviewList: some View {
         VStack(spacing: 0) {
+            HStack {
+                Button("Schwierige Seiten optisch prüfen") {
+                    state.analyzeDifficultPagesOptically()
+                }
+                .disabled(
+                    filteredOCRReviewCandidates.isEmpty
+                        || state.isMaintainingDocuments
+                        || state.isProcessing
+                )
+                Text(
+                    "Nur ungelöste Prüffälle; keine PDF wird automatisch verändert oder gelöscht."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(10)
+            .background(.bar)
             List {
                 if filteredOCRReviewCandidates.isEmpty {
                     maintenanceEmptyState(
@@ -5953,6 +6437,9 @@ struct MaintenanceView: View {
                                     }
                                     Button("OCR manuell nachbearbeiten") {
                                         manualOCRCandidate = candidate
+                                    }
+                                    Button("Mit optischer KI prüfen") {
+                                        state.analyzeOptically(candidate)
                                     }
                                     Button(
                                         "Diese Seite löschen …",
@@ -7251,82 +7738,90 @@ struct OCRView: View {
 
 struct ModelsView: View {
     @Environment(AppState.self) private var state
+    @Environment(\.openURL) private var openURL
     @State private var pendingEmbeddingActivation: InstalledModel?
     @State private var pendingEmbeddingUpdate: InstalledModel?
     @State private var pendingRemoval: InstalledModel?
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                GroupBox("Dieser Mac") {
-                    Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 6) {
-                        GridRow {
-                            Text("Chip").foregroundStyle(.secondary)
-                            Text(state.hardwareProfile.chipName)
-                        }
-                        GridRow {
-                            Text("Unified Memory").foregroundStyle(.secondary)
-                            Text(ByteCountFormatter.string(
-                                fromByteCount: Int64(state.hardwareProfile.physicalMemoryBytes),
-                                countStyle: .memory
-                            ))
-                        }
-                        GridRow {
-                            Text("Freier Speicher").foregroundStyle(.secondary)
-                            Text(ByteCountFormatter.string(
-                                fromByteCount: state.hardwareProfile.availableStorageBytes,
-                                countStyle: .file
-                            ))
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
+        Form {
+            Section("Dieser Mac") {
+                LabeledContent("Chip", value: state.hardwareProfile.chipName)
+                LabeledContent(
+                    "Unified Memory",
+                    value: ByteCountFormatter.string(
+                        fromByteCount:
+                            Int64(state.hardwareProfile.physicalMemoryBytes),
+                        countStyle: .memory
+                    )
+                )
+                LabeledContent(
+                    "Freier Speicher",
+                    value: ByteCountFormatter.string(
+                        fromByteCount:
+                            state.hardwareProfile.availableStorageBytes,
+                        countStyle: .file
+                    )
+                )
+            }
 
-                if let message = state.modelMessage {
+            if let message = state.modelMessage {
+                Section {
                     Label(
                         LocalizedStringKey(message),
                         systemImage: "checkmark.circle"
                     )
-                        .foregroundStyle(.green)
+                    .foregroundStyle(.green)
                 }
+            }
 
-                if let progress = state.modelDownloadProgress {
-                    GroupBox("Modelldownload") {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ProgressView(value: progress.fraction)
-                            Text(progress.currentFile)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            HStack {
-                                Text(
-                                    "\(ByteCountFormatter.string(fromByteCount: progress.downloadedBytes, countStyle: .file)) von \(ByteCountFormatter.string(fromByteCount: progress.totalBytes, countStyle: .file))"
-                                )
-                                Spacer()
-                                Button("Pausieren") {
-                                    state.pauseModelDownload()
-                                }
-                                Button("Abbrechen", role: .destructive) {
-                                    state.cancelModelDownload()
-                                }
-                            }
+            if let progress = state.modelDownloadProgress {
+                Section("Modelldownload") {
+                    ProgressView(value: progress.fraction)
+                    Text(progress.currentFile)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text(
+                            "\(ByteCountFormatter.string(fromByteCount: progress.downloadedBytes, countStyle: .file)) von \(ByteCountFormatter.string(fromByteCount: progress.totalBytes, countStyle: .file))"
+                        )
+                        Spacer()
+                        Button("Pausieren") {
+                            state.pauseModelDownload()
+                        }
+                        Button("Abbrechen", role: .destructive) {
+                            state.cancelModelDownload()
                         }
                     }
                 }
+            }
 
-                Text("Embedding-Modell")
-                    .font(.title2.bold())
+            Section("Embedding-Modell") {
                 ForEach(visibleModels(kind: .embedding)) { model in
                     modelCard(model)
                 }
+            }
 
-                Text("Antwortmodelle")
-                    .font(.title2.bold())
+            Section("Antwortmodelle") {
                 ForEach(visibleModels(kind: .answer)) { model in
                     modelCard(model)
                 }
             }
-            .padding()
+
+            Section {
+                Text(
+                    "Nur für Seiten, die PDFKit und die mehrstufige Apple‑Vision‑OCR nicht zuverlässig lösen. Download und Aktivierung erfolgen ausschließlich auf Ihre Aktion; die Verarbeitung bleibt lokal."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                ForEach(visibleModels(kind: .documentVision)) { model in
+                    modelCard(model)
+                }
+            } header: {
+                Text("Optisches Dokumentmodell")
+            }
         }
+        .formStyle(.grouped)
         .navigationTitle(state.localizedSectionTitle(.models))
         .alert(
             "Index neu aufbauen?",
@@ -7378,11 +7873,7 @@ struct ModelsView: View {
             }
             Button("Abbrechen", role: .cancel) { pendingRemoval = nil }
         } message: { model in
-            Text(
-                model.descriptor.kind == .embedding
-                    ? "Nur die Modelldateien werden verschoben. Gespeicherte Dokumenttexte und Embeddings bleiben erhalten; die Volltextsuche funktioniert weiter."
-                    : "Nur die Modelldateien werden verschoben. Dokumentindex und Suche bleiben erhalten; KI-Antworten sind danach deaktiviert."
-            )
+            Text(removalMessage(for: model.descriptor.kind))
         }
     }
 
@@ -7393,6 +7884,17 @@ struct ModelsView: View {
         }
     }
 
+    private func removalMessage(for kind: ModelKind) -> String {
+        switch kind {
+        case .embedding:
+            "Nur die Modelldateien werden verschoben. Gespeicherte Dokumenttexte und Embeddings bleiben erhalten; die Volltextsuche funktioniert weiter."
+        case .answer:
+            "Nur die Modelldateien werden verschoben. Dokumentindex und Suche bleiben erhalten; KI-Antworten sind danach deaktiviert."
+        case .documentVision:
+            "Nur das lokale Dokumentmodell wird verschoben. Keine Seite wird gelöscht oder verändert; ungelöste Fälle bleiben unter OCR prüfen."
+        }
+    }
+
     @ViewBuilder
     private func modelCard(_ model: InstalledModel) -> some View {
         GroupBox {
@@ -7400,13 +7902,22 @@ struct ModelsView: View {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(model.descriptor.displayName).font(.headline)
-                        Text("\(model.descriptor.family) · \(model.descriptor.parameters) · \(model.descriptor.quantization)")
+                        (
+                            Text(LocalizedStringKey(model.descriptor.family))
+                                + Text(" · \(model.descriptor.parameters) · \(model.descriptor.quantization)")
+                        )
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
                     compatibilityBadge(model.compatibility)
-                    if model.isInstalled {
-                        Text(modelStatus(model))
+                    if model.integrityFailed {
+                        Text("Fehlerhaft")
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.red.opacity(0.12), in: Capsule())
+                    } else if model.isInstalled {
+                        Text(LocalizedStringKey(modelStatus(model)))
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
                             .background(
@@ -7449,9 +7960,27 @@ struct ModelsView: View {
                 }
 
                 HStack {
-                    Link("Lizenz: \(model.descriptor.licenseName)", destination: model.descriptor.licenseURL)
+                    Button {
+                        openURL(model.descriptor.licenseURL)
+                    } label: {
+                        Text("Lizenz:")
+                            + Text(" \(model.descriptor.licenseName)")
+                    }
+                    .buttonStyle(.link)
                     Spacer()
-                    if model.updateAvailable {
+                    if model.integrityFailed {
+                        Button("Erneut herunterladen") {
+                            state.installModel(
+                                model,
+                                activateAfterInstall: model.isActive
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(
+                            state.downloadingModelID != nil
+                                || model.compatibility == .incompatible
+                        )
+                    } else if model.updateAvailable {
                         Button("Modell aktualisieren") {
                             if model.descriptor.kind == .embedding {
                                 pendingEmbeddingUpdate = model
@@ -7465,7 +7994,9 @@ struct ModelsView: View {
                                 || model.compatibility == .incompatible
                         )
                     } else if model.isInstalled {
-                        Button("Testen") { state.testModel(model) }
+                        Button("Integrität prüfen") {
+                            state.testModel(model)
+                        }
                         if model.isActive {
                             Button("Deaktivieren") {
                                 state.deactivateModel(model)
@@ -7485,13 +8016,29 @@ struct ModelsView: View {
                         }
                     } else {
                         if state.pausedModelID == model.id {
-                            Button("Fortsetzen") { state.installModel(model) }
+                            Button("Fortsetzen") {
+                                state.installModel(
+                                    model,
+                                    activateAfterInstall:
+                                        model.descriptor.kind == .documentVision
+                                )
+                            }
                                 .buttonStyle(.borderedProminent)
                             Button("Verwerfen", role: .destructive) {
                                 state.discardPausedDownload()
                             }
                         } else {
-                            Button("Herunterladen") { state.installModel(model) }
+                            Button(
+                                model.descriptor.kind == .documentVision
+                                    ? "Herunterladen und aktivieren"
+                                    : "Herunterladen"
+                            ) {
+                                state.installModel(
+                                    model,
+                                    activateAfterInstall:
+                                        model.descriptor.kind == .documentVision
+                                )
+                            }
                             .buttonStyle(.borderedProminent)
                             .disabled(
                                 state.downloadingModelID != nil
@@ -7516,6 +8063,10 @@ struct ModelsView: View {
             return state.isAnswerModelLoaded
                 ? "Aktiv · geladen"
                 : "Aktiv · bei Bedarf laden"
+        case .documentVision:
+            return state.isDocumentVisionModelLoaded
+                ? "Aktiv · geladen"
+                : "Aktiv · bei Bedarf laden"
         }
     }
 
@@ -7527,7 +8078,7 @@ struct ModelsView: View {
         case .experimental: ("Experimentell", .orange)
         case .incompatible: ("Nicht kompatibel", .red)
         }
-        Text(title)
+        Text(LocalizedStringKey(title))
             .font(.caption.bold())
             .foregroundStyle(color)
             .padding(.horizontal, 8)
@@ -7756,15 +8307,9 @@ struct SettingsView: View {
             }
             Section("Crashberichte") {
                 Toggle(
-                    "Crashberichte automatisch über Apple Mail senden",
+                    "Bereinigte Crashberichte automatisch an den Findora-Support senden",
                     isOn: $state.automaticCrashReportsEnabled
                 )
-                TextField(
-                    "Empfängeradresse",
-                    text: $state.crashReportRecipient
-                )
-                .textContentType(.emailAddress)
-                .disableAutocorrection(true)
                 LabeledContent("Status") {
                     Text(state.crashReportStatusText)
                         .foregroundStyle(
@@ -7783,13 +8328,13 @@ struct SettingsView: View {
                     )
                 }
                 Text(
-                    "Nach einem ungeplanten App-Ende wird beim nächsten Start ein bereinigter Bericht über die lokal konfigurierte Apple-Mail-App gesendet. macOS kann beim ersten Versand nach der Erlaubnis für Apple Mail fragen. Dokumentinhalte, Suchanfragen und vollständige private Pfade werden nicht übertragen."
+                    "Nach einem ungeplanten App-Ende wird beim nächsten Start ein bereinigter Bericht über die lokal konfigurierte Apple-Mail-App an den Findora-Support gesendet. macOS kann beim ersten Versand nach der Erlaubnis für Apple Mail fragen. Enthalten sind App- und Build-Version, macOS- und Hardwaredaten, Laufzeit, ein bereinigter macOS-Diagnoseauszug und die letzten technischen Findora-Protokolle. Dokumentinhalte, Suchanfragen, OCR-Texte, Dateinamen und vollständige private Pfade werden nicht übertragen."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
             Section("Datenschutz") {
-                Text("Dokumente, Suchanfragen, Embeddings und Antworten bleiben lokal. Es gibt keine allgemeine Telemetrie. Nur ausdrücklich aktivierte, bereinigte Crashberichte werden über Apple Mail versendet.")
+                Text("Dokumente, Suchanfragen, Embeddings und Antworten bleiben lokal. Es gibt keine allgemeine Telemetrie. Der automatische Versand bereinigter Crashberichte an den Findora-Support ist standardmäßig aktiviert und kann hier jederzeit deaktiviert werden.")
                     .foregroundStyle(.secondary)
             }
             Section("Indexwartung") {

@@ -58,6 +58,16 @@ public enum FindoraRuntimeEnvironment {
             .appending(path: "Findora", directoryHint: .isDirectory)
     }
 
+    public static func temporaryRoot(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> URL {
+        if let root = testRoot(environment: environment, fileManager: fileManager) {
+            return root.appending(path: "Temporary", directoryHint: .isDirectory)
+        }
+        return fileManager.temporaryDirectory
+    }
+
     public static func userDefaults(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default

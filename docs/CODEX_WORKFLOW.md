@@ -37,6 +37,16 @@ Verbindlich:
   mit GitHub synchronisiertes Ergebnis beauftragt hat.
 - Sicherheits- und Architekturvorgaben aus `AGENTS.md` beachten.
 - Bei größeren Änderungen Dokumentation aktualisieren.
+- GUI- und Smoke-Tests nur mit einer `FINDORA_TEST_ROOT` unter dem echten
+  macOS-`$TMPDIR` starten und vor der ersten UI-Aktion per `lsof` bestätigen,
+  dass keine produktive oder benutzerdefinierte Findora-Datenbank geöffnet ist.
+- Nach einem unbeabsichtigten produktiven Zugriff gelten die
+  Fortsetzungsregeln aus `AGENTS.md`: sofort stoppen, read-only auswerten und
+  den Vorfall dokumentieren. Bei ausschließlich begrenzten technischen
+  Metadatenänderungen und fehlerfreien SQLite-Prüfungen darf Codex ohne
+  Rückfrage fortfahren sowie einen bereits autorisierten Commit und Push
+  abschließen; inhaltliche oder unklare Änderungen erfordern weiterhin eine
+  ausdrückliche Nutzerentscheidung.
 
 ---
 

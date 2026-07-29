@@ -22,11 +22,32 @@ Diese Datei gilt für alle Arbeiten im Repository.
   Auswahl oder einem echten Fallback-Bedarf auflösen.
 - Produktive App-Daten unter `~/Library/Application Support/Findora` und
   `~/Library/Logs/Findora` nicht für Tests verwenden, migrieren oder löschen.
+- Isolierte App-Starts müssen `FINDORA_TEST_ROOT` auf ein mit
+  `mktemp -d "${TMPDIR%/}/Findora-Tests.XXXXXX"` erzeugtes Verzeichnis unter
+  dem echten macOS-Temporärverzeichnis setzen. Vor der ersten UI-Aktion ist
+  mit `lsof` nachzuweisen, dass weder ein produktiver noch ein benutzerdefiniert
+  konfigurierter Daten- oder Modellpfad geöffnet wurde. `/tmp` darf nicht
+  ungeprüft verwendet werden, weil Findora absichtlich nur den von
+  `FileManager.temporaryDirectory` gelieferten Teilbaum als Testwurzel
+  akzeptiert.
+- Falls trotz dieser Schutzmaßnahmen unbeabsichtigt ein produktiver oder
+  benutzerdefinierter Findora-Pfad geöffnet wurde, den betreffenden Prozess
+  sofort beenden und die Auswirkung read-only prüfen. Codex darf danach ohne
+  erneute Nutzerfreigabe weiterarbeiten, committen und einen bereits
+  autorisierten Push ausführen, wenn nachweislich nur automatisch erzeugte
+  technische Metadaten betroffen sind (beispielsweise Integritätszeitstempel
+  von Modellen oder SQLite-WAL-/SHM-Verwaltung), `quick_check`,
+  `integrity_check` und die Fremdschlüsselprüfung fehlerfrei sind und keine
+  Dokument-, OCR-, Such-, Mail-, Bookmark- oder Einstellungsdaten geändert
+  wurden. Der Vorfall und die Prüfergebnisse müssen im Abschlussbericht stehen.
+  Bei inhaltlichen, nicht eindeutig begrenzbaren oder destruktiven Änderungen
+  bleibt eine neue ausdrückliche Nutzerentscheidung erforderlich.
 - Keine allgemeine Telemetrie, Cloud-KI oder automatische externe Übertragung
-  ergänzen. Einzige ausdrücklich freigegebene Ausnahme sind vom Nutzer in den
-  Einstellungen aktivierte, lokal bereinigte Crashberichte über Apple Mail;
-  sie dürfen keine Dokumentinhalte, Suchanfragen oder vollständigen privaten
-  Pfade enthalten.
+  ergänzen. Einzige ausdrücklich freigegebene Ausnahme sind lokal bereinigte
+  Crashberichte über Apple Mail an den fest konfigurierten Findora-Support.
+  Diese Funktion ist standardmäßig aktiviert, in den Einstellungen jederzeit
+  abschaltbar und darf keine Dokumentinhalte, Suchanfragen, OCR-Texte,
+  Dateinamen oder vollständigen privaten Pfade enthalten.
 - Die Modulgrenzen aus `ARCHITECTURE.md`, die Schutzregeln aus `SECURITY.md`
   und die Datenschutzregeln aus `PRIVACY.md` einhalten.
 

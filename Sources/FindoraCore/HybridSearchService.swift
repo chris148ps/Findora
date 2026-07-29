@@ -135,8 +135,18 @@ public actor HybridSearchService {
         let evidence = try await database.searchEvidence(
             documentIDs: Set(viable.map(\.source.documentID))
         )
+        let queryTerms = Self.searchTerms(
+            query: trimmed,
+            plan: plan
+        )
         let ranked = viable.compactMap { candidate in
-            Self.rerank(candidate, plan: plan, evidence: evidence[candidate.source.documentID])
+            Self.rerank(
+                candidate,
+                plan: plan,
+                query: trimmed,
+                queryTerms: queryTerms,
+                evidence: evidence[candidate.source.documentID]
+            )
         }.sorted {
             if $0.relevance != $1.relevance {
                 return Self.relevanceOrder($0.relevance) < Self.relevanceOrder($1.relevance)
@@ -146,17 +156,23 @@ public actor HybridSearchService {
 
         var direct: [SearchSource] = []
         var possible: [SearchSource] = []
-        var directDocuments: Set<Int64> = []
-        var possibleDocuments: Set<Int64> = []
+        var directPages: Set<String> = []
+        var possiblePages: Set<String> = []
+        var pagesPerDocument: [Int64: Int] = [:]
         for source in ranked {
+            let pageKey = "\(source.documentID)#\(source.pageNumber)"
             switch source.relevance {
             case .veryRelevant, .relevant:
                 guard direct.count < limit,
-                      directDocuments.insert(source.documentID).inserted else { continue }
+                      directPages.insert(pageKey).inserted,
+                      pagesPerDocument[source.documentID, default: 0] < 4 else {
+                    continue
+                }
                 direct.append(source)
+                pagesPerDocument[source.documentID, default: 0] += 1
             case .possiblyRelevant:
                 guard possible.count < min(6, limit),
-                      possibleDocuments.insert(source.documentID).inserted else { continue }
+                      possiblePages.insert(pageKey).inserted else { continue }
                 possible.append(source)
             }
         }
@@ -176,6 +192,8 @@ public actor HybridSearchService {
     private static func rerank(
         _ candidate: Candidate,
         plan: SearchPlan,
+        query: String,
+        queryTerms: [String],
         evidence: DocumentSearchEvidence?
     ) -> SearchSource? {
         guard let evidence, !evidence.chunks.isEmpty else { return nil }
@@ -205,8 +223,11 @@ public actor HybridSearchService {
                 ? matchedTopics.count == plan.topics.count
                 : !matchedTopics.isEmpty)
 
-        let scoringTerms = hardTerms + plan.topics + plan.optionalTerms
-        let bestChunk = evidence.chunks.max { lhs, rhs in
+        let scoringTerms = queryTerms + hardTerms + plan.topics + plan.optionalTerms
+        let pageChunks = evidence.chunks.filter {
+            $0.pageNumber == candidate.source.pageNumber
+        }
+        let bestChunk = (pageChunks.isEmpty ? evidence.chunks : pageChunks).max { lhs, rhs in
             matchCount(scoringTerms, in: lhs.text) < matchCount(scoringTerms, in: rhs.text)
         } ?? evidence.chunks[0]
         let hardInBestChunk = hardTerms.filter {
@@ -219,7 +240,14 @@ public actor HybridSearchService {
         let sameChunk = (hardTerms.isEmpty || hardInBestChunk.count == hardTerms.count)
             && (plan.topics.isEmpty || topicsInBestChunk.count == plan.topics.count)
 
+        let phraseInText = containsPhrase(query, in: bestChunk.text)
+        let phraseInFileName = containsPhrase(query, in: fileName)
+        let matchedQueryTerms = queryTerms.filter {
+            contains($0, in: bestChunk.text) || contains($0, in: fileName)
+        }
         let hasExactEvidence = candidate.lexicalRank != nil
+            || phraseInText
+            || phraseInFileName
         let semanticScore = candidate.semanticScore ?? -1
         let relevance: SearchRelevance
         if topicsSatisfied {
@@ -259,6 +287,15 @@ public actor HybridSearchService {
         var score = candidate.combinedScore
         if sameChunk { score += 0.02 }
         score += Double(matchedHardTerms.count + matchedTopics.count) * 0.005
+        if phraseInText { score += 0.16 }
+        if phraseInFileName { score += 0.20 }
+        if matchedQueryTerms.count == queryTerms.count, !queryTerms.isEmpty {
+            score += 0.08
+        }
+        if queryTerms.contains(where: isIdentifierLike),
+           matchedQueryTerms.contains(where: isIdentifierLike) {
+            score += 0.18
+        }
         if bestChunk.ocrQuality == OCRQualityStatus.likelyFailed.rawValue {
             score -= 0.01
         }
@@ -275,6 +312,7 @@ public actor HybridSearchService {
             relevance: relevance,
             matchedEntities: matchedEntities,
             matchedTopics: matchedTopics,
+            matchedTerms: matchedQueryTerms,
             reason: reason,
             ocrQuality: bestChunk.ocrQuality,
             textSource: bestChunk.textSource,
@@ -325,6 +363,40 @@ public actor HybridSearchService {
         return text.range(
             of: pattern,
             options: [.regularExpression, .caseInsensitive, .diacriticInsensitive]
+        ) != nil
+    }
+
+    private static func containsPhrase(_ phrase: String, in text: String) -> Bool {
+        let normalizedPhrase = phrase
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedText = text
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        return !normalizedPhrase.isEmpty && normalizedText.contains(normalizedPhrase)
+    }
+
+    private static func searchTerms(
+        query: String,
+        plan: SearchPlan
+    ) -> [String] {
+        var seen: Set<String> = []
+        return (plan.hardTerms + plan.topics + plan.retrievalTerms + [
+            query.trimmingCharacters(in: .whitespacesAndNewlines)
+        ]).filter {
+            !$0.isEmpty
+                && seen.insert($0.folding(
+                    options: [.caseInsensitive, .diacriticInsensitive],
+                    locale: .current
+                )).inserted
+        }
+    }
+
+    private static func isIdentifierLike(_ value: String) -> Bool {
+        value.range(
+            of: #"(?=.*\d)[\p{L}\p{N}][\p{L}\p{N}./:+_-]{3,}"#,
+            options: .regularExpression
         ) != nil
     }
 

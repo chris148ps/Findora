@@ -108,6 +108,22 @@ Der Modellkatalog pinnt Modell-ID, Revision, Dateiliste und SHA-256-Werte.
 Ein Modellwechsel erzeugt einen neuen Indexstand. Der alte Index bleibt bis
 zum erfolgreichen Neuaufbau aktiv.
 
+Für die optionale optische Dokumenteskalation ist GLM-OCR 4 Bit als eigener
+`documentVision`-Modelltyp gepinnt. Die native MLX-VLM-Laufzeit vermeidet eine
+zweite Python-/Paddle-Installation. Das rund 1,25-GB-Modell ist für die
+seitenweise Ausführung auf 8-GB-Apple-Silicon vorgesehen, wird nur nach
+Nutzeraktion geladen und darf ausschließlich Textvorschläge und
+Klassifikationen liefern. PDFKit und die mehrstufige Vision-OCR bleiben immer
+vorgeschaltet.
+
+PaddleOCR/PP-StructureV3 wurde als dokumentorientierte Alternative geprüft,
+aber nicht als zusätzliche Laufzeit eingebaut: Die bestehende native
+Swift-/MLX-Auslieferung unterstützt GLM-OCR direkt, während Paddle eine zweite
+Python-/Paddle-Laufzeit und ein zusätzliches Paketierungs- und
+Speichermanagement erfordern würde. Die Auswahl vermeidet diese parallele
+Runtime auf 8-GB-Macs, ohne die lokale, dokumentorientierte Eskalationsstufe
+oder die vorgeschalteten Qualitätsprüfungen aufzugeben.
+
 ## Antwortmodelle
 
 Der Erstkatalog enthält nur explizit geprüfte MLX-Modelle:

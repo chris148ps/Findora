@@ -284,6 +284,83 @@
           "checksumSHA256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
         }
       ]
+    },
+    {
+      "id": "mlx-community/GLM-OCR-4bit",
+      "kind": "documentVision",
+      "displayName": "GLM-OCR (4 Bit)",
+      "family": "GLM-OCR Dokumentmodell",
+      "parameters": "0.9B",
+      "quantization": "4bit",
+      "backend": "mlx-vlm",
+      "downloadSizeBytes": 1254095421,
+      "estimatedRuntimeRAMBytes": 2415919104,
+      "minimumSystemRAMBytes": 8589934592,
+      "recommendedSystemRAMBytes": 8589934592,
+      "defaultContextLength": 1024,
+      "maximumContextLength": 2048,
+      "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/tree/97f587506984cc92fa69b2694b4128e53db6b081",
+      "checksumSHA256": "99f17e403d0383870c03c03dd7ca4dc1fad3a4bfa8aee2f751b43665ea1fbc10",
+      "licenseName": "MIT",
+      "licenseURL": "https://huggingface.co/zai-org/GLM-OCR/blob/main/LICENSE",
+      "modelVersion": "97f587506984cc92fa69b2694b4128e53db6b081",
+      "repositoryID": "mlx-community/GLM-OCR-4bit",
+      "files": [
+        {
+          "relativePath": "chat_template.jinja",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/chat_template.jinja",
+          "sizeBytes": 4606,
+          "checksumSHA256": "062e7ee4cc8defa88a5938b5d456dc60366ffd80647f918946ee747bf09ddc7c"
+        },
+        {
+          "relativePath": "config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/config.json",
+          "sizeBytes": 2080,
+          "checksumSHA256": "c5c23ce928b8ccd72468c36de821a4132091e7bfc8dc3011e4349acafa63b72a"
+        },
+        {
+          "relativePath": "generation_config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/generation_config.json",
+          "sizeBytes": 165,
+          "checksumSHA256": "4e2a3412f65b2a21d315d928986c55723d3e60dfb92c3982a5b9fd56835b0aa5"
+        },
+        {
+          "relativePath": "model.safetensors",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/model.safetensors",
+          "sizeBytes": 1247191941,
+          "checksumSHA256": "089e0339fcbc0fbf2225c3bd1cd94c6b4d49fdb3b1adfbb35ea22eb60b2afc95"
+        },
+        {
+          "relativePath": "model.safetensors.index.json",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/model.safetensors.index.json",
+          "sizeBytes": 55990,
+          "checksumSHA256": "191dea2bf69e8d0ec156ce87be21044ae28a1dd6a3418a35b2df4b36478daa39"
+        },
+        {
+          "relativePath": "preprocessor_config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/preprocessor_config.json",
+          "sizeBytes": 367,
+          "checksumSHA256": "02cc50c36240882ae35e8cd4077a25a379664108185d728d261cb785aefeccff"
+        },
+        {
+          "relativePath": "processor_config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/processor_config.json",
+          "sizeBytes": 597,
+          "checksumSHA256": "19dafea5bd6415c50e2da43a31583dab39f9496673260ad33d9fa6c638a1d077"
+        },
+        {
+          "relativePath": "tokenizer.json",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/tokenizer.json",
+          "sizeBytes": 6838609,
+          "checksumSHA256": "aa0fd058c73a5718bb191f6672dc16d122ee0147b20c123d1726514298f9968a"
+        },
+        {
+          "relativePath": "tokenizer_config.json",
+          "downloadURL": "https://huggingface.co/mlx-community/GLM-OCR-4bit/resolve/97f587506984cc92fa69b2694b4128e53db6b081/tokenizer_config.json",
+          "sizeBytes": 1066,
+          "checksumSHA256": "7a76fcb27abbc2cb0249d81884fef972b2c27194e3e13db54baae50f58f141fb"
+        }
+      ]
     }
   ]
 }

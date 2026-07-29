@@ -418,7 +418,9 @@ public actor MailImportService {
     private func extractPDFPages(
         _ attachment: ParsedMailAttachment
     ) async throws -> [ExtractedPage] {
-        let directory = fileManager.temporaryDirectory.appending(
+        let directory = FindoraRuntimeEnvironment.temporaryRoot(
+            fileManager: fileManager
+        ).appending(
             path: "Findora-mail-attachment-\(UUID().uuidString)",
             directoryHint: .isDirectory
         )

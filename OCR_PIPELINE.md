@@ -97,22 +97,19 @@ exponentielles Backoff.
 
 ## Textschichtprüfung
 
-PDFKit extrahiert seitenweise Text. Eine brauchbare Textschicht liegt vor,
-wenn mindestens eine der folgenden Bedingungen erfüllt ist:
-
-- im Dokument mindestens 80 druckbare Zeichen vorhanden sind; oder
-- mindestens 70 % der nichtleeren Seiten jeweils mindestens 20 druckbare
-  Zeichen enthalten.
-
-Gemischte PDFs werden mit `--skip-text` verarbeitet, wenn mindestens eine
-Seite die Schwelle klar unterschreitet. Vollständig brauchbare PDFs werden
-nicht an OCRmyPDF übergeben.
+PDFKit bewertet jede Seite einzeln. Neben bereinigter Zeichen- und Wortzahl
+fließen plausible Wörter, Buchstaben-/Zahlenanteil, Steuer- und Ersatzzeichen,
+wiederholte Artefakte, Einzeichenfragmentierung und eine tatsächlich
+erzeugbare PDFKit-Selektion ein. Kurze Identifikationsnummern können brauchbar
+sein; lange Zeichenmüll-Schichten werden abgelehnt. Gemischte PDFs behalten
+brauchbare native Seiten, während nur die übrigen Seiten OCR erhalten.
 
 ## Dokumentidentität und OCR-Modi
 
 Der Index speichert die tatsächlich verwendete Textquelle seitenweise.
-Gemischte PDFs behalten vorhandene Seiten als `extracted`; nur akzeptierte
-OCR-Seiten erhalten `ocr`. Dadurch zählt ein gemischtes PDF einmal als
+Gemischte PDFs behalten vorhandene Seiten als `nativePDF`; akzeptierte
+OCR-Seiten erhalten `visionOCR`, `postprocessedOCR` oder `verifiedOCR`.
+Manuelle und optische Modelltexte bleiben als eigene Quelle erkennbar. Dadurch zählt ein gemischtes PDF einmal als
 **Durch OCR ergänzt**, während PDF- und OCR-Seiten getrennt aggregiert werden.
 Retry-Versuche bleiben Diagnosezeilen und erhöhen keine Erfolgszähler.
 
@@ -164,12 +161,14 @@ des gewählten Ordners und nur nach Alters-/Jobabgleich entfernt.
 7. verfügbare alternative Engine;
 8. 400 dpi mit Kontrastkorrektur.
 
-Pro Problemseite gelten höchstens acht Versuche und 120 Sekunden
-Gesamtlaufzeit. Vor jedem Versuch werden Abbruch und Zeitlimit geprüft.
+Pro Problemseite gelten mindestens drei unterschiedliche, höchstens acht
+Versuche und 120 Sekunden Gesamtlaufzeit. Vor jedem Versuch werden Abbruch
+und Zeitlimit geprüft.
 Hochauflösende Versuche laufen global einzeln; jede Konfiguration erzwingt
 Parallelität 1. Ein Fehler beendet nicht die gesamte Folge. Identische
-Strategie-IDs werden nur einmal ausgeführt. Die Nachbearbeitung betrifft nur
-das aktuelle Problemdokument; bei manueller Prüfung wird ausschließlich die
+Strategie-IDs werden nur einmal ausgeführt. Ein erster formal akzeptabler Text
+beendet die Folge erst nach den Mindestversuchen. Die Nachbearbeitung betrifft
+nur das aktuelle Problemdokument; bei manueller Prüfung wird ausschließlich die
 Zielseite gespeichert und neu indexiert, nie der gesamte Bestand.
 
 ## Qualitätsprüfung und Übernahme
@@ -183,7 +182,7 @@ fehlgeschlagen“. Tesseract liefert seine Konfidenz über TSV, Vision über
 erkannte Textbeobachtungen; beide durchlaufen denselben `OCRQualityEvaluator`
 und `OCRQualityScorer`.
 
-Nur Text über der zentralen Schwelle (standardmäßig 0,68), mit mindestens acht
+Nur Text über der zentralen Schwelle (standardmäßig 0,50), mit mindestens acht
 Zeichen, zwei Wörtern und ohne offensichtlichen Fehlschlag wird automatisch
 übernommen. Die beste bisherige Variante gewinnt; der letzte Versuch hat keine
 Sonderstellung. Unsichere Varianten werden mit Strategie, Engine, Aufbereitung,

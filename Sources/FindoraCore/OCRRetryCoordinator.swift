@@ -2,15 +2,21 @@ import Foundation
 
 public struct OCRRetryPolicy: Equatable, Sendable {
     public let maximumAttempts: Int
+    public let minimumAttempts: Int
     public let maximumDuration: Duration
     public let automaticAcceptanceScore: Double
 
     public init(
         maximumAttempts: Int = 8,
+        minimumAttempts: Int = 3,
         maximumDuration: Duration = .seconds(120),
         automaticAcceptanceScore: Double = 0.50
     ) {
         self.maximumAttempts = min(8, max(1, maximumAttempts))
+        self.minimumAttempts = min(
+            self.maximumAttempts,
+            max(1, minimumAttempts)
+        )
         self.maximumDuration = maximumDuration
         self.automaticAcceptanceScore = min(1, max(0, automaticAcceptanceScore))
     }
@@ -199,6 +205,7 @@ public struct OCRAttemptRecord: Equatable, Sendable {
     public let qualityScore: Double
     public let duration: Duration
     public let completedAt: Date
+    public let textBoxes: [OCRTextBox]
 
     public init(
         pageNumber: Int,
@@ -208,7 +215,8 @@ public struct OCRAttemptRecord: Equatable, Sendable {
         quality: OCRPageQuality,
         qualityScore: Double,
         duration: Duration,
-        completedAt: Date
+        completedAt: Date,
+        textBoxes: [OCRTextBox] = []
     ) {
         self.pageNumber = pageNumber
         self.strategy = strategy
@@ -218,6 +226,7 @@ public struct OCRAttemptRecord: Equatable, Sendable {
         self.qualityScore = qualityScore
         self.duration = duration
         self.completedAt = completedAt
+        self.textBoxes = textBoxes
     }
 }
 
@@ -274,6 +283,16 @@ public struct OCRQualityScorer: Sendable {
             of: #"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4,})\b"#,
             options: .regularExpression
         ) != nil ? 0.03 : 0
+        let tokens = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        let plausibleTokens = tokens.count(where: Self.isPlausibleToken)
+        let plausibleWordRatio = tokens.isEmpty
+            ? 0
+            : Double(plausibleTokens) / Double(tokens.count)
+        let fragmentedRatio = tokens.isEmpty
+            ? 0
+            : Double(tokens.count(where: { $0.count == 1 })) / Double(tokens.count)
+        let wordPlausibility = min(0.16, plausibleWordRatio * 0.16)
+        let fragmentationPenalty = min(0.20, max(0, fragmentedRatio - 0.30))
         return min(
             1,
             max(
@@ -283,9 +302,11 @@ public struct OCRQualityScorer: Sendable {
                     + wordScore * 0.25
                     + (quality.status == .good ? 0.10 : 0)
                     + plausibleNumberBonus
+                    + wordPlausibility
                     - unusualPenalty
                     - brokenPenalty
                     - repeatedArtifacts
+                    - fragmentationPenalty
             )
         )
     }
@@ -301,6 +322,36 @@ public struct OCRQualityScorer: Sendable {
             && quality.wordCount >= 2
             && quality.status != .likelyFailed
             && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && Self.plausibleWordRatio(text) >= 0.42
+    }
+
+    private static func plausibleWordRatio(_ text: String) -> Double {
+        let tokens = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !tokens.isEmpty else { return 0 }
+        return Double(tokens.count(where: isPlausibleToken)) / Double(tokens.count)
+    }
+
+    private static func isPlausibleToken(_ token: String) -> Bool {
+        let trimmed = token.trimmingCharacters(in: .punctuationCharacters)
+        guard !trimmed.isEmpty else { return false }
+        let scalars = trimmed.unicodeScalars
+        let alphanumeric = scalars.count {
+            $0.properties.isAlphabetic || $0.properties.numericType != nil
+        }
+        guard alphanumeric >= max(2, trimmed.count * 2 / 3) else {
+            return false
+        }
+        if trimmed.allSatisfy(\.isNumber) {
+            return trimmed.count >= 2
+        }
+        if scalars.count(where: \.properties.isAlphabetic) >= 3 {
+            let vowels = CharacterSet(
+                charactersIn: "aeiouyäöüAEIOUYÄÖÜ"
+            )
+            return scalars.contains(where: vowels.contains)
+                || scalars.contains(where: { $0.properties.numericType != nil })
+        }
+        return true
     }
 }
 
@@ -370,7 +421,11 @@ public struct OCRRetryCoordinator: Sendable {
                 let texts = Dictionary(uniqueKeysWithValues: result.pages.map {
                     ($0.pageNumber, $0.text)
                 })
-                for quality in result.pageQualities {
+                let boxes = Dictionary(grouping: result.textBoxes, by: \.pageNumber)
+                for quality in result.pageQualities where
+                    baseConfiguration.targetPageNumbers?.contains(
+                        quality.pageNumber
+                    ) ?? true {
                     let text = texts[quality.pageNumber] ?? ""
                     let score = scorer.score(quality, text: text)
                     let record = OCRAttemptRecord(
@@ -381,7 +436,8 @@ public struct OCRRetryCoordinator: Sendable {
                         quality: quality,
                         qualityScore: score,
                         duration: duration,
-                        completedAt: result.completedAt
+                        completedAt: result.completedAt,
+                        textBoxes: boxes[quality.pageNumber] ?? []
                     )
                     attempts.append(record)
                     if best[quality.pageNumber].map({
@@ -406,7 +462,8 @@ public struct OCRRetryCoordinator: Sendable {
             let relevantPages = pageAnalyses.filter {
                 $0.status != .safelyEmpty
             }.map(\.pageNumber)
-            if !relevantPages.isEmpty,
+            if completedAttempts >= policy.minimumAttempts,
+               !relevantPages.isEmpty,
                relevantPages.allSatisfy({ page in
                    guard let record = best[page] else { return false }
                    return scorer.isAutomaticallyAcceptable(
@@ -431,7 +488,14 @@ public struct OCRRetryCoordinator: Sendable {
         let pages = best.values.sorted(by: {
             $0.pageNumber < $1.pageNumber
         }).map {
-            ExtractedPage(pageNumber: $0.pageNumber, text: $0.text)
+            ExtractedPage(
+                pageNumber: $0.pageNumber,
+                text: $0.text,
+                source: $0.strategy.id == "standard"
+                    ? ($0.engine == .appleVision ? .visionOCR : .verifiedOCR)
+                    : .postprocessedOCR,
+                qualityScore: $0.qualityScore
+            )
         }
         let qualities = best.values.sorted(by: {
             $0.pageNumber < $1.pageNumber
@@ -450,6 +514,7 @@ public struct OCRRetryCoordinator: Sendable {
                 engine: dominantEngine ?? $0.engine,
                 duration: started.duration(to: .now),
                 messages: $0.messages,
+                textBoxes: best.values.flatMap(\.textBoxes),
                 completedAt: .now
             )
         }

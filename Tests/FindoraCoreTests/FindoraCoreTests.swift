@@ -16,8 +16,22 @@ func temporaryFileNamesAreIgnored() {
 
 @Test
 func abandonedOCRTemporaryFilesAreRemovedConservatively() throws {
-    let root = temporaryTestDirectory()
-    defer { try? FileManager.default.removeItem(at: root) }
+    let environment = ProcessInfo.processInfo.environment
+    let persistentRoot = environment["FINDORA_DOCUMENT_VISION_TEST_ROOT"].map {
+        URL(filePath: $0, directoryHint: .isDirectory)
+    }
+    let root = persistentRoot ?? temporaryTestDirectory()
+    defer {
+        if persistentRoot == nil {
+            try? FileManager.default.removeItem(at: root)
+        }
+    }
+    if persistentRoot != nil {
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+    }
     let oldTemporary = root.appending(path: ".findora-ocr-old.pdf")
     let recentTemporary = root.appending(path: ".findora-ocr-recent.pdf")
     let unrelated = root.appending(path: ".other-temp.pdf")
@@ -458,7 +472,7 @@ func configuredParallelOCRProcessesMoreThanOneFileAtOnce() async throws {
 @Test
 func bundledModelCatalogIsPinnedAndFitsEightGigabyteProfile() throws {
     let catalog = try ModelCatalog.bundled()
-    #expect(catalog.models.count == 4)
+    #expect(catalog.models.count == 5)
     #expect(catalog.models.allSatisfy { !$0.files.isEmpty })
     #expect(catalog.models.allSatisfy { $0.files.allSatisfy { $0.checksumSHA256.count == 64 } })
 
@@ -471,9 +485,13 @@ func bundledModelCatalogIsPinnedAndFitsEightGigabyteProfile() throws {
     let compact = try #require(catalog.models.first { $0.id.contains("1.7B") })
     let larger = try #require(catalog.models.first { $0.id.contains("4B-4bit") })
     let experimental = try #require(catalog.models.first { $0.id.contains("8B-4bit") })
+    let documentVision = try #require(
+        catalog.models.first { $0.kind == .documentVision }
+    )
     #expect(profile.compatibility(for: compact) == .recommended)
     #expect(profile.compatibility(for: larger) == .compatible)
     #expect(profile.compatibility(for: experimental) == .experimental)
+    #expect(profile.compatibility(for: documentVision) == .recommended)
 }
 
 @Test
@@ -535,6 +553,18 @@ func ruleBasedSearchPlanRecognizesNicoAndTrainingAsMandatoryContext() throws {
     )
     #expect(!independent.requiredEntities.contains("Nico"))
     #expect(independent.topics.contains("Rechnung"))
+}
+
+@Test
+func ruleBasedSearchPlanPreservesLongHyphenatedIdentifiers() {
+    let planner = RuleBasedSearchPlanner()
+
+    let rotation = planner.plan(query: "ROTATION-270")
+    let invoice = planner.plan(query: "RECHNUNG-2026-4711")
+
+    #expect(rotation.requiredEntities.contains("ROTATION-270"))
+    #expect(!rotation.requiredEntities.contains("ROTATION-"))
+    #expect(invoice.requiredEntities.contains("RECHNUNG-2026-4711"))
 }
 
 @Test
@@ -629,7 +659,7 @@ func mandatoryEntityFilteringAndRerankingExcludeUnrelatedDocuments() async throw
     #expect(outcome.directMatches.count < 10)
     #expect(outcome.directMatches.allSatisfy { $0.matchedEntities.contains("Nico") })
     #expect(outcome.directMatches.allSatisfy { !$0.reason.isEmpty })
-    #expect(outcome.directMatches.allSatisfy { $0.textSource == "extracted" })
+    #expect(outcome.directMatches.allSatisfy { $0.textSource == "nativePDF" })
 
     let sameChunk = try #require(outcome.directMatches.first {
         $0.fileName == "Ausbildungsvertrag Nico.pdf"
@@ -698,7 +728,7 @@ func mandatoryNameEvidenceWorksForOCRText() async throws {
     let source = try #require(outcome.directMatches.first)
     #expect(source.matchedEntities == ["Nico"])
     #expect(source.matchedTopics == ["Ausbildung"])
-    #expect(source.textSource == "ocr")
+    #expect(source.textSource == "visionOCR")
     #expect(source.ocrQuality == OCRQualityStatus.good.rawValue)
 }
 
@@ -1107,6 +1137,9 @@ func persistentStatusEventsAndSnapshotsTrackLiveProcessing() async throws {
     )
     status = try await database.statistics()
     #expect(status.currentOCREngine == OCREngine.appleVision.displayName)
+    try await database.saveScan(files: files, root: root)
+    status = try await database.statistics()
+    #expect(status.currentOCREngine == OCREngine.appleVision.displayName)
     try await database.updateJob(
         path: failing.path,
         state: .failed,
@@ -1273,6 +1306,79 @@ func realMLXAnswerModelCanDownloadValidateAndGenerateWhenRequested() async throw
     )
     try await generator.test()
     await generator.unload()
+}
+
+@Test(.timeLimit(.minutes(20)))
+func realMLXDocumentVisionModelCanDownloadValidateAndAnalyzeWhenRequested() async throws {
+    guard ProcessInfo.processInfo.environment[
+        "FINDORA_RUN_DOCUMENT_VISION_TESTS"
+    ] == "1" else {
+        return
+    }
+    let root = temporaryTestDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let paths = try AppPaths(
+        applicationSupport: root.appending(path: "Support"),
+        logs: root.appending(path: "Logs")
+    )
+    let descriptor = try #require(
+        try ModelCatalog.bundled().models.first {
+            $0.kind == .documentVision
+        }
+    )
+    let manager = LocalModelManager(
+        catalog: try ModelCatalog.bundled(),
+        paths: paths
+    )
+    let profile = HardwareProfile(
+        isAppleSilicon: true,
+        chipName: "Integrationstest",
+        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+        availableStorageBytes: 10_000_000_000
+    )
+    let directory: URL
+    if let installed = await manager.installedDirectory(
+        modelID: descriptor.id
+    ) {
+        directory = installed
+    } else {
+        directory = try await manager.install(
+            modelID: descriptor.id,
+            profile: profile,
+            validation: { directory, descriptor in
+                let analyzer = MLXDocumentVisionAnalyzer(
+                    modelID: descriptor.id,
+                    modelVersion: descriptor.modelVersion,
+                    directory: directory,
+                    contextLength: descriptor.defaultContextLength
+                )
+                try await analyzer.test()
+                await analyzer.unload()
+            }
+        ) { _ in }
+    }
+    let pdf = root.appending(path: "GLM-OCR-Pruefung.pdf")
+    try createImagePDF(
+        at: pdf,
+        text: "GLM OCR PRUEFUNG MODELL 2026"
+    )
+    let analyzer = MLXDocumentVisionAnalyzer(
+        modelID: descriptor.id,
+        modelVersion: descriptor.modelVersion,
+        directory: directory,
+        contextLength: descriptor.defaultContextLength
+    )
+
+    let analysis = try await analyzer.analyzePage(
+        fileURL: pdf,
+        pageNumber: 1,
+        timeout: .seconds(120)
+    )
+
+    #expect(analysis.classification == .textRecovered)
+    #expect(analysis.proposedText.contains("2026"))
+    #expect(analysis.confidence >= 0.58)
+    await analyzer.unload()
 }
 
 private func temporaryTestDirectory() -> URL {
