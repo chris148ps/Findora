@@ -5,9 +5,16 @@ Diese Datei gilt für alle Arbeiten im Repository.
 ## Vor jedem Auftrag
 
 1. `AGENTS.md` und `docs/CODEX_WORKFLOW.md` vollständig lesen.
-2. `git status`, den aktuellen Branch und `git pull --ff-only` prüfen.
-3. Die für den Auftrag relevanten Fach- und Sicherheitsdokumente lesen.
-4. Vorhandene Nutzeränderungen erhalten und den Auftrag möglichst klein halten.
+2. `docs/FINDORA_MASTER_SPECIFICATION.md` als verbindliche langfristige
+   Zielarchitektur vollständig lesen.
+3. `git status`, den aktuellen Branch und `git pull --ff-only` prüfen.
+4. Die für den Auftrag relevanten Fach- und Sicherheitsdokumente lesen.
+5. Vorhandene Nutzeränderungen erhalten und den Auftrag möglichst klein halten.
+
+Die Master-Spezifikation beschreibt das langfristige Soll. Der tatsächlich
+implementierte Stand und offene Abnahmen ergeben sich aus
+`docs/PROJEKTSTATUS.md` und `docs/NEXT_TASK.md`; Zielmerkmale dürfen nicht als
+bereits implementiert dargestellt werden.
 
 ## Architektur- und Sicherheitsgrenzen
 
@@ -49,7 +56,9 @@ Diese Datei gilt für alle Arbeiten im Repository.
   abschaltbar und darf keine Dokumentinhalte, Suchanfragen, OCR-Texte,
   Dateinamen oder vollständigen privaten Pfade enthalten.
 - Die Modulgrenzen aus `ARCHITECTURE.md`, die Schutzregeln aus `SECURITY.md`
-  und die Datenschutzregeln aus `PRIVACY.md` einhalten.
+  und die Datenschutzregeln aus `PRIVACY.md` einhalten. Neue Architektur- und
+  Produktentscheidungen müssen außerdem mit
+  `docs/FINDORA_MASTER_SPECIFICATION.md` vereinbar sein.
 
 ## Pflichtprüfungen
 
