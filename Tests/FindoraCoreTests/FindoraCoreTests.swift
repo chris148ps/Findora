@@ -1344,7 +1344,7 @@ func realMLXDocumentVisionModelCanDownloadValidateAndAnalyzeWhenRequested() asyn
     )
     let descriptor = try #require(
         try ModelCatalog.bundled().models.first {
-            $0.kind == .documentVision
+            $0.id.contains("gemma-4-e2b")
         }
     )
     let manager = LocalModelManager(
@@ -1378,10 +1378,10 @@ func realMLXDocumentVisionModelCanDownloadValidateAndAnalyzeWhenRequested() asyn
             }
         ) { _ in }
     }
-    let pdf = root.appending(path: "GLM-OCR-Pruefung.pdf")
+    let pdf = root.appending(path: "Gemma-Vision-Pruefung.pdf")
     try createImagePDF(
         at: pdf,
-        text: "GLM OCR PRUEFUNG MODELL 2026"
+        text: "GEMMA VISION PRUEFUNG MODELL 2026"
     )
     let analyzer = MLXDocumentVisionAnalyzer(
         modelID: descriptor.id,

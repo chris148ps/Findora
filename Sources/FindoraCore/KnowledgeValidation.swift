@@ -95,7 +95,8 @@ public struct KnowledgeExtractionValidator: Sendable {
         for entity in envelope.entities {
             try insertUnique(entity.candidateID, into: &allIDs)
             try validateConfidence(entity.confidence, identifier: entity.candidateID)
-            guard !entity.canonicalName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard entity.type.isSyntacticallyValid,
+                  !entity.canonicalName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw KnowledgeValidationError.unsupportedValue(entity.candidateID)
             }
             try validateEvidenceReferences(

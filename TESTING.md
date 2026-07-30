@@ -82,6 +82,14 @@ Abgedeckt sind:
   `integrity_check`;
 - sichere Speicherkopie, Hash-/SQLite-Prüfung, Umschaltung und Altbestand;
 - Richtlinien für im führenden Dokumentenordner entfernte PDFs.
+- produktive Abarbeitung aller elf abhängigen Wissensjobstufen mit
+  schema-validierter Modellantwort, Agentenläufen und Auditereignissen;
+- `waiting_for_model` und Wiederaufnahme nach Modellaktivierung;
+- erweiterbare, lokal registrierte Ontologietypen ohne weitere
+  Schema-Migration;
+- fail-closed Antwortklassen sowie Berechnet- und Konfliktklassifikation;
+- exklusive prozessweite Generativsperre zusätzlich zu Modellleases;
+- Schema 16 mit Agenten-, Audit-, Ontologie- und Projektquellenfeldern.
 
 ## Reale MLX-Integration
 
@@ -167,6 +175,14 @@ Danach manuell:
 29. Daten- und Modellspeicher getrennt auf ein synthetisches APFS-Testvolume
     migrieren und Altbestand erst nach Bestätigung entfernen.
 30. Konfiguriertes Testvolume aushängen; keine leere Datenbank darf entstehen.
+31. Mit isoliertem `FINDORA_TEST_ROOT` den Agentenmonitor beobachten: Ohne
+    Qwen bleibt der Planner auf `waiting_for_model`; nach Aktivierung müssen
+    alle elf Stufen enden und der Wissensgraph wachsen.
+32. Qwen-Extraktion und Phi-Zweitprüfung mit ausschließlich synthetischen
+    Dokumenten ausführen; Quellen, Seite, Textbereich, Modell und Revision
+    stichprobenartig gegen SQLite prüfen.
+33. Einen synthetischen Mailthread mit Zusage, Aufgabe und Termin importieren
+    und Nachricht-, Anhang-, Claim- und Ereignisverknüpfung kontrollieren.
 
 Der Memory-Pressure-Pfad lässt sich ohne echten Speichermangel kontrolliert
 beim App-Start auslösen:

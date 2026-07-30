@@ -108,11 +108,11 @@ public struct ModelRouter: Sendable {
                 && profile.compatibility(for: $0) != .incompatible
         }
         let sorted = candidates.sorted { lhs, rhs in
+            if lhs.id == preferredID { return true }
+            if rhs.id == preferredID { return false }
             let lhsInstalled = installedModelIDs.contains(lhs.id)
             let rhsInstalled = installedModelIDs.contains(rhs.id)
             if lhsInstalled != rhsInstalled { return lhsInstalled }
-            if lhs.id == preferredID { return true }
-            if rhs.id == preferredID { return false }
             let lhsIsPrimaryQwen = lhs.id.localizedCaseInsensitiveContains("Qwen3.5-4B")
             let rhsIsPrimaryQwen = rhs.id.localizedCaseInsensitiveContains("Qwen3.5-4B")
             if lhsIsPrimaryQwen != rhsIsPrimaryQwen,

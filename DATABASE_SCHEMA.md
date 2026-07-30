@@ -1,6 +1,6 @@
 # Datenbankschema
 
-Die aktuelle erwartete Schema-Version ist **13**. `schema_migrations` enthält
+Die aktuelle erwartete Schema-Version ist **16**. `schema_migrations` enthält
 jede erfolgreich und transaktional angewendete Version mit Zeitstempel. Die
 App führt beim Öffnen nur noch fehlende Migrationen aus; ein Fehler rollt die
 jeweilige Migration vollständig zurück.
@@ -58,6 +58,36 @@ Schema-Migration 13 ergänzt die sichere Mail-Dublettenwartung:
 - `email_source_link_suppressions` verhindert, dass ein bewusst nur aus
   Findora entferntes Exemplar beim nächsten Quellenabgleich still wiederkehrt.
 
-Die Benutzerbereiche Kommunikationspartner und Projekte sind für ein späteres
-Update zurückgestellt. Bestehende Tabellen aus Schema 11 bleiben
-verlustfrei erhalten; Findora erzeugt derzeit keine neuen Projektgruppen.
+Schema-Migration 14 ergänzt seitenbezogene Textquellen, optische
+Analyseergebnisse, Bounding Boxes und wiederaufnehmbare
+Dokumentenreparaturzustände.
+
+Schema-Migration 15 ergänzt die revisionsfähige Wissensschicht:
+
+- Entitäten, Aliase und Kennungen;
+- Claims, Fakten, Relationen und wörtliche Belege;
+- Konflikte, Revisionen, Projekte und Projektkandidaten;
+- Wissensjobs, Analysezustände, Modellläufe und Wissenslücken;
+- Kommunikations-Threads, Nachrichten, Teilnehmer, Ereignisse und Anhänge;
+- Zusammenfassungen, Muster, Statistiken, Trends und Empfehlungen.
+
+Vor dem Bestandsupgrade wird nach einem WAL-Checkpoint eine lokale
+Sicherheitskopie angelegt. Der isolierte Wissensreset lässt Dokumente, Seiten,
+OCR, Chunks, FTS und Embeddings unverändert.
+
+Schema-Migration 16 verdrahtet die produktive Agenten- und Ontologieschicht:
+
+- `ontology_types` hält eingebaute und lokal ergänzte Typen. Neue Typen
+  benötigen keine weitere SQLite-Migration, müssen aber vor Modellspeicherung
+  lokal registriert und aktiviert sein;
+- `agent_runs` persistiert Rolle, Job, Zustand, Zähler und technische
+  Fehlerkategorie jedes Agentenlaufs;
+- `audit_log` protokolliert revisionsweise technische Zustandsänderungen ohne
+  Dokumenttext;
+- `knowledge_project_candidates.document_id` bindet Projektvorschläge an ihre
+  Originalquelle.
+
+Alle Agentenfolgearbeiten lesen ausschließlich validierte Claims und Belege.
+Automatische Projektbildung verlangt mindestens zwei starke Signale, davon ein
+eindeutiges Identifikator-, Adress-, Vertrags-, Auftrags- oder Gerätesignal;
+unsichere Kandidaten bleiben Vorschläge.

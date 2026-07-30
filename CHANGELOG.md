@@ -24,6 +24,15 @@ oder Tags.
 - optionale Menüleistensteuerung und Login-Item;
 - automatisierte Core-, OCR-, Index- und Opt-in-MLX-Tests;
 - Architektur-, Datenschutz-, Sicherheits-, Test- und Betriebsdokumentation.
+- produktiver lokaler Agentendienst für die persistente Wissensjobkette;
+- Qwen-3.5-Extraktion mit unabhängiger Phi-4-Mini-Prüfung und gemeinsamer
+  Exklusivsperre für große generative Laufzeiten;
+- Schema 16 mit Agentenläufen, Audit-Log und erweiterbarer lokaler Ontologie;
+- beleggebundene Konflikt-, Kommunikations-, Projekt-, Zusammenfassungs- und
+  Erfahrungsfolgestufen;
+- Agentenmonitor und sichtbare Antwortklassen;
+- tatsächliches, ausdrücklich aktivierbares capability-basiertes
+  Downloadrouting für empfohlene Wissensmodelle.
 
 ### Behoben
 

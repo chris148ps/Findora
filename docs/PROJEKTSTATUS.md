@@ -8,7 +8,7 @@ Stand: 30. Juli 2026
   Gemma 4 E2B sowie unveränderten älteren Modellen.
 - Capability-Routing, RAM-Budget, priorisierte exklusive Leases, Timeout,
   Abbruch, Cooldown und Speicherdrucksperre.
-- SQLite-Schema 15 mit Sicherheitskopie vor Bestandsmigration,
+- SQLite-Schema 16 mit Sicherheitskopie vor Bestandsmigration,
   Wissens-/Kommunikations-/Erfahrungstabellen und revisionsfähigen Belegen.
 - Strukturiertes JSON, fail-closed Quellenprüfung und transaktionaler
   Speicherpfad.
@@ -21,10 +21,20 @@ Stand: 30. Juli 2026
 - persistenter nativer Antwort-/Quellen-Splitter mit Mindestgrößen,
   Doppelklick-Reset und kompakter Ersatzdarstellung.
 - Wissensfunktion deaktivierbar; klassischer Index bleibt unabhängig.
+- produktiver lokaler Agentenworker für die abhängige Wissensjobkette;
+- exklusive Qwen-/Phi-/Vision-/Antwortausführung und reales
+  capability-basiertes Opt-in-Downloadrouting;
+- Agentenmonitor, technische Agentenläufe, Audit-Log und erweiterbare
+  Ontologietypen;
+- deterministische Konflikt-, Kommunikationsereignis-, Projekt-,
+  Zusammenfassungs- und Erfahrungsfolgestufen;
+- sichtbare Antwortklassen mit fail-closed `Unbekannt` ohne gültige Quellen.
 
 ## Abnahmegrenzen
 
 Unit-Tests verwenden synthetische Daten und laden keine Mehr-GB-Gewichte.
-Reale Qwen-/Phi-/Gemma-Läufe und 8-GB-Performancewerte sind eine getrennte
-Hardware-Abnahme. Gemma bleibt experimentell. Langzeitstatistiken werden nicht
-aus Testdaten vorgefüllt.
+Reale Qwen-/Phi-/Gemma-Läufe und belastbare 8-GB-Performancewerte sind eine
+getrennte Hardware-Abnahme. Gemma bleibt experimentell. Erfahrungsstatistiken
+entstehen erst ab drei aktiven, belegten Claims und werden zunächst nur als
+Vorschlag gespeichert; Testdaten werden nicht in produktive Bestände
+übernommen.

@@ -1,6 +1,6 @@
 # Findora – Architektur und Umsetzungsplan
 
-Stand: 24. Juli 2026
+Stand: 30. Juli 2026
 
 ## Ziel und Leitplanken
 
@@ -108,18 +108,17 @@ Der Modellkatalog pinnt Modell-ID, Revision, Dateiliste und SHA-256-Werte.
 Ein Modellwechsel erzeugt einen neuen Indexstand. Der alte Index bleibt bis
 zum erfolgreichen Neuaufbau aktiv.
 
-Für die optionale optische Dokumenteskalation ist GLM-OCR 4 Bit als eigener
-`documentVision`-Modelltyp gepinnt. Die native MLX-VLM-Laufzeit vermeidet eine
-zweite Python-/Paddle-Installation. Das rund 1,25-GB-Modell ist für die
-seitenweise Ausführung auf 8-GB-Apple-Silicon vorgesehen, wird nur nach
-Nutzeraktion geladen und darf ausschließlich Textvorschläge und
-Klassifikationen liefern. PDFKit und die mehrstufige Vision-OCR bleiben immer
-vorgeschaltet.
+Für die optionale optische Dokumenteskalation ist Gemma 4 E2B Instruct 4 Bit
+als experimentelles `documentVision`-Modell gepinnt. Die bestehende
+GLM-OCR-4-Bit-Integration bleibt als kompatible Alternative erhalten. Beide
+verwenden dieselbe native MLX-VLM-Grenze, werden nur nach Nutzeraktion geladen
+und dürfen ausschließlich Textvorschläge und Klassifikationen liefern. PDFKit
+und die mehrstufige Apple-Vision-OCR bleiben immer vorgeschaltet.
 
 PaddleOCR/PP-StructureV3 wurde als dokumentorientierte Alternative geprüft,
 aber nicht als zusätzliche Laufzeit eingebaut: Die bestehende native
-Swift-/MLX-Auslieferung unterstützt GLM-OCR direkt, während Paddle eine zweite
-Python-/Paddle-Laufzeit und ein zusätzliches Paketierungs- und
+Swift-/MLX-Auslieferung unterstützt Gemma und GLM-OCR direkt, während Paddle
+eine zweite Python-/Paddle-Laufzeit und ein zusätzliches Paketierungs- und
 Speichermanagement erfordern würde. Die Auswahl vermeidet diese parallele
 Runtime auf 8-GB-Macs, ohne die lokale, dokumentorientierte Eskalationsstufe
 oder die vorgeschalteten Qualitätsprüfungen aufzugeben.
@@ -213,12 +212,14 @@ E-Mail-Identität, Quellenzuordnung und Anhangsidentität sind ebenfalls
 getrennt. `MailImportService` streamt Quellen; Mail, PDF und Anhang teilen
 sich Chunk-, FTS- und Embeddingpipeline.
 
-Migrationen 11 bis 13 bewahren historische Tabellen für Partner und Projekte,
-ergänzen unabhängige Analyseversionen je Dokument und sichern die
-Mail-Dublettenwartung. Partner- und Projektprofile werden derzeit weder
-automatisch erzeugt noch in Oberfläche oder Suche verwendet. OCR, Embeddings
-und vollständige Neuindexierungen bleiben ausdrücklich gestartete
-Wartungsaktionen. Details stehen in `docs/COMMUNICATION_GRAPH.md` und
+Migrationen 11 bis 14 bewahren historische Kommunikationsdaten, ergänzen
+unabhängige Analyseversionen je Dokument sowie sichere Mail-, OCR- und
+Wartungsdaten. Migration 15 ergänzt die lokale Wissensschicht; Migration 16
+verdrahtet Agentenläufe, Audit und die datengetriebene Ontologie. Automatische
+Projektbildung erfolgt ausschließlich aus mehreren starken, belegten Signalen;
+unsichere Ergebnisse bleiben Vorschläge. OCR, Embeddings und vollständige
+Neuindexierungen bleiben ausdrücklich gestartete Wartungsaktionen. Details
+stehen in `docs/COMMUNICATION_GRAPH.md` und
 `docs/DATABASE_MIGRATIONS.md`.
 
 Embeddings werden als normalisierte Float32-BLOBs in SQLite gespeichert.
@@ -301,6 +302,11 @@ Datenbank ergänzt. Unbekannte IDs werden verworfen.
 
 Bei zu niedriger Retrieval-Güte wird kein LLM-Freitext als belegte Antwort
 ausgegeben, sondern die definierte Keine-Belege-Meldung.
+
+`KnowledgeAgentSystem` verarbeitet die persistente Wissensjobkette. Qwen,
+Phi, optische Analyse und Vordergrundantworten teilen
+`LocalGenerativeTaskGate`; vor einer unabhängigen Phi-Prüfung wird die
+Qwen-Laufzeit entladen. Folgeagenten lesen nur validierte Claims und Belege.
 
 ## Meilensteine und Gates
 

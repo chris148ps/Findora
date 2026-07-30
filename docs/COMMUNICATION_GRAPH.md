@@ -1,11 +1,9 @@
 # Interne Mail- und Dokumentverknüpfungen
 
-Die früher sichtbaren Bereiche **Kommunikationspartner** und **Projekte** sind
-für ein späteres Update zurückgestellt. Sie erscheinen weder in der
-Navigation noch als Sucherweiterung oder in den Dokumentdetails. Die
-automatische Projektbildung ist deaktiviert. Vorhandene interne Tabellen
-werden nicht gelöscht, damit Bestandsdaten nicht durch eine destruktive
-Migration verloren gehen.
+Der Kommunikationsgraph ist eine interne lokale Wissensschicht. Threads,
+Nachrichten, Teilnehmer, Anhänge und belegte Ereignisse sind im
+Entwicklerbereich prüfbar. Bestehende kompatible Partner- und Projekttabellen
+werden nicht destruktiv ersetzt.
 
 ## Lokales Modell
 
@@ -15,9 +13,9 @@ Identität. Alias-Schreibweisen derselben Adresse werden separat erhalten.
 Firmen-Domains erzeugen Organisationen; verbreitete private Mail-Domains
 werden nicht automatisch als Organisation interpretiert.
 
-Die Adressableitung ist ebenfalls deaktiviert. Bestehende Partner-,
-Organisations- und Projektzeilen bleiben ausschließlich aus
-Kompatibilitätsgründen erhalten.
+Die Wissensschicht kann Adressen als Entitäts- und Projektsignal verwenden.
+Automatische Zuordnungen verlangen starke Mehrfachsignale; häufige Namen und
+bloße Betreffähnlichkeit reichen nicht.
 
 ## Verknüpfungsregeln
 
@@ -35,9 +33,20 @@ Adressen und lokalen Embeddings abgeleitet. Es gibt keine Cloud-Abfrage.
 
 ## Suche und Details
 
-Partner- und Projektnamen erweitern die Suche derzeit nicht. Dokumentdetails
-zeigen nur direkte lokal ermittelte Mail-/Dokumentrelationen einschließlich
-Status und Konfidenz.
+Die hybride Suche kann aktive belegte Wissensclaims zusammen mit direkten
+lokalen Mail-/Dokumentrelationen verwenden. Jede Relation zeigt Status,
+Konfidenz und Originalbeleg.
+
+## Kommunikationsereignisse
+
+Nach der quellenvalidierten Extraktion materialisiert der
+Kommunikations-Agent Entscheidungen, Zusagen, Ablehnungen, offene Fragen,
+Aufgaben, Termine, Freigaben, Anforderungen, technische Änderungen und
+Verantwortlichkeiten. Ein Ereignis verweist zwingend auf Nachricht und Claim;
+ohne aktiven `verified`- oder `supported`-Claim wird nichts gespeichert.
+
+Anhänge bleiben über Nachrichten-, Anhangs-, Dokument- und SHA-256-Identität
+dauerhaft verbunden.
 
 ## Datenschutz
 

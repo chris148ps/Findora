@@ -166,16 +166,17 @@ Downloadgröße und RAM-Einstufung. Jede Datei wird per SHA-256 validiert.
 - experimentelle visuelle Prüfung: Gemma 4 E2B Instruct 4 Bit
 - bestehende Qwen-3-Modelle bleiben als kompatible Altmodelle erhalten
 - Qwen3 8B 4 Bit auf 8-GB-Macs nur experimentell
-- Optische Dokumenteskalation: GLM-OCR 4 Bit, Revision
+- bestehende optische Alternative: GLM-OCR 4 Bit, Revision
   `97f587506984cc92fa69b2694b4128e53db6b081`, MIT, rund 1,25 GB Download
 
 Downloads lassen sich pausieren, fortsetzen und abbrechen. Ein
 Embedding-Modellwechsel erfordert eine Neuindexierung. Das Sprachmodell wird
 erst für eine Antwort geladen und bei Speicherdruck oder nach Inaktivität
 entladen.
-GLM-OCR wird nur nach ausdrücklichem Download und nur für ungelöste Seiten
-verwendet. Unsichere Ergebnisse bleiben in **OCR prüfen**; das Modell darf
-weder PDFs ändern noch Seiten löschen oder manuelle Bewertungen überschreiben.
+Gemma oder die bestehende GLM-OCR-Alternative werden nur nach ausdrücklichem
+Download und nur für ungelöste Seiten verwendet. Unsichere Ergebnisse bleiben
+in **OCR prüfen**; das Modell darf weder PDFs ändern noch Seiten löschen oder
+manuelle Bewertungen überschreiben.
 
 Capability-Routing, Speicherbudget und exklusive Modell-Leases verhindern auf
 8-GB-Geräten unkontrolliertes paralleles Laden großer generativer Modelle.
@@ -200,6 +201,20 @@ Neue oder geänderte Dokumente erhalten idempotente Wissensjobs. Beim Entfernen
 werden Belege zunächst als fehlend markiert; ein Fakt bleibt aktiv, solange
 ein anderer gültiger Beleg existiert. Die Wissensfunktion ist deaktivierbar;
 die klassische Suche funktioniert ohne Wissensmodelle.
+
+Ein lokaler Agentendienst arbeitet diese abhängige Jobkette produktiv ab.
+Qwen 3.5 erzeugt das vollständige strukturierte Extraktionsobjekt; bei
+Unsicherheit prüft Phi-4 Mini dieselben Originalbelege unabhängig. Qwen wird
+vor der Phi-Prüfung entladen. Vordergrundantworten, Extraktion, Prüfung und
+optische Analyse teilen zusätzlich eine prozessweite Exklusivsperre, damit auf
+8-GB-Systemen niemals zwei große generative Laufzeiten gleichzeitig arbeiten.
+
+Folgeagenten bilden nur aus validiertem Datenbankzustand Konflikte,
+Kommunikationsereignisse, starke Projektzuordnungen, beleggebundene
+Zusammenfassungen und vorgeschlagene Erfahrungsmuster. Agentenläufe und
+technische Zustandsänderungen werden ohne Dokumentinhalt auditiert.
+Ontologietypen sind lokal registrierbar und benötigen keine weitere
+Schema-Migration.
 
 Unter **Einstellungen → Entwicklung / Diagnose** sind nach Aktivierung des
 Entwicklermodus Entitäten, Aussagen, Projektkandidaten,
@@ -237,6 +252,11 @@ Für eine formulierte Antwort werden nur die besten lokalen Fundstellen an das
 lokale Modell übergeben. Quellen-IDs werden von der App erzeugt und nachher
 gegen die Datenbank validiert. Fehlen ausreichende Belege, gibt die App keine
 scheinbar belegte Antwort aus.
+
+Die Antwortansicht kennzeichnet das Ergebnis als **Gesichert**, **Berechnet**,
+**Wahrscheinlichkeit**, **Erfahrung**, **Konflikt** oder **Unbekannt**. Ohne
+gültige Quellen-ID und lokale Originalquelle lautet die Klasse immer
+**Unbekannt**.
 
 Der Inhaltstyp lässt sich mit **Alle / Dokumente / E-Mails / Anhänge**
 filtern. Die Suchansicht zeigt Nutzerfrage und Markdown-Antwort chatähnlich in einem
@@ -343,3 +363,6 @@ nicht gelöscht.
 - [`UI_LOCALIZATION.md`](UI_LOCALIZATION.md)
 - [`FINDORA_UI.md`](FINDORA_UI.md)
 - [`docs/CODEX_WORKFLOW.md`](docs/CODEX_WORKFLOW.md)
+- [`docs/AGENT_SYSTEM.md`](docs/AGENT_SYSTEM.md)
+- [`docs/LOCAL_API.md`](docs/LOCAL_API.md)
+- [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md)

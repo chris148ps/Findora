@@ -482,7 +482,7 @@ public actor MLXDocumentVisionAnalyzer: OpticalDocumentAnalyzing {
             modelVersion: modelVersion,
             durationSeconds: started.duration(to: .now).seconds,
             explanation: quality >= 0.58
-                ? "Lokaler GLM-OCR-Text bestand die Plausibilitätsprüfung."
+                ? "Lokaler Text des optischen Dokumentmodells bestand die Plausibilitätsprüfung."
                 : "Modellergebnis blieb unter der automatischen Übernahmeschwelle."
         )
     }

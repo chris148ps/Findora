@@ -1,31 +1,71 @@
 import Foundation
 
-public enum KnowledgeEntityType: String, Codable, CaseIterable, Sendable {
-    case person
-    case company
-    case organization
-    case project
-    case `case`
-    case property
-    case address
-    case document
-    case invoice
-    case contract
-    case offer
-    case product
-    case device
-    case technicalSystem = "technical_system"
-    case pvSystem = "pv_system"
-    case battery
-    case wallbox
-    case inverter
-    case authority
-    case gridOperator = "grid_operator"
-    case standard
-    case appointment
-    case task
-    case topic
-    case location
+/// Extensible ontology key. Built-in values remain source-compatible while
+/// additional locally registered types can be decoded without a schema
+/// migration or a new app binary.
+public struct KnowledgeEntityType:
+    RawRepresentable,
+    Codable,
+    CaseIterable,
+    Hashable,
+    Sendable
+{
+    public let rawValue: String
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        rawValue = try container.decode(String.self)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let person = Self(rawValue: "person")
+    public static let company = Self(rawValue: "company")
+    public static let organization = Self(rawValue: "organization")
+    public static let project = Self(rawValue: "project")
+    public static let `case` = Self(rawValue: "case")
+    public static let property = Self(rawValue: "property")
+    public static let address = Self(rawValue: "address")
+    public static let document = Self(rawValue: "document")
+    public static let invoice = Self(rawValue: "invoice")
+    public static let contract = Self(rawValue: "contract")
+    public static let offer = Self(rawValue: "offer")
+    public static let product = Self(rawValue: "product")
+    public static let device = Self(rawValue: "device")
+    public static let technicalSystem = Self(rawValue: "technical_system")
+    public static let pvSystem = Self(rawValue: "pv_system")
+    public static let battery = Self(rawValue: "battery")
+    public static let wallbox = Self(rawValue: "wallbox")
+    public static let inverter = Self(rawValue: "inverter")
+    public static let authority = Self(rawValue: "authority")
+    public static let gridOperator = Self(rawValue: "grid_operator")
+    public static let standard = Self(rawValue: "standard")
+    public static let appointment = Self(rawValue: "appointment")
+    public static let task = Self(rawValue: "task")
+    public static let topic = Self(rawValue: "topic")
+    public static let location = Self(rawValue: "location")
+
+    public static let allCases: [Self] = [
+        .person, .company, .organization, .project, .case, .property,
+        .address, .document, .invoice, .contract, .offer, .product, .device,
+        .technicalSystem, .pvSystem, .battery, .wallbox, .inverter,
+        .authority, .gridOperator, .standard, .appointment, .task, .topic,
+        .location
+    ]
+
+    public var isSyntacticallyValid: Bool {
+        rawValue.range(
+            of: #"^[a-z][a-z0-9_]{1,63}$"#,
+            options: .regularExpression
+        ) != nil
+    }
 }
 
 public enum KnowledgeClaimType: String, Codable, CaseIterable, Sendable {
@@ -629,4 +669,24 @@ public enum ExperiencePatternStatus: String, Codable, CaseIterable, Sendable {
     case confirmed
     case rejected
     case stale
+}
+
+public enum KnowledgeAnswerClass: String, Codable, CaseIterable, Sendable {
+    case secured
+    case calculated
+    case probability
+    case experience
+    case conflict
+    case unknown
+
+    public var displayName: String {
+        switch self {
+        case .secured: "Gesichert"
+        case .calculated: "Berechnet"
+        case .probability: "Wahrscheinlichkeit"
+        case .experience: "Erfahrung"
+        case .conflict: "Konflikt"
+        case .unknown: "Unbekannt"
+        }
+    }
 }

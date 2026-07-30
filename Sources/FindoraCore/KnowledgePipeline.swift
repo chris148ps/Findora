@@ -73,46 +73,60 @@ public struct KnowledgeExtractionCoordinator: Sendable {
         }
         let prompt = Self.prompt(context: context, limit: policy.maximumInputCharacters)
         let instructions = Self.instructions
-        let primaryResult = try await generateValidated(
-            with: primary,
-            instructions: instructions,
-            prompt: prompt,
-            context: context
-        )
-
-        let result: ValidatedKnowledgeExtraction
-        if policy.automaticSecondReview,
-           let independentReviewer,
-           Self.needsSecondReview(
-               primaryResult.envelope,
-               threshold: policy.secondReviewConfidenceThreshold
-           ) {
-            let reviewContext = KnowledgeExtractionContext(
-                documentID: context.documentID,
-                documentHash: context.documentHash,
-                pages: context.pages,
-                extractionModelID: independentReviewer.modelID,
-                extractionModelVersion: independentReviewer.modelVersion,
-                promptVersion: "\(context.promptVersion)-independent-review",
-                schemaVersion: context.schemaVersion
-            )
-            let review = try await generateValidated(
-                with: independentReviewer,
-                instructions: Self.independentReviewInstructions,
+        do {
+            let primaryResult = try await generateValidated(
+                with: primary,
+                instructions: instructions,
                 prompt: prompt,
-                context: reviewContext
+                context: context
             )
-            result = try Self.consensus(
-                primary: primaryResult,
-                review: review,
-                originalContext: context
-            )
-        } else {
-            result = primaryResult
-        }
 
-        try await database.storeValidatedKnowledge(result)
-        return result
+            let result: ValidatedKnowledgeExtraction
+            if policy.automaticSecondReview,
+               let independentReviewer,
+               Self.needsSecondReview(
+                   primaryResult.envelope,
+                   threshold: policy.secondReviewConfidenceThreshold
+               ) {
+                // The primary runtime is fully released before Phi is loaded.
+                // This is the hard one-large-model-at-a-time boundary on 8-GB
+                // systems, independent of the runtimes' idle timers.
+                await primary.unload()
+                let reviewContext = KnowledgeExtractionContext(
+                    documentID: context.documentID,
+                    documentHash: context.documentHash,
+                    pages: context.pages,
+                    extractionModelID: independentReviewer.modelID,
+                    extractionModelVersion: independentReviewer.modelVersion,
+                    promptVersion: "\(context.promptVersion)-independent-review",
+                    schemaVersion: context.schemaVersion
+                )
+                let review = try await generateValidated(
+                    with: independentReviewer,
+                    instructions: Self.independentReviewInstructions,
+                    prompt: prompt,
+                    context: reviewContext
+                )
+                await independentReviewer.unload()
+                result = try Self.consensus(
+                    primary: primaryResult,
+                    review: review,
+                    originalContext: context
+                )
+            } else {
+                await primary.unload()
+                result = primaryResult
+            }
+
+            try await database.storeValidatedKnowledge(result)
+            return result
+        } catch {
+            await primary.unload()
+            if let independentReviewer {
+                await independentReviewer.unload()
+            }
+            throw error
+        }
     }
 
     private func generateValidated(
@@ -163,17 +177,38 @@ public struct KnowledgeExtractionCoordinator: Sendable {
         review: ValidatedKnowledgeExtraction,
         originalContext: KnowledgeExtractionContext
     ) throws -> ValidatedKnowledgeExtraction {
-        let reviewedFacts = Set(review.envelope.facts.map(factSignature))
-        let reviewedRelations = Set(review.envelope.relations.map(relationSignature))
+        let reviewedFacts = Set(
+            review.envelope.facts.map {
+                factSignature($0, envelope: review.envelope)
+            }
+        )
+        let reviewedRelations = Set(
+            review.envelope.relations.map {
+                relationSignature($0, envelope: review.envelope)
+            }
+        )
+        let reviewedProjectSignals = Set(
+            review.envelope.projectSignals.map(projectSignalSignature)
+        )
         let facts = primary.envelope.facts.filter {
-            reviewedFacts.contains(factSignature($0))
+            reviewedFacts.contains(factSignature($0, envelope: primary.envelope))
         }
         let relations = primary.envelope.relations.filter {
-            reviewedRelations.contains(relationSignature($0))
+            reviewedRelations.contains(
+                relationSignature($0, envelope: primary.envelope)
+            )
         }
-        if (!primary.envelope.facts.isEmpty || !primary.envelope.relations.isEmpty),
+        let projectSignals = primary.envelope.projectSignals.filter {
+            reviewedProjectSignals.contains(projectSignalSignature($0))
+        }
+        if (
+            !primary.envelope.facts.isEmpty
+                || !primary.envelope.relations.isEmpty
+                || !primary.envelope.projectSignals.isEmpty
+        ),
            facts.isEmpty,
-           relations.isEmpty {
+           relations.isEmpty,
+           projectSignals.isEmpty {
             throw KnowledgePipelineError.independentReviewRejectedAllClaims
         }
         let requiredEntityIDs = Set(
@@ -182,13 +217,13 @@ public struct KnowledgeExtractionCoordinator: Sendable {
         )
         let entities = primary.envelope.entities.filter {
             requiredEntityIDs.contains($0.candidateID)
-                || primary.envelope.projectSignals.isEmpty == false
+                || projectSignals.isEmpty == false
         }
         let requiredEvidenceIDs = Set(
             entities.flatMap(\.evidenceIDs)
                 + facts.flatMap(\.evidenceIDs)
                 + relations.flatMap(\.evidenceIDs)
-                + primary.envelope.projectSignals.flatMap(\.evidenceIDs)
+                + projectSignals.flatMap(\.evidenceIDs)
         )
         let evidence = primary.envelope.evidence.filter {
             requiredEvidenceIDs.contains($0.id)
@@ -201,7 +236,7 @@ public struct KnowledgeExtractionCoordinator: Sendable {
             facts: facts,
             relations: relations,
             evidence: evidence,
-            projectSignals: primary.envelope.projectSignals,
+            projectSignals: projectSignals,
             uncertainties: primary.envelope.uncertainties
                 + [KnowledgeUncertainty(
                     kind: "independent_review",
@@ -212,21 +247,59 @@ public struct KnowledgeExtractionCoordinator: Sendable {
         return ValidatedKnowledgeExtraction(envelope: envelope, context: originalContext)
     }
 
-    private static func factSignature(_ fact: KnowledgeFactCandidate) -> String {
-        [
+    private static func factSignature(
+        _ fact: KnowledgeFactCandidate,
+        envelope: KnowledgeExtractionEnvelope
+    ) -> String {
+        let names = Dictionary(
+            uniqueKeysWithValues: envelope.entities.map {
+                ($0.candidateID, normalizedSignatureValue($0.canonicalName))
+            }
+        )
+        return [
+            names[fact.subjectEntityID] ?? "",
             fact.predicate.lowercased(),
+            fact.objectEntityID.flatMap { names[$0] } ?? "",
             fact.literalValue?.lowercased() ?? "",
             fact.valueType.rawValue,
             fact.unit?.lowercased() ?? ""
         ].joined(separator: "\u{1f}")
     }
 
-    private static func relationSignature(_ relation: KnowledgeRelationCandidate) -> String {
-        [
+    private static func relationSignature(
+        _ relation: KnowledgeRelationCandidate,
+        envelope: KnowledgeExtractionEnvelope
+    ) -> String {
+        let names = Dictionary(
+            uniqueKeysWithValues: envelope.entities.map {
+                ($0.candidateID, normalizedSignatureValue($0.canonicalName))
+            }
+        )
+        return [
+            names[relation.subjectEntityID] ?? "",
             relation.predicate.lowercased(),
+            names[relation.objectEntityID] ?? "",
             relation.validFrom ?? "",
             relation.validUntil ?? ""
         ].joined(separator: "\u{1f}")
+    }
+
+    private static func projectSignalSignature(
+        _ signal: KnowledgeProjectSignal
+    ) -> String {
+        [
+            normalizedSignatureValue(signal.kind),
+            normalizedSignatureValue(signal.value)
+        ].joined(separator: "\u{1f}")
+    }
+
+    private static func normalizedSignatureValue(_ value: String) -> String {
+        value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "de_DE")
+        )
+        .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static let instructions = """
@@ -423,5 +496,61 @@ public struct KnowledgeQueryPlanner: Sendable {
             useVectorSearch: modelsAvailable,
             requireOriginalEvidence: true
         )
+    }
+}
+
+public struct KnowledgeAnswerClassifier: Sendable {
+    public init() {}
+
+    public func classify(
+        question: String,
+        answer: String,
+        sources: [SearchSource]
+    ) -> KnowledgeAnswerClass {
+        guard !sources.isEmpty,
+              answer != SourceCitationValidator.noEvidenceMessage,
+              answer.range(
+                of: #"\[S-\d{3}\]"#,
+                options: .regularExpression
+              ) != nil else {
+            return .unknown
+        }
+        let normalizedQuestion = question.lowercased()
+        let normalizedAnswer = answer.lowercased()
+        if Self.containsAny(
+            [
+                "widerspruch",
+                "widersprech",
+                "konflikt",
+                "abweichende angabe",
+                "contradiction"
+            ],
+            in: normalizedAnswer
+        ) {
+            return .conflict
+        }
+        if Self.containsAny(
+            ["berechne", "summe", "differenz", "durchschnitt", "calculate"],
+            in: normalizedQuestion
+        ) {
+            return .calculated
+        }
+        if Self.containsAny(
+            ["erfahrung", "muster", "trend", "typischerweise", "experience"],
+            in: normalizedQuestion
+        ) {
+            return .experience
+        }
+        if Self.containsAny(
+            ["wahrscheinlich", "möglicherweise", "unsicher", "probability"],
+            in: normalizedAnswer
+        ) {
+            return .probability
+        }
+        return .secured
+    }
+
+    private static func containsAny(_ terms: [String], in text: String) -> Bool {
+        terms.contains { text.contains($0) }
     }
 }

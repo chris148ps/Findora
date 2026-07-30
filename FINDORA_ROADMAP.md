@@ -10,6 +10,10 @@
 - optionale, standardmäßig deaktivierte Importordnerüberwachung
 - unabhängiger, sicher migrierbarer Daten- und Modellspeicher
 - SHA-256-Dokumentabgleich mit drei Richtlinien für entfernte PDFs
+- produktive lokale Wissensjobkette mit Qwen-/Phi-Prüfung
+- revisionsfähiger Wissens-, Kommunikations-, Projekt- und Erfahrungsgraph
+- Agentenmonitor, technisches Audit und erweiterbare Ontologietypen
+- quellenpflichtige Antwortklassen und kombinierte Wissens-/FTS-/Vektorsuche
 
 ## Später, nicht Bestandteil dieser Umsetzung
 
@@ -22,4 +26,3 @@
 Vor einer externen Veröffentlichung bleiben Notarisierung, SBOM, heterogene
 reale MSG/MBOX-Abnahmetests und ein Langzeittest mit großem synthetischem
 Bestand gesonderte Freigabepunkte.
-

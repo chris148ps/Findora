@@ -199,6 +199,7 @@ struct SearchSessionTurn: Identifiable {
     let sources: [SearchSource]
     let possibleSources: [SearchSource]
     let plan: SearchPlan
+    let answerClass: KnowledgeAnswerClass
 }
 
 @MainActor
@@ -212,6 +213,7 @@ final class AppState {
     var isPaused = false
     var question = ""
     var answer = ""
+    var answerClass: KnowledgeAnswerClass = .unknown
     var searchResults: [SearchSource] = []
     var possibleSearchResults: [SearchSource] = []
     var submittedQuestion = ""
@@ -238,6 +240,10 @@ final class AppState {
     var unloadModelsWhenIdle = true
     var knowledgeStatistics = KnowledgeStatistics()
     var knowledgeReviewSnapshot = KnowledgeReviewSnapshot()
+    var agentSnapshots = FindoraAgentRole.allCases.map {
+        FindoraAgentSnapshot(role: $0)
+    }
+    var ontologyTypes: [KnowledgeOntologyType] = []
     var launchAtLogin = false
     var memoryPressure = "Normal"
     var availableModels: [InstalledModel] = []
@@ -369,7 +375,11 @@ final class AppState {
     private var mailWatchLoop: Task<Void, Never>?
     private var answerGenerator: (any AnswerGenerating)?
     private var validatorGenerator: (any AnswerGenerating)?
+    private var knowledgeGenerator: (any StructuredKnowledgeGenerating)?
+    private var knowledgeValidatorGenerator: (any StructuredKnowledgeGenerating)?
     private var documentVisionAnalyzer: (any OpticalDocumentAnalyzing)?
+    private var knowledgeAgentSystem: KnowledgeAgentSystem?
+    private let generativeTaskGate = LocalGenerativeTaskGate()
     private var resolvedFolder: ResolvedFolder?
     private var scanLoop: Task<Void, Never>?
     private var eventScanTask: Task<Void, Never>?
@@ -536,9 +546,12 @@ final class AppState {
                 await refreshModels()
                 await restoreModelSelection()
                 await refreshModels()
+                await configureKnowledgeAgentSystem()
+                ensureRecommendedKnowledgeModelsIfAllowed()
             } else {
                 modelMessage =
                     "Der konfigurierte KI-Modellspeicher ist nicht erreichbar. Die Volltextsuche bleibt verfügbar."
+                await configureKnowledgeAgentSystem()
             }
             await refreshMailSources()
             startMailWatchLoop()
@@ -1209,6 +1222,11 @@ final class AppState {
             return
         }
         isProcessing = true
+        await knowledgeAgentSystem?.reportExternalActivity(
+            role: .importAgent,
+            state: .running,
+            detail: "Lokaler Dokumentordner wird inkrementell abgeglichen."
+        )
         await beginProcessingSession(phase: .scanning)
         folderStatus = "Scan läuft …"
         defer { isProcessing = false }
@@ -1227,6 +1245,11 @@ final class AppState {
             )
             folderStatus = "Erreichbar"
             await updateProcessingSession(phase: .indexing)
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .ocr,
+                state: .running,
+                detail: "PDFKit-, Vision-OCR- und Indexpipeline laufen."
+            )
             await processor.processPending(
                 ocrConfiguration: ocrConfiguration,
                 removeMissingDocuments:
@@ -1250,8 +1273,30 @@ final class AppState {
             }
             await updateProcessingSession(failed: statistics.failedJobs)
             await finishProcessingSession(phase: .completed)
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .importAgent,
+                state: .succeeded,
+                detail: "Dokumentabgleich abgeschlossen.",
+                processedItemCount: files.count
+            )
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .ocr,
+                state: .succeeded,
+                detail: "OCR- und Indexpipeline abgeschlossen.",
+                processedItemCount: files.count
+            )
         } catch is CancellationError {
             await finishProcessingSession(phase: .completed)
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .importAgent,
+                state: .idle,
+                detail: "Dokumentabgleich abgebrochen."
+            )
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .ocr,
+                state: .idle,
+                detail: "OCR- und Indexpipeline abgebrochen."
+            )
             reportCancellation(
                 taskType: "Dokumentenscan",
                 trigger: "Task ersetzt oder App-Lifecycle",
@@ -1260,6 +1305,16 @@ final class AppState {
         } catch {
             folderStatus = "Nicht erreichbar"
             await finishProcessingSession(phase: .failed)
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .importAgent,
+                state: .failed,
+                detail: error.localizedDescription
+            )
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .ocr,
+                state: .failed,
+                detail: error.localizedDescription
+            )
             report(error, taskType: "Dokumentenscan")
         }
     }
@@ -1270,6 +1325,7 @@ final class AppState {
         let fileLogger = fileLogger
         Task {
             await processor.setPaused(paused)
+            await knowledgeAgentSystem?.setPaused(paused || !knowledgeEnabled)
             do {
                 try await database.setProcessingPaused(paused)
                 if var session = processingSession {
@@ -1356,6 +1412,8 @@ final class AppState {
                     value: removedDocumentPolicy.rawValue
                 )
                 startScanLoop()
+                await configureKnowledgeAgentSystem()
+                ensureRecommendedKnowledgeModelsIfAllowed()
                 modelMessage = "Einstellungen wurden lokal gespeichert."
                 await deliverPendingCrashReport()
             } catch {
@@ -1730,7 +1788,7 @@ final class AppState {
         guard documentVisionAnalyzer != nil else {
             selectedSection = .models
             modelMessage =
-                "Für diese schwer lesbare Seite kann Findora GLM-OCR lokal verwenden. Laden und aktivieren Sie das Dokumentmodell; Dokumentinhalte werden nicht übertragen."
+                "Für diese schwer lesbare Seite kann Findora das aktive optische Dokumentmodell lokal verwenden. Laden und aktivieren Sie ein kompatibles Modell; Dokumentinhalte werden nicht übertragen."
             return
         }
         isMaintainingDocuments = true
@@ -1827,12 +1885,33 @@ final class AppState {
                 "Das optische Dokumentmodell ist nicht aktiviert."
             )
         }
-        let analysis = try await analyzer.analyzePage(
-            fileURL: URL(filePath: candidate.absolutePath),
-            pageNumber: candidate.pageNumber,
-            timeout: .seconds(90)
+        await knowledgeAgentSystem?.reportExternalActivity(
+            role: .vision,
+            state: .running,
+            detail: "Eine lokal gerenderte Problemseite wird optisch analysiert."
         )
         isDocumentVisionModelLoaded = true
+        let analysis: OpticalPageAnalysis
+        do {
+            analysis = try await generativeTaskGate.withExclusiveAccess({
+                try await analyzer.analyzePage(
+                    fileURL: URL(filePath: candidate.absolutePath),
+                    pageNumber: candidate.pageNumber,
+                    timeout: .seconds(90)
+                )
+            }, cleanup: {
+                await analyzer.unload()
+            })
+            isDocumentVisionModelLoaded = false
+        } catch {
+            isDocumentVisionModelLoaded = false
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .vision,
+                state: .failed,
+                detail: error.localizedDescription
+            )
+            throw error
+        }
         let accepted =
             candidate.textKind == .automatic
             && analysis.classification == .textRecovered
@@ -1853,6 +1932,14 @@ final class AppState {
                 source: .opticalDocumentModel
             )
         }
+        await knowledgeAgentSystem?.reportExternalActivity(
+            role: .vision,
+            state: .succeeded,
+            detail: accepted
+                ? "Optischer Textvorschlag wurde qualitätsgeprüft übernommen."
+                : "Optisches Ergebnis bleibt als überprüfbarer Vorschlag.",
+            processedItemCount: 1
+        )
         return (analysis.classification, accepted)
     }
 
@@ -2285,6 +2372,7 @@ final class AppState {
         }
         isSearching = true
         answer = ""
+        answerClass = .unknown
         searchResults = []
         possibleSearchResults = []
         submittedQuestion = value
@@ -2296,6 +2384,11 @@ final class AppState {
                 isSearching = false
                 searchTask = nil
             }
+            await knowledgeAgentSystem?.reportExternalActivity(
+                role: .answer,
+                state: .running,
+                detail: "Lokale Suche und quellengebundene Antwort laufen."
+            )
             do {
                 let rulePlanner = RuleBasedSearchPlanner()
                 let isFollowUp = rulePlanner.isFollowUp(value)
@@ -2311,13 +2404,21 @@ final class AppState {
                 if let cached = searchPlanCache[cacheKey] {
                     plan = cached
                 } else if rulePlanner.needsModelPlanning(value),
-                          let planner = answerGenerator as? any SearchPlanning {
+                          let planningGenerator = answerGenerator,
+                          let planner = planningGenerator as? any SearchPlanning {
+                    isAnswerModelLoaded = true
                     do {
-                        plan = try await planner.planSearch(
-                            query: value,
-                            ruleBasedPlan: rulePlan
-                        )
+                        plan = try await generativeTaskGate.withExclusiveAccess({
+                            try await planner.planSearch(
+                                query: value,
+                                ruleBasedPlan: rulePlan
+                            )
+                        }, cleanup: {
+                            await planningGenerator.unload()
+                        })
+                        isAnswerModelLoaded = false
                     } catch {
+                        isAnswerModelLoaded = false
                         plan = rulePlan
                         searchPlanningNotice = "Der lokale KI-Suchplan war ungültig; die sichere regelbasierte Analyse wurde verwendet."
                     }
@@ -2345,31 +2446,60 @@ final class AppState {
                     answer = "Keine ausreichend passenden Dokumente gefunden."
                 } else if let answerGenerator {
                     isAnswerModelLoaded = true
-                    answer = try await answerGenerator.answer(
-                        question: value,
-                        sources: sources
-                    )
+                    answer = try await generativeTaskGate.withExclusiveAccess({
+                        try await answerGenerator.answer(
+                            question: value,
+                            sources: sources
+                        )
+                    }, cleanup: {
+                        await answerGenerator.unload()
+                    })
+                    isAnswerModelLoaded = false
                 } else {
                     answer = """
                     Es wurden passende lokale Textstellen gefunden. Installiere und aktiviere im Bereich „Modelle“ \
                     ein kompatibles Antwortmodell, um daraus eine belegte natürlichsprachliche Antwort erzeugen zu lassen.
                     """
                 }
+                answerClass = KnowledgeAnswerClassifier().classify(
+                    question: value,
+                    answer: answer,
+                    sources: sources
+                )
                 searchSession.append(
                     SearchSessionTurn(
                         question: value,
                         answer: answer,
                         sources: sources,
                         possibleSources: outcome.possibleMatches,
-                        plan: plan
+                        plan: plan,
+                        answerClass: answerClass
                     )
                 )
                 if searchSession.count > 6 {
                     searchSession.removeFirst(searchSession.count - 6)
                 }
+                await knowledgeAgentSystem?.reportExternalActivity(
+                    role: .answer,
+                    state: .succeeded,
+                    detail: "Quellengebundene Antwort abgeschlossen.",
+                    processedItemCount: sources.count
+                )
             } catch is CancellationError {
+                isAnswerModelLoaded = false
                 answer = "Antwort wurde abgebrochen."
+                await knowledgeAgentSystem?.reportExternalActivity(
+                    role: .answer,
+                    state: .idle,
+                    detail: "Antwort abgebrochen."
+                )
             } catch {
+                isAnswerModelLoaded = false
+                await knowledgeAgentSystem?.reportExternalActivity(
+                    role: .answer,
+                    state: .failed,
+                    detail: error.localizedDescription
+                )
                 report(error)
             }
         }
@@ -2391,6 +2521,7 @@ final class AppState {
         searchPlanCache = [:]
         submittedQuestion = ""
         answer = ""
+        answerClass = .unknown
         searchResults = []
         possibleSearchResults = []
         currentSearchPlan = nil
@@ -2458,6 +2589,10 @@ final class AppState {
             knowledgeStatistics = try await database.knowledgeStatistics()
             if developerModeEnabled {
                 knowledgeReviewSnapshot = try await database.knowledgeReviewSnapshot()
+                ontologyTypes = try await database.ontologyTypes()
+                if let knowledgeAgentSystem {
+                    agentSnapshots = await knowledgeAgentSystem.currentSnapshots()
+                }
             }
             logEntries = try await database.recentErrors()
         } catch {
@@ -2469,6 +2604,8 @@ final class AppState {
         Task {
             do {
                 try await database.enqueueAllKnowledgeReanalysis()
+                await configureKnowledgeAgentSystem()
+                ensureRecommendedKnowledgeModelsIfAllowed()
                 knowledgeStatistics = try await database.knowledgeStatistics()
                 knowledgeReviewSnapshot = try await database.knowledgeReviewSnapshot()
                 modelMessage = "Die betroffenen Wissensanalysen wurden idempotent neu eingereiht."
@@ -2602,6 +2739,7 @@ final class AppState {
         downloadingModelID = model.id
         pausedModelID = nil
         modelMessage = nil
+        let modelTaskGate = generativeTaskGate
         modelDownloadTask = Task {
             defer {
                 downloadingModelID = nil
@@ -2630,7 +2768,11 @@ final class AppState {
                                 directory: directory,
                                 contextLength: descriptor.defaultContextLength
                             )
-                            try await generator.test()
+                            try await modelTaskGate.withExclusiveAccess({
+                                try await generator.test()
+                            }, cleanup: {
+                                await generator.unload()
+                            })
                         case .documentVision:
                             let analyzer = MLXDocumentVisionAnalyzer(
                                 modelID: descriptor.id,
@@ -2638,8 +2780,11 @@ final class AppState {
                                 directory: directory,
                                 contextLength: descriptor.defaultContextLength
                             )
-                            try await analyzer.test()
-                            await analyzer.unload()
+                            try await modelTaskGate.withExclusiveAccess({
+                                try await analyzer.test()
+                            }, cleanup: {
+                                await analyzer.unload()
+                            })
                         }
                     }
                 ) { [weak self] progress in
@@ -2651,6 +2796,8 @@ final class AppState {
                 await refreshModels()
                 if activateAfterInstall {
                     activateModel(model)
+                } else {
+                    ensureRecommendedKnowledgeModelsIfAllowed()
                 }
             } catch is ModelDownloadPausedError {
                 pausedModelID = model.id
@@ -2740,6 +2887,10 @@ final class AppState {
                         throw error
                     }
                 case .answer:
+                    await validatorGenerator?.unload()
+                    await documentVisionAnalyzer?.unload()
+                    isValidatorModelLoaded = false
+                    isDocumentVisionModelLoaded = false
                     let generator = MLXAnswerGenerator(
                         modelID: model.id,
                         modelVersion: model.descriptor.modelVersion,
@@ -2747,12 +2898,19 @@ final class AppState {
                         contextLength: model.descriptor.defaultContextLength,
                         idleTimeout: .seconds(llmIdleMinutes * 60)
                     )
-                    try await generator.test()
+                    try await generativeTaskGate.withExclusiveAccess({
+                        try await generator.test()
+                    }, cleanup: {
+                        await generator.unload()
+                    })
                     try await modelManager.activate(modelID: model.id)
                     await unloadAnswerModel(reason: "Modellwechsel")
                     answerGenerator = generator
+                    knowledgeGenerator = model.descriptor.capabilities.contains(
+                        .structuredExtraction
+                    ) ? generator : nil
                     activeAnswerModelID = model.id
-                    isAnswerModelLoaded = true
+                    isAnswerModelLoaded = false
                     try await database.setModelEnabled(
                         modelID: model.id,
                         modelVersion: model.descriptor.modelVersion,
@@ -2761,6 +2919,10 @@ final class AppState {
                     try await database.setSetting(key: "activeAnswerModelID", value: model.id)
                     modelMessage = "Antwortmodell wurde getestet und aktiviert."
                 case .validator:
+                    await answerGenerator?.unload()
+                    await documentVisionAnalyzer?.unload()
+                    isAnswerModelLoaded = false
+                    isDocumentVisionModelLoaded = false
                     let generator = MLXAnswerGenerator(
                         modelID: model.id,
                         modelVersion: model.descriptor.modelVersion,
@@ -2768,14 +2930,21 @@ final class AppState {
                         contextLength: model.descriptor.defaultContextLength,
                         idleTimeout: .seconds(llmIdleMinutes * 60)
                     )
-                    try await generator.test()
+                    try await generativeTaskGate.withExclusiveAccess({
+                        try await generator.test()
+                    }, cleanup: {
+                        await generator.unload()
+                    })
                     try await modelManager.activate(modelID: model.id)
                     if let validatorGenerator {
                         await validatorGenerator.unload()
                     }
                     validatorGenerator = generator
+                    knowledgeValidatorGenerator = model.descriptor.capabilities.contains(
+                        .knowledgeValidation
+                    ) ? generator : nil
                     activeValidatorModelID = model.id
-                    isValidatorModelLoaded = true
+                    isValidatorModelLoaded = false
                     try await database.setModelEnabled(
                         modelID: model.id,
                         modelVersion: model.descriptor.modelVersion,
@@ -2787,20 +2956,28 @@ final class AppState {
                     )
                     modelMessage = "Prüfmodell wurde getestet und aktiviert."
                 case .documentVision:
+                    await answerGenerator?.unload()
+                    await validatorGenerator?.unload()
+                    isAnswerModelLoaded = false
+                    isValidatorModelLoaded = false
                     let analyzer = MLXDocumentVisionAnalyzer(
                         modelID: model.id,
                         modelVersion: model.descriptor.modelVersion,
                         directory: directory,
                         contextLength: model.descriptor.defaultContextLength
                     )
-                    try await analyzer.test()
+                    try await generativeTaskGate.withExclusiveAccess({
+                        try await analyzer.test()
+                    }, cleanup: {
+                        await analyzer.unload()
+                    })
                     try await modelManager.activate(modelID: model.id)
                     if let previous = documentVisionAnalyzer {
                         await previous.unload()
                     }
                     documentVisionAnalyzer = analyzer
                     activeDocumentVisionModelID = model.id
-                    isDocumentVisionModelLoaded = true
+                    isDocumentVisionModelLoaded = false
                     try await database.setModelEnabled(
                         modelID: model.id,
                         modelVersion: model.descriptor.modelVersion,
@@ -2813,7 +2990,9 @@ final class AppState {
                     modelMessage =
                         "Das lokale Dokumentmodell wurde geprüft und aktiviert."
                 }
+                await synchronizeKnowledgeModels()
                 await refreshModels()
+                ensureRecommendedKnowledgeModelsIfAllowed()
             } catch {
                 report(error)
             }
@@ -2828,6 +3007,7 @@ final class AppState {
                     guard activeAnswerModelID == model.id else { return }
                     await unloadAnswerModel(reason: "Vom Benutzer deaktiviert")
                     answerGenerator = nil
+                    knowledgeGenerator = nil
                     activeAnswerModelID = nil
                     await modelManager.deactivate(kind: .answer)
                     try await database.setModelEnabled(
@@ -2845,6 +3025,7 @@ final class AppState {
                     guard activeValidatorModelID == model.id else { return }
                     await validatorGenerator?.unload()
                     validatorGenerator = nil
+                    knowledgeValidatorGenerator = nil
                     activeValidatorModelID = nil
                     isValidatorModelLoaded = false
                     await modelManager.deactivate(kind: .validator)
@@ -2900,6 +3081,7 @@ final class AppState {
                     modelMessage =
                         "Das optische Dokumentmodell ist deaktiviert. Seiten bleiben zur manuellen Prüfung erhalten."
                 }
+                await synchronizeKnowledgeModels()
                 await refreshModels()
             } catch {
                 report(error, taskType: "Modell deaktivieren")
@@ -2929,7 +3111,11 @@ final class AppState {
                         directory: directory,
                         contextLength: model.descriptor.defaultContextLength
                     )
-                    try await generator.test()
+                    try await generativeTaskGate.withExclusiveAccess({
+                        try await generator.test()
+                    }, cleanup: {
+                        await generator.unload()
+                    })
                 } else {
                     let analyzer = MLXDocumentVisionAnalyzer(
                         modelID: model.id,
@@ -2937,8 +3123,11 @@ final class AppState {
                         directory: directory,
                         contextLength: model.descriptor.defaultContextLength
                     )
-                    try await analyzer.test()
-                    await analyzer.unload()
+                    try await generativeTaskGate.withExclusiveAccess({
+                        try await analyzer.test()
+                    }, cleanup: {
+                        await analyzer.unload()
+                    })
                 }
                 modelMessage = "Modelltest erfolgreich: \(model.descriptor.displayName)"
             } catch {
@@ -2953,6 +3142,7 @@ final class AppState {
                 if model.descriptor.kind == .answer, activeAnswerModelID == model.id {
                     await unloadAnswerModel(reason: "Modellentfernung")
                     answerGenerator = nil
+                    knowledgeGenerator = nil
                     activeAnswerModelID = nil
                     isAnswerModelLoaded = false
                     try await database.setModelEnabled(
@@ -2966,6 +3156,7 @@ final class AppState {
                    activeValidatorModelID == model.id {
                     await validatorGenerator?.unload()
                     validatorGenerator = nil
+                    knowledgeValidatorGenerator = nil
                     activeValidatorModelID = nil
                     isValidatorModelLoaded = false
                     try await database.setModelEnabled(
@@ -3017,6 +3208,7 @@ final class AppState {
                     modelVersion: model.descriptor.modelVersion
                 )
                 modelMessage = "Das Modell wurde in den Papierkorb verschoben."
+                await synchronizeKnowledgeModels()
                 await refreshModels()
             } catch {
                 report(error)
@@ -3193,6 +3385,10 @@ final class AppState {
                     contextLength: descriptor.defaultContextLength,
                     idleTimeout: .seconds(llmIdleMinutes * 60)
                 )
+                if let generator = answerGenerator as? any StructuredKnowledgeGenerating,
+                   descriptor.capabilities.contains(.structuredExtraction) {
+                    knowledgeGenerator = generator
+                }
                 try await modelManager.activate(modelID: answerID)
                 activeAnswerModelID = answerID
                 isAnswerModelLoaded = false
@@ -3218,6 +3414,10 @@ final class AppState {
                     contextLength: descriptor.defaultContextLength,
                     idleTimeout: .seconds(llmIdleMinutes * 60)
                 )
+                if let generator = validatorGenerator as? any StructuredKnowledgeGenerating,
+                   descriptor.capabilities.contains(.knowledgeValidation) {
+                    knowledgeValidatorGenerator = generator
+                }
                 try await modelManager.activate(modelID: validatorID)
                 activeValidatorModelID = validatorID
                 isValidatorModelLoaded = false
@@ -3406,6 +3606,135 @@ final class AppState {
         )
     }
 
+    private func configureKnowledgeAgentSystem() async {
+        let system: KnowledgeAgentSystem
+        if let knowledgeAgentSystem {
+            system = knowledgeAgentSystem
+        } else {
+            let created = KnowledgeAgentSystem(
+                database: database,
+                policy: KnowledgeExtractionPolicy(
+                    automaticSecondReview: automaticSecondReview,
+                    secondReviewConfidenceThreshold: reviewOnlyWhenUncertain
+                        ? 0.78
+                        : 1,
+                    maximumInputCharacters: hardwareProfile.physicalMemoryBytes
+                        <= 8_589_934_592 ? 16_000 : 24_000,
+                    maximumOutputTokens: hardwareProfile.physicalMemoryBytes
+                        <= 8_589_934_592 ? 1_536 : 2_048
+                ),
+                generativeTaskGate: generativeTaskGate
+            )
+            knowledgeAgentSystem = created
+            system = created
+            await system.setSnapshotHandler { [weak self] snapshots in
+                await MainActor.run {
+                    self?.agentSnapshots = snapshots
+                }
+            }
+        }
+        await system.setPolicy(
+            KnowledgeExtractionPolicy(
+                automaticSecondReview: automaticSecondReview,
+                secondReviewConfidenceThreshold: reviewOnlyWhenUncertain
+                    ? 0.78
+                    : 1,
+                maximumInputCharacters: hardwareProfile.physicalMemoryBytes
+                    <= 8_589_934_592 ? 16_000 : 24_000,
+                maximumOutputTokens: hardwareProfile.physicalMemoryBytes
+                    <= 8_589_934_592 ? 1_536 : 2_048
+            )
+        )
+        await system.setModels(
+            primary: knowledgeGenerator,
+            reviewer: automaticSecondReview ? knowledgeValidatorGenerator : nil
+        )
+        await system.setPaused(!knowledgeEnabled || isPaused)
+        await system.start()
+        ontologyTypes = (try? await database.ontologyTypes()) ?? []
+    }
+
+    private func synchronizeKnowledgeModels() async {
+        guard let knowledgeAgentSystem else { return }
+        await knowledgeAgentSystem.setModels(
+            primary: knowledgeGenerator,
+            reviewer: automaticSecondReview ? knowledgeValidatorGenerator : nil
+        )
+    }
+
+    private func ensureRecommendedKnowledgeModelsIfAllowed() {
+        guard automaticallyDownloadRecommendedModels,
+              automaticModelSelection,
+              modelStorageAvailable,
+              modelDownloadTask == nil else { return }
+        let descriptors = availableModels.map(\.descriptor)
+        let installedIDs = Set(
+            availableModels.filter(\.isInstalled).map(\.id)
+        )
+        let qwenID = descriptors.first {
+            $0.id.contains("Qwen3.5-4B")
+        }?.id
+        let phiID = descriptors.first {
+            $0.id.contains("Phi-4-mini")
+        }?.id
+        let preferences = ModelRoutingPreferences(
+            preferredPrimaryModelID: qwenID,
+            preferredValidationModelID: phiID,
+            automaticSelection: automaticModelSelection,
+            allowExperimentalModels: showExperimentalModels
+        )
+        let pressure: MemoryPressureLevel = switch memoryPressure {
+        case "Kritisch": .critical
+        case "Erhöht": .warning
+        default: .normal
+        }
+        if knowledgeGenerator == nil {
+            let decision = ModelRouter().route(
+                task: .structuredExtraction,
+                catalog: descriptors,
+                installedModelIDs: installedIDs,
+                profile: hardwareProfile,
+                pressure: pressure,
+                preferences: preferences
+            )
+            guard let descriptor = decision.descriptor,
+                  let qwen = availableModels.first(where: {
+                      $0.id == descriptor.id
+                  }) else {
+                modelMessage = decision.reason
+                return
+            }
+            if qwen.isInstalled {
+                activateModel(qwen)
+            } else if decision.requiresDownloadConsent {
+                installModel(qwen, activateAfterInstall: true)
+            }
+            return
+        }
+        if automaticSecondReview, knowledgeValidatorGenerator == nil {
+            let decision = ModelRouter().route(
+                task: .knowledgeValidation,
+                catalog: descriptors,
+                installedModelIDs: installedIDs,
+                profile: hardwareProfile,
+                pressure: pressure,
+                preferences: preferences
+            )
+            guard let descriptor = decision.descriptor,
+                  let phi = availableModels.first(where: {
+                      $0.id == descriptor.id
+                  }) else {
+                modelMessage = decision.reason
+                return
+            }
+            if phi.isInstalled {
+                activateModel(phi)
+            } else if decision.requiresDownloadConsent {
+                installModel(phi, activateAfterInstall: true)
+            }
+        }
+    }
+
     func ocrRequirementsChanged() {
         ocrInstallationMessage = nil
         guard ocrConfiguration.requiresTesseractComponents else {
@@ -3472,6 +3801,9 @@ final class AppState {
                 )
             }
         }
+        await knowledgeAgentSystem?.setPaused(
+            level == .critical || !knowledgeEnabled || isPaused
+        )
     }
 
     private func runMemoryPressureDiagnosticIfRequested() async {
@@ -3948,7 +4280,7 @@ struct HelpView: View {
             )
             helpSection(
                 "Lokales optisches Dokumentmodell",
-                "GLM-OCR kann schwierige Seiten nach PDFKit und Apple Vision optional lokal prüfen. Downloadgröße, RAM-Eignung, Version und Lizenz stehen unter Modelle. Download, Aktivierung, Deaktivierung und Löschen erfolgen nur auf Ihre Aktion; unsichere Vorschläge bleiben in OCR prüfen und lösen keine Dateiaktion aus.",
+                "Das aktive optische Dokumentmodell kann schwierige Seiten nach PDFKit und Apple Vision optional lokal prüfen. Downloadgröße, RAM-Eignung, Version und Lizenz stehen unter Modelle. Download, Aktivierung, Deaktivierung und Löschen erfolgen nur auf Ihre Aktion; unsichere Vorschläge bleiben in OCR prüfen und lösen keine Dateiaktion aus.",
                 symbol: "eye.trianglebadge.exclamationmark"
             )
             helpSection(
@@ -4725,6 +5057,16 @@ struct SearchView: View {
                 HStack {
                     Label("Findora", systemImage: "sparkles")
                         .font(.headline)
+                    if !state.answer.isEmpty {
+                        Text(verbatim: state.answerClass.displayName)
+                            .font(.caption.bold())
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(
+                                .secondary.opacity(0.12),
+                                in: Capsule()
+                            )
+                    }
                     Spacer()
                     if !state.answer.isEmpty {
                         Button("Antwort kopieren", systemImage: "doc.on.doc") {
@@ -8843,6 +9185,33 @@ struct SettingsView: View {
                     }
                     DisclosureGroup("Erfahrungswissen") {
                         reviewRecords(state.knowledgeReviewSnapshot.patterns)
+                    }
+                }
+                Section("Agentenmonitor") {
+                    ForEach(state.agentSnapshots) { snapshot in
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(verbatim: snapshot.role.displayName)
+                                    .font(.headline)
+                                if !snapshot.detail.isEmpty {
+                                    Text(verbatim: snapshot.detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Text(verbatim: snapshot.state.rawValue)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(
+                                    snapshot.state == .failed ? .red : .secondary
+                                )
+                        }
+                    }
+                    LabeledContent("Aktive Ontologietypen") {
+                        Text(
+                            state.ontologyTypes.filter(\.isEnabled).count,
+                            format: .number
+                        )
                     }
                 }
                 Section("Wissensdatenbank – Wartung") {

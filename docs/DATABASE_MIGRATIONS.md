@@ -2,7 +2,7 @@
 
 ## Schema-Version
 
-Findora erwartet Schema-Version 15. Beim Start werden aktuelle und erwartete
+Findora erwartet Schema-Version 16. Beim Start werden aktuelle und erwartete
 Version verglichen und ausschließlich fehlende Migrationen in aufsteigender
 Reihenfolge ausgeführt. Jede Migration läuft in einer SQLite-Transaktion und
 wird erst danach in `schema_migrations` dokumentiert.
@@ -80,7 +80,19 @@ Der isolierte Wissensreset leert ausschließlich Wissens-, Kommunikations- und
 Erfahrungstabellen. Dokumente, Seiten, OCR, Chunks, FTS und Embeddings sind
 nicht Teil dieses Resets.
 
-Migrationstests decken direkte Upgrades von Schema 10 und 11, Schema 15,
+Migrationstests decken direkte Upgrades von Schema 10 und 11, Schema 15 und 16,
 Rollback und
 Fortsetzung nach einem künstlichen Abbruch, Daten- und Embedding-Erhalt sowie
 `quick_check` und `integrity_check` ab.
+
+## Migration 16: Agenten, Audit und erweiterbare Ontologie
+
+Migration 16 ergänzt additiv `ontology_types`, `agent_runs` und `audit_log`
+sowie die Dokumentreferenz an Projektkandidaten. Eingebaute Domänentypen werden
+idempotent eingetragen. Benutzerdefinierte Typen werden als Datenzeilen
+registriert und benötigen deshalb keine weitere Schemaänderung.
+
+Agentenläufe enthalten nur technische Kennungen, Status, Zähler und
+Fehlerkategorien. Dokumenttext, Prompts und Antworten werden nicht in das
+Audit-Log geschrieben. Die Migration läuft transaktional und legt vor dem
+Upgrade einer bestehenden Wissensdatenbank eine lokale Sicherheitskopie an.

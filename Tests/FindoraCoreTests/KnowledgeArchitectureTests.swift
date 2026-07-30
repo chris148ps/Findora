@@ -64,7 +64,7 @@ func knowledgeJobsAreIdempotentAndRespectDependencies() async throws {
     defer { try? FileManager.default.removeItem(at: fixture.root) }
 
     var statistics = try await fixture.database.knowledgeStatistics()
-    #expect(statistics.pendingJobs == 10)
+    #expect(statistics.pendingJobs == 11)
 
     _ = try await fixture.database.indexDocument(
         file: fixture.file,
@@ -77,7 +77,7 @@ func knowledgeJobsAreIdempotentAndRespectDependencies() async throws {
         ocrPerformed: false
     )
     statistics = try await fixture.database.knowledgeStatistics()
-    #expect(statistics.pendingJobs == 10)
+    #expect(statistics.pendingJobs == 11)
 
     let first = try #require(try await fixture.database.nextKnowledgeJob())
     #expect(first.kind == .classifyDocument)
@@ -286,15 +286,21 @@ func modelRouterSelectsQwenPhiAndDemandDrivenGemma() throws {
         pressure: .normal
     )
     #expect(hiddenVision.descriptor?.id.contains("gemma-4") != true)
+    let gemmaID = try #require(
+        models.first { $0.id.contains("gemma-4-e2b") }?.id
+    )
     let enabledVision = router.route(
         task: .visionDocumentAnalysis,
         catalog: models,
         installedModelIDs: installed,
         profile: profile,
         pressure: .normal,
-        preferences: .init(allowExperimentalModels: true)
+        preferences: .init(
+            preferredVisionModelID: gemmaID,
+            allowExperimentalModels: true
+        )
     )
-    #expect(enabledVision.descriptor != nil)
+    #expect(enabledVision.descriptor?.id == gemmaID)
 }
 
 @Test
@@ -338,6 +344,25 @@ func criticalMemoryPressureMakesRoutingFailClosed() throws {
 }
 
 @Test
+func generativeTaskGateSerializesRuntimesAndRunsCleanup() async {
+    let gate = LocalGenerativeTaskGate()
+    let probe = GenerativeGateProbe()
+    await withTaskGroup(of: Void.self) { group in
+        for _ in 0..<3 {
+            group.addTask {
+                try? await gate.withExclusiveAccess({
+                    await probe.runOperation()
+                }, cleanup: {
+                    await probe.recordCleanup()
+                })
+            }
+        }
+    }
+    #expect(await probe.maximumConcurrentOperations() == 1)
+    #expect(await probe.cleanupCount() == 3)
+}
+
+@Test
 func queryPlanningAlwaysRequiresOriginalEvidence() {
     let plan = KnowledgeQueryPlanner().plan(
         hasResolvedEntity: true,
@@ -349,6 +374,43 @@ func queryPlanningAlwaysRequiresOriginalEvidence() {
     #expect(plan.useFullText)
     #expect(!plan.useVectorSearch)
     #expect(plan.requireOriginalEvidence)
+}
+
+@Test
+func answerClassificationFailsClosedWithoutCitationsAndDistinguishesProvenanceClass() {
+    let classifier = KnowledgeAnswerClassifier()
+    #expect(
+        classifier.classify(
+            question: "Was ist belegt?",
+            answer: "Eine Antwort ohne Quellen-ID.",
+            sources: []
+        ) == .unknown
+    )
+    let source = SearchSource(
+        id: "source",
+        documentID: 1,
+        chunkID: "chunk",
+        fileName: "synthetic.pdf",
+        absolutePath: "/synthetic.pdf",
+        relativePath: "synthetic.pdf",
+        pageNumber: 1,
+        excerpt: "Beleg",
+        score: 1
+    )
+    #expect(
+        classifier.classify(
+            question: "Berechne die Summe.",
+            answer: "Die belegte Summe beträgt 42 [S-001].",
+            sources: [source]
+        ) == .calculated
+    )
+    #expect(
+        classifier.classify(
+            question: "Was ist belegt?",
+            answer: "Die Unterlagen widersprechen sich [S-001].",
+            sources: [source]
+        ) == .conflict
+    )
 }
 
 @Test
@@ -463,6 +525,138 @@ func modelLeasesSwitchLargeModelsExclusively() async throws {
     #expect(!qwenLoadedAfterSwitch)
     #expect(phiLoadedAfterSwitch)
     await second.release()
+}
+
+@Test
+func knowledgeAgentSystemConsumesTheProductiveJobGraphAndAuditsEveryStage() async throws {
+    let fixture = try await makeKnowledgeDatabaseFixture(name: "AgentSystem")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let context = try #require(
+        try await fixture.database.knowledgeExtractionContext(
+            documentID: fixture.documentID,
+            modelID: "qwen-agent-test",
+            modelVersion: "1"
+        )
+    )
+    let generator = TestStructuredKnowledgeGenerator(
+        modelID: "qwen-agent-test",
+        modelVersion: "1",
+        output: try JSONEncoder().encode(testEnvelope(context: context))
+    )
+    let system = KnowledgeAgentSystem(
+        database: fixture.database,
+        policy: .init(automaticSecondReview: false)
+    )
+    await system.setModels(primary: generator, reviewer: nil)
+
+    for _ in 0..<11 {
+        #expect(await system.runNextJob())
+    }
+    #expect(!(await system.runNextJob()))
+    let statistics = try await fixture.database.knowledgeStatistics()
+    #expect(statistics.pendingJobs == 0)
+    #expect(statistics.entities == 1)
+    #expect(statistics.facts == 1)
+    #expect(try await fixture.database.agentRunCount() == 11)
+    #expect(try await fixture.database.auditEventCount() >= 22)
+    #expect(await generator.unloadCount == 1)
+
+    let api = FindoraLocalKnowledgeAPI(database: fixture.database)
+    let status = try await api.status()
+    #expect(status.knowledge.facts == 1)
+    #expect(status.ontologyTypeCount >= KnowledgeEntityType.allCases.count)
+    #expect(status.agentRunCount == 11)
+}
+
+@Test
+func knowledgeAgentWaitsForAModelResumesAndAuditsExistingServiceAgents() async throws {
+    let fixture = try await makeKnowledgeDatabaseFixture(name: "AgentResume")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let system = KnowledgeAgentSystem(
+        database: fixture.database,
+        policy: .init(automaticSecondReview: false)
+    )
+
+    #expect(await system.runNextJob())
+    #expect(
+        await system.currentSnapshots().first(where: { $0.role == .planner })?.state
+            == .waitingForModel
+    )
+
+    let context = try #require(
+        try await fixture.database.knowledgeExtractionContext(
+            documentID: fixture.documentID,
+            modelID: "qwen-resume-test",
+            modelVersion: "1"
+        )
+    )
+    let generator = TestStructuredKnowledgeGenerator(
+        modelID: "qwen-resume-test",
+        modelVersion: "1",
+        output: try JSONEncoder().encode(testEnvelope(context: context))
+    )
+    await system.setModels(primary: generator, reviewer: nil)
+    #expect(await system.runNextJob())
+
+    await system.reportExternalActivity(
+        role: .importAgent,
+        state: .running,
+        detail: "Synthetic import"
+    )
+    await system.reportExternalActivity(
+        role: .importAgent,
+        state: .succeeded,
+        detail: "Synthetic import completed",
+        processedItemCount: 1
+    )
+    #expect(try await fixture.database.agentRunCount() == 3)
+    #expect(try await fixture.database.auditEventCount() >= 6)
+}
+
+@Test
+func ontologyAcceptsRegisteredLocalTypesWithoutAnotherSchemaMigration() async throws {
+    let fixture = try await makeKnowledgeDatabaseFixture(name: "Ontology")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let customType = KnowledgeEntityType(rawValue: "medical_case")
+    try await fixture.database.registerOntologyType(
+        key: customType,
+        domain: "medicine",
+        displayName: "Medizinischer Fall",
+        description: "Lokal definierter Vorbereitungstyp"
+    )
+    let context = try #require(
+        try await fixture.database.knowledgeExtractionContext(
+            documentID: fixture.documentID,
+            modelID: "qwen-test",
+            modelVersion: "1"
+        )
+    )
+    let base = testEnvelope(context: context)
+    let entity = KnowledgeEntityCandidate(
+        candidateID: "medical-1",
+        type: customType,
+        canonicalName: "Lokaler Testfall",
+        confidence: 0.91,
+        evidenceIDs: ["ev-1"]
+    )
+    let envelope = KnowledgeExtractionEnvelope(
+        entities: [entity],
+        evidence: base.evidence
+    )
+    let validated = try KnowledgeExtractionValidator().validate(
+        envelope,
+        context: context
+    )
+    try await fixture.database.storeValidatedKnowledge(validated)
+
+    let ontology = try await fixture.database.ontologyTypes()
+    #expect(ontology.contains { $0.key == customType && !$0.isBuiltIn })
+    #expect(
+        try await fixture.database.knowledgeEntityID(
+            type: customType,
+            canonicalName: "Lokaler Testfall"
+        ) != nil
+    )
 }
 
 private struct KnowledgeDatabaseFixture {
@@ -580,4 +774,54 @@ private func testEnvelope(
         facts: [fact],
         evidence: [evidence]
     )
+}
+
+private actor TestStructuredKnowledgeGenerator: StructuredKnowledgeGenerating {
+    let modelID: String
+    let modelVersion: String
+    let output: Data
+    private(set) var unloadCount = 0
+
+    init(modelID: String, modelVersion: String, output: Data) {
+        self.modelID = modelID
+        self.modelVersion = modelVersion
+        self.output = output
+    }
+
+    func generateStructuredJSON(
+        instructions: String,
+        prompt: String,
+        maximumTokens: Int
+    ) async throws -> Data {
+        output
+    }
+
+    func unload() async {
+        unloadCount += 1
+    }
+}
+
+private actor GenerativeGateProbe {
+    private var activeOperations = 0
+    private var maximumOperations = 0
+    private var cleanups = 0
+
+    func runOperation() async {
+        activeOperations += 1
+        maximumOperations = max(maximumOperations, activeOperations)
+        try? await Task.sleep(for: .milliseconds(20))
+        activeOperations -= 1
+    }
+
+    func recordCleanup() {
+        cleanups += 1
+    }
+
+    func maximumConcurrentOperations() -> Int {
+        maximumOperations
+    }
+
+    func cleanupCount() -> Int {
+        cleanups
+    }
 }

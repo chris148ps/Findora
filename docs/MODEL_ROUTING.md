@@ -30,6 +30,11 @@ Downloadmanager zeigt Zweck, Größe, RAM und Lizenz, unterstützt
 Pause/Fortsetzung, prüft jede Datei und schließt atomar ab. Automatische
 empfohlene Downloads sind standardmäßig aus.
 
+Ist die lokale Opt-in-Einstellung aktiviert, verwendet die App diese
+Routingentscheidung produktiv: Qwen 3.5 und danach Phi-4 Mini werden aus dem
+festen Katalog installiert und aktiviert. Ohne Opt-in bleibt der Job
+`waiting_for_model`; es findet kein Hintergrunddownload statt.
+
 ## 8-GB-Schutz
 
 `ModelMemoryBudget` reserviert Runtime-RAM abzüglich Systemreserve. Bis 8 GiB
@@ -40,3 +45,8 @@ begrenzt. Kritischer Druck blockiert neue Leases.
 Wechsel wird die alte Runtime entladen und erst dann die neue geladen. Die
 Warteschlange ist priorisiert, abbruchfähig, timeoutbegrenzt und verwendet nach
 Ladefehlern einen Cooldown. Diagnoselogs enthalten keine Dokumentinhalte.
+
+Für die tatsächlich aufgerufenen MLX-Generatoren serialisiert zusätzlich ein
+prozessweiter `LocalGenerativeTaskGate` Wissensjobs, Suchplanung, Antworten
+und optische Analyse. Die Extraktionskoordination entlädt Qwen vor der
+unabhängigen Phi-Prüfung.

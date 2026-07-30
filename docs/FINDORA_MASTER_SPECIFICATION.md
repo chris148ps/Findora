@@ -2,7 +2,7 @@
 
 ## Lokale KI-Wissensplattform
 
-**Version 1.0 (Living Specification)**
+**Version 2.0 (Living Specification)**
 
 **Stand: 30.07.2026**
 
@@ -102,7 +102,7 @@ Unterstützung für:
 
 - EML
 - MBOX
-- MSG (zukünftig)
+- MSG
 
 Automatische Erkennung:
 
@@ -165,6 +165,11 @@ Agenten:
 Agenten kommunizieren ausschließlich über gemeinsame Services und den
 Wissensgraphen.
 
+Die produktive Koordination verwendet persistente, abhängige Jobs. Modellcode
+besitzt keinen Datenbankzugriff; nur schema- und quellenvalidierte Ergebnisse
+gelangen über den Wissensservice in eine Transaktion. Jeder Agentenlauf ist
+technisch revisionsfähig auditierbar, ohne Dokumentinhalte zu protokollieren.
+
 ## 9. Antwortsystem
 
 Pipeline:
@@ -217,6 +222,9 @@ Standardisierte Typen für:
 - Medizin (zukünftig)
 
 Neue Typen müssen ohne Datenmigration ergänzt werden können.
+
+Ontologietypen sind lokal registrierte Datenobjekte. Nicht registrierte
+Modelltypen werden fail-closed abgelehnt.
 
 ## 12. Qualitätsmodell
 
@@ -287,6 +295,7 @@ Optimiert für 8 GB:
 - adaptive Batchgrößen
 - Prioritäten
 - Leerlaufentladung
+- prozessweite Exklusivsperre für Qwen, Phi und Vision
 
 ## 17. Sicherheit
 

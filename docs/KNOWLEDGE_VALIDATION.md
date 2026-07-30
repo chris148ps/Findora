@@ -29,7 +29,9 @@ Prompt darf die Ausgabe einmal vollständig neu erzeugen.
 ## Aussagentypen und Zweitprüfung
 
 `explicit_fact` und `calculated_fact` können nach Quellenprüfung aktiv werden.
-`model_inference` bleibt `proposed/uncertain`. Ein Modell darf weder
+`model_inference` bleibt ausschließlich ein nicht faktischer
+`proposed/uncertain`-Prüfkandidat und wird weder im aktiven Wissensgraph noch
+für Antworten, Projekte, Kommunikation oder Erfahrungswissen verwendet. Ein Modell darf weder
 `user_confirmed` noch `externally_verified` behaupten. Abgelehnte Aussagen und
 Nutzerkorrekturen werden beim Upsert nicht überschrieben.
 
@@ -43,3 +45,12 @@ Die Suche kombiniert aktive `verified`/`supported` Wissensclaims mit FTS,
 Dateinamen und optionaler Vektorsuche. Ein Wissentreffer verweist auf den
 Originalbeleg und die Seite. `SourceCitationValidator` verwirft erfundene
 Quellen-IDs.
+
+`KnowledgeAnswerClassifier` kennzeichnet das sichtbare Ergebnis als
+`Gesichert`, `Berechnet`, `Wahrscheinlichkeit`, `Erfahrung`, `Konflikt` oder
+`Unbekannt`. Ohne mindestens eine reale Quelle und eine gültige Quellen-ID
+lautet die Klasse immer `Unbekannt`.
+
+Automatisch gebildete Projekte verknüpfen ausschließlich genau die validierten
+Belege, die von den angenommenen starken Projektsignalen referenziert werden.
+Ein bloßer Dokumentbezug oder ein häufiger Personenname reicht nicht aus.

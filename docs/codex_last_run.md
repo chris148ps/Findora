@@ -4,119 +4,118 @@ Stand: 30. Juli 2026
 
 ## Ausgangszustand
 
-- Branch `main`, Arbeitsbaum vor Beginn sauber, `origin/main` aktuell.
-- Ausgangscommit `needd8ca feat: add PDFKit hybrid search and OCR escalation`.
-- Baseline: 97 Tests bestanden.
-- SQLite-Schema 14, Modellkatalog Schema 1, keine getrennte Wissensschicht.
-- Keine produktiven Daten und keine Originaldokumente wurden geöffnet.
+- Branch `main`, Arbeitsbaum vor Beginn sauber.
+- Lokaler Ausgangscommit
+  `6f5b3b2 docs: Master-Spezifikation verankern`; `main` lag dadurch einen
+  Commit vor `origin/main`.
+- `git pull --ff-only`: bereits aktuell.
+- Baseline: 112 Tests bestanden, SQLite-Schema 15.
+- Die Modell-, Wissens- und Graphstrukturen waren vorhanden, aber
+  `KnowledgeExtractionCoordinator`, `ModelRouter` und die Wissensjobs waren
+  noch nicht produktiv durch einen dauerhaften Worker verdrahtet.
 
 ## Umsetzung
 
-### Modelle
+### Agenten und End-to-End-Verarbeitung
 
-- Katalog Schema 2 mit capability-basierten Rollen und Zuständen.
-- Qwen 3.5 4B MLX 4 Bit als primäres Text-/Wissensmodell.
-- Phi-4 Mini Instruct 4 Bit als lokales Prüfmodell.
-- Gemma 4 E2B Instruct 4 Bit als experimentelles visuelles Modell.
-- Gepinnte Revisionen, Einzeldateigrößen und SHA-256-Prüfsummen.
-- Capability-Router, 8-GB-Kontextgrenzen, Speicherdrucksperre,
-  priorisierte exklusive Leases, Abbruch, Timeout und Ladefehler-Cooldown.
-- Ältere Qwen-Modelle bleiben erhalten.
+- `KnowledgeAgentSystem` beansprucht die elf abhängigen Wissensjobs dauerhaft,
+  wartet ohne Fehlerloop auf fehlende Modelle und setzt nach Aktivierung fort.
+- Planner, Extraktion, Qualität, Projekt, Kommunikation, Erfahrung und Wartung
+  arbeiten über typisierte Datenbankservices. Bestehende Import-, OCR-,
+  Vision- und Antwortdienste melden Zustand und technische Läufe an denselben
+  Agentenmonitor.
+- `agent_runs` und `audit_log` speichern Rollen, Zustände, technische Zähler
+  und Revisionen ohne Dokumenttext, Prompt oder Modelloutput.
+- Deterministische Folgestufen validieren materialisierte Claims, bilden nur
+  aus mehreren starken Signalen Projekte, erkennen Konflikte, erzeugen
+  beleggebundene Kommunikationsereignisse und Zusammenfassungen und bauen ab
+  drei aktiven Claims vorgeschlagenes Erfahrungswissen auf.
 
-### Wissensdatenbank
+### Modelle und 8-GB-Grenze
 
-- SQLite-Schema 15 mit lokaler Sicherheitskopie vor einer Bestandsmigration.
-- Entitäten, Aliase, Kennungen, Fakten, Beziehungen, Claims, Belege,
-  Konflikte, Revisionen, Projekte, Zusammenfassungen, Jobs, Wissenslücken,
-  Kommunikation, Statistiken, Trends und Erfahrungswissen.
-- Fail-closed JSON- und Quellenvalidierung mit Dokument-, Seiten-, Chunk-,
-  Textstellen- und optionaler Bounding-Box-Prüfung.
-- Vollständig transaktionale Speicherung; keine Teilpersistenz.
-- Idempotente Jobketten bei neuem/geändertem Dokument.
-- Sichere Invalidierung: fehlende Quelle zieht einen Claim nur ohne weiteren
-  gültigen Beleg zurück.
-- begrenzte SQLite-Graphtraversierung und kombinierte
-  Wissens-/FTS-/Dateinamen-/Vektorretrieval.
+- Die standardmäßig ausgeschaltete Opt-in-Einstellung für empfohlene Downloads
+  lädt nun über den Capability-Router tatsächlich Qwen 3.5 und danach Phi-4
+  Mini aus dem gepinnten Katalog.
+- Gemma Vision bleibt experimentell und wird niemals durch dieses Opt-in
+  stillschweigend geladen.
+- `LocalGenerativeTaskGate` serialisiert Qwen, Phi, Antwortplanung,
+  Antwortgenerierung und optische Analyse prozessweit. Jede große Laufzeit wird
+  noch innerhalb dieser exklusiven Phase entladen; Qwen wird vor Phi
+  freigegeben. Kritischer Speicherdruck pausiert neue Agentenarbeit.
 
-### Kommunikation, Projekte und Erfahrung
+### Wissen, Ontologie, Antworten und lokale API
 
-- Threadbildung aus Unterhaltungskennung, Reply-Headern sowie Betreff plus
-  Teilnehmern; keine reine Betreffzuordnung.
-- Dauerhafte E-Mail-/Anhang-/Dokumentverknüpfung.
-- deterministische Entitätsauflösung mit Vorrang gespeicherter Negativregeln.
-- Projektbewertung verlangt starke Mehrfachsignale; häufiger Name allein wird
-  abgelehnt.
-- Tabellen und Diagnoseansicht für beleggebundenes Erfahrungswissen.
-
-### Oberfläche
-
-- Einstellungen für automatische Auswahl, Zweitprüfung, experimentelle
-  Modelle, Leerlaufentladung und standardmäßig ausgeschaltete automatische
-  Downloads.
-- Entwicklerbereich mit Übersicht, Projekten, Entitäten, Claims,
-  Kommunikationsgraph, Erfahrungswissen und Wartung.
-- Wissensfunktion deaktivierbar. Reset nur nach `RESET KNOWLEDGE`; Dokumente,
-  OCR und klassischer Suchindex bleiben erhalten.
-- Nativer persistenter Antwort-/Quellen-Trenner mit Mindestgrößen,
-  Doppelklick-Reset und kompakter Ersatzdarstellung.
+- SQLite-Schema 16 ergänzt transaktional und mit vorgelagerter lokaler
+  Sicherheitskopie erweiterbare Ontologietypen, Agentenläufe und Audit-Log.
+- Neue Fachtypen werden lokal registriert und benötigen keine weitere
+  Datenbankschemamigration. Nicht registrierte Modelltypen werden abgelehnt.
+- Projektbeziehungen übernehmen ausschließlich die von starken Signalen
+  referenzierten validierten Belege.
+- Antworten zeigen die Klassen `Gesichert`, `Berechnet`, `Wahrscheinlichkeit`,
+  `Erfahrung`, `Konflikt` oder `Unbekannt`; ohne reale Quelle und gültige
+  Quellen-ID wird fail-closed `Unbekannt` verwendet.
+- `LocalKnowledgeAPI` stellt eine transportneutrale lokale Fassade für Status,
+  Reviews, begrenzte Graphabfragen, Ontologie und idempotente Neuanalyse bereit,
+  öffnet aber keinen Netzwerklistener.
 
 ## Tests
 
-Der Bestand wurde von 97 auf 112 Tests erweitert. Neue Abdeckung umfasst:
+Der Bestand wurde von 112 auf 117 Tests erweitert. Neue Abdeckung umfasst:
 
-- Katalog und Routing für Qwen/Phi/Gemma,
-- 8-GB-Kontextbudget, kritischen Speicherdruck und exklusive Modellwechsel,
-- gültige und erfundene Quellen, falsche Seiten, fehlende Belege und
-  unzulässige Aussagentypen,
-- idempotente abhängige Jobs und vollständige Deaktivierung,
-- persistente Entitäten/Fakten/Relationen, Graph und kombinierte Suche,
-- Reset-Erhalt des klassischen Dokumentindexes,
-- Entitäts-Negativregeln und Projekt-Ablehnung bei häufigem Namen,
-- Splitter-Mindestgrößen und kompakte Darstellung.
+- vollständige produktive Wissensjobkette und Agenten-Audit;
+- `waiting_for_model`, Wiederaufnahme und bestehende Service-Agenten;
+- exklusive große Laufzeiten einschließlich Cleanup;
+- erweiterbare lokale Ontologie ohne neue Migration;
+- lokale API und fail-closed Antwortklassen.
 
 ## Noch extern abzunehmen
 
-- Reale Mehr-GB-Gewichte wurden in normalen Tests nicht heruntergeladen.
-- Qwen 3.5, Phi und Gemma benötigen reale Laufzeitabnahmen mit installierten
-  Gewichten.
-- Verbindliche Modell-RAM-/Zeitmessungen benötigen installierte Gewichte auf
-  dem vorhandenen 8-GB-Apple-Silicon-Prüfgerät.
-- Gemma bleibt bis zu dieser Abnahme und Lizenzfreigabe experimentell.
+- Reale Mehr-GB-Gewichte wurden nicht heruntergeladen.
+- Qwen 3.5, Phi-4 Mini und Gemma benötigen reale Laufzeit- und
+  Qualitätsabnahmen mit installierten Gewichten.
+- Verbindliche Modell-RAM-, Ladewechsel-, Langzeit- und End-to-End-Messungen
+  benötigen die freigegebenen Gewichte auf dem 8-GB-Apple-Silicon-Prüfgerät.
+- Gemma bleibt bis zur Lizenz- und Geräteabnahme experimentell.
+- Die native Oberfläche benötigt weiterhin die dokumentierte visuelle
+  Deutsch-/Englisch-, Hell-/Dunkel- und VoiceOver-Abnahme.
+- Der eingebettete Modellkatalog wird vom App-Bundle umfasst, aktuell aber nur
+  ad-hoc signiert. Eine vertrauenswürdige Developer-ID-Kette und eigene
+  Publisher-Signaturen der Upstream-Gewichte sind noch nicht abgenommen;
+  Gewichte werden bis dahin fail-closed über Revision, Größe und SHA-256
+  geprüft.
 
 ## Schutzbestätigung
 
-- keine Originaldokumente verändert,
-- keine produktiven App-Daten gelöscht oder migriert,
-- keine Modelle oder Buildartefakte in Git aufgenommen,
-- keine Versionsänderung,
-- kein Tag, kein Release und keine Notarisierung.
+- keine Originaldokumente verändert, verschoben oder gelöscht;
+- keine produktiven App-Daten migriert, repariert oder gelöscht;
+- keine Modelle heruntergeladen oder in Git aufgenommen;
+- keine Versionsänderung, kein Tag, kein Release und keine Notarisierung.
+
+Beim ersten Smoke-Abgleich wählte die PID-Suche irrtümlich eine bereits seit
+Stunden laufende Benutzerinstanz. Diese wurde ausschließlich read-only mit
+`ps`/`lsof` betrachtet und weder beendet noch bedient. Der von Codex gestartete
+Testprozess wurde sofort beendet. Die Wiederholung mit direkt ausgegebener PID
+bestätigte vor jeder UI-Aktion ausschließlich den isolierten Testpfad.
 
 ## Abschlussprüfungen
 
-- `swift test`: 112 Tests bestanden, 0 Fehler.
-- `swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors`:
-  bestanden.
-- `swift build -c release`: bestanden.
+- `swift test`: 117 Tests bestanden, 0 Fehler.
+- `swift build -Xswiftc -strict-concurrency=complete
+  -Xswiftc -warnings-as-errors`: bestanden.
 - `./scripts/check-product-name.sh`: bestanden.
 - `./scripts/check-localization.sh`: bestanden.
 - `./scripts/build-app.sh release`: bestanden.
 - `codesign --verify --deep --strict build/Findora.app`: bestanden
-  (Ad-hoc-Signatur, Bundle-ID `de.findora.app`).
+  (Ad-hoc-Signatur, Bundle-ID `de.findora.app`, arm64).
 - `git diff --check`: bestanden.
 - Isolierter Smoke-Test mit `FINDORA_TEST_ROOT` unter dem echten
-  macOS-Temporärverzeichnis: bestanden. Vor der ersten UI-Aktion zeigte `lsof`
-  ausschließlich Zugriffe auf die isolierte Testdatenbank und keine produktiven
-  oder benutzerdefinierten Findora-Daten- oder Modellpfade.
+  macOS-Temporärverzeichnis: bestanden. `lsof` zeigte für PID 44458 nur die
+  isolierte Datenbank und keinen produktiven oder benutzerdefinierten Findora-
+  Daten-, Dokument- oder Modellpfad.
+- Isolierter Leerlauf-RSS: 107.680 KB.
 - SQLite im isolierten Testbestand:
-  `quick_check = ok`, `integrity_check = ok`, 0 Fremdschlüsselverletzungen.
+  `quick_check = ok`, `integrity_check = ok`, 0
+  Fremdschlüsselverletzungen, Schema 16 und 25 aktive Ontologietypen.
 
-Das Prüfgerät ist ein Apple-M1-Mac mit 8 GB Unified Memory. Der isoliert
-gestartete Leerlaufprozess belegte 69.008 KB RSS. Reale Laufzeitmessungen mit
-geladenem Qwen-, Phi- oder Gemma-Modell wurden nicht vorgenommen, weil im
-Auftrag keine Zustimmung zu den dafür erforderlichen Multi-GB-Downloads
-vorlag. Daher bleiben Modell-RAM, Modellwechsel, visuelle Seitenanalyse und
-End-to-End-Modellqualität ausdrücklich als Geräteabnahme offen.
-
-Commit und Push werden im Abschlussbericht des Auftrags mit Hash und Ziel
-dokumentiert. Tag, Release, Notarisierung und Versionsänderung sind nicht Teil
-dieses Laufs.
+Commit und Push nach `origin/main` werden im Abschlussbericht mit Hash und
+Ziel dokumentiert.

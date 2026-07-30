@@ -5788,6 +5788,18 @@ public actor SQLiteDatabase {
         let envelope = extraction.envelope
         let context = extraction.context
         let timestamp = now.timeIntervalSince1970
+        let enabledOntologyTypes = Set(
+            try query(
+                "SELECT type_key FROM ontology_types WHERE enabled = 1"
+            ).compactMap { $0.string("type_key") }
+        )
+        guard envelope.entities.allSatisfy({
+            enabledOntologyTypes.contains($0.type.rawValue)
+        }) else {
+            throw FindoraError.database(
+                "Die Extraktion enthält einen nicht freigegebenen Ontologietyp."
+            )
+        }
         let encodedEnvelope = try JSONEncoder().encode(envelope)
         let outputHash = SHA256Hasher().hash(data: encodedEnvelope)
         let inputHash = SHA256Hasher().hash(
@@ -5999,21 +6011,32 @@ public actor SQLiteDatabase {
             }
 
             if !envelope.projectSignals.isEmpty {
-                let signalData = try JSONEncoder().encode(envelope.projectSignals)
+                let persistedSignals = envelope.projectSignals.map { signal in
+                    KnowledgeProjectSignal(
+                        kind: signal.kind,
+                        value: signal.value,
+                        weight: signal.weight,
+                        evidenceIDs: signal.evidenceIDs.compactMap {
+                            storedEvidenceIDs[$0]
+                        }
+                    )
+                }
+                let signalData = try JSONEncoder().encode(persistedSignals)
                 let candidateKey = SHA256Hasher().hash(
                     data: Data("\(context.documentHash):\(String(decoding: signalData, as: UTF8.self))".utf8)
                 )
-                let confidence = envelope.projectSignals.map(\.weight).reduce(0, +)
-                    / Double(envelope.projectSignals.count)
+                let confidence = persistedSignals.map(\.weight).reduce(0, +)
+                    / Double(persistedSignals.count)
                 try execute(
                     """
                     INSERT INTO knowledge_project_candidates (
-                        id, candidate_key, proposed_name, project_type, status,
+                        id, document_id, candidate_key, proposed_name, project_type, status,
                         confidence, supporting_signals_json, counter_signals_json,
                         extraction_model, model_version, prompt_version,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'proposed', ?, ?, '[]', ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?, '[]', ?, ?, ?, ?, ?)
                     ON CONFLICT(candidate_key) DO UPDATE SET
+                        document_id = excluded.document_id,
                         confidence = excluded.confidence,
                         supporting_signals_json = excluded.supporting_signals_json,
                         model_version = excluded.model_version,
@@ -6021,7 +6044,8 @@ public actor SQLiteDatabase {
                         updated_at = excluded.updated_at
                     """,
                     bindings: [
-                        .text("project-candidate-\(candidateKey)"), .text(candidateKey),
+                        .text("project-candidate-\(candidateKey)"),
+                        .integer(context.documentID), .text(candidateKey),
                         .text("Vorgang \(context.documentHash.prefix(10))"),
                         .text(envelope.documentType ?? "case"), .real(confidence),
                         .text(String(decoding: signalData, as: UTF8.self)),
@@ -6180,6 +6204,312 @@ public actor SQLiteDatabase {
                 .real(now.timeIntervalSince1970), .text(id)
             ]
         )
+    }
+
+    public func waitKnowledgeJobForModel(
+        id: String,
+        reason: String,
+        now: Date = .now
+    ) throws {
+        try execute(
+            """
+            UPDATE knowledge_jobs
+            SET state = 'waiting_for_model', last_error_category = ?,
+                not_before = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            bindings: [
+                .text(reason), .real(now.timeIntervalSince1970), .text(id)
+            ]
+        )
+    }
+
+    public func resumeKnowledgeJobsWaitingForModel(now: Date = .now) throws {
+        try execute(
+            """
+            UPDATE knowledge_jobs
+            SET state = 'pending', last_error_category = NULL, updated_at = ?
+            WHERE state = 'waiting_for_model'
+            """,
+            bindings: [.real(now.timeIntervalSince1970)]
+        )
+    }
+
+    @discardableResult
+    public func beginAgentRun(
+        role: FindoraAgentRole,
+        job: KnowledgeJob,
+        now: Date = .now
+    ) throws -> String {
+        let identifier = UUID().uuidString.lowercased()
+        try transaction {
+            try execute(
+                """
+                INSERT INTO agent_runs (
+                    id, agent_role, job_id, job_kind, state, started_at
+                ) VALUES (?, ?, ?, ?, 'running', ?)
+                """,
+                bindings: [
+                    .text(identifier), .text(role.rawValue), .text(job.id),
+                    .text(job.kind.rawValue), .real(now.timeIntervalSince1970)
+                ]
+            )
+            try appendAuditEvent(
+                eventType: "agent_started",
+                objectType: "knowledge_job",
+                objectID: job.id,
+                actor: role.rawValue,
+                metadata: [
+                    "jobKind": job.kind.rawValue,
+                    "targetKey": job.targetKey
+                ],
+                now: now.timeIntervalSince1970
+            )
+        }
+        return identifier
+    }
+
+    public func beginStandaloneAgentRun(
+        role: FindoraAgentRole,
+        now: Date = .now
+    ) throws -> String {
+        let identifier = UUID().uuidString.lowercased()
+        try transaction {
+            try execute(
+                """
+                INSERT INTO agent_runs (
+                    id, agent_role, job_id, job_kind, state, started_at
+                ) VALUES (?, ?, NULL, NULL, 'running', ?)
+                """,
+                bindings: [
+                    .text(identifier), .text(role.rawValue),
+                    .real(now.timeIntervalSince1970)
+                ]
+            )
+            try appendAuditEvent(
+                eventType: "agent_started",
+                objectType: "agent_run",
+                objectID: identifier,
+                actor: role.rawValue,
+                metadata: [:],
+                now: now.timeIntervalSince1970
+            )
+        }
+        return identifier
+    }
+
+    public func finishAgentRun(
+        id: String,
+        state: FindoraAgentState,
+        processedItemCount: Int,
+        errorCategory: String?,
+        now: Date = .now
+    ) throws {
+        try transaction {
+            try execute(
+                """
+                UPDATE agent_runs
+                SET state = ?, processed_item_count = ?, error_category = ?,
+                    completed_at = ?
+                WHERE id = ?
+                """,
+                bindings: [
+                    .text(state.rawValue),
+                    .integer(Int64(max(0, processedItemCount))),
+                    errorCategory.map(SQLiteValue.text) ?? .null,
+                    .real(now.timeIntervalSince1970), .text(id)
+                ]
+            )
+            if let row = try query(
+                """
+                SELECT agent_role, job_id, job_kind
+                FROM agent_runs WHERE id = ?
+                """,
+                bindings: [.text(id)]
+            ).first,
+            let role = row.string("agent_role") {
+                let jobID = row.string("job_id")
+                try appendAuditEvent(
+                    eventType: "agent_\(state.rawValue)",
+                    objectType: jobID == nil ? "agent_run" : "knowledge_job",
+                    objectID: jobID ?? id,
+                    actor: role,
+                    metadata: [
+                        "jobKind": row.string("job_kind") ?? "",
+                        "processedItemCount": String(max(0, processedItemCount)),
+                        "errorCategory": errorCategory ?? ""
+                    ],
+                    now: now.timeIntervalSince1970
+                )
+            }
+        }
+    }
+
+    public func ontologyTypes(enabledOnly: Bool = false) throws -> [KnowledgeOntologyType] {
+        let rows = try query(
+            """
+            SELECT type_key, domain_key, display_name, description,
+                   is_builtin, enabled, revision
+            FROM ontology_types
+            \(enabledOnly ? "WHERE enabled = 1" : "")
+            ORDER BY domain_key, display_name, type_key
+            """
+        )
+        return rows.compactMap { row in
+            guard let key = row.string("type_key"),
+                  let domain = row.string("domain_key"),
+                  let displayName = row.string("display_name"),
+                  let description = row.string("description"),
+                  let builtIn = row.int64("is_builtin"),
+                  let enabled = row.int64("enabled"),
+                  let revision = row.int64("revision") else { return nil }
+            return KnowledgeOntologyType(
+                key: KnowledgeEntityType(rawValue: key),
+                domain: domain,
+                displayName: displayName,
+                description: description,
+                isBuiltIn: builtIn == 1,
+                isEnabled: enabled == 1,
+                revision: Int(revision)
+            )
+        }
+    }
+
+    public func agentRunCount() throws -> Int {
+        Int(try scalarInt64("SELECT COUNT(*) FROM agent_runs"))
+    }
+
+    public func auditEventCount() throws -> Int {
+        Int(try scalarInt64("SELECT COUNT(*) FROM audit_log"))
+    }
+
+    public func registerOntologyType(
+        key: KnowledgeEntityType,
+        domain: String,
+        displayName: String,
+        description: String,
+        now: Date = .now
+    ) throws {
+        guard key.isSyntacticallyValid,
+              domain.range(
+                of: #"^[a-z][a-z0-9_-]{1,63}$"#,
+                options: .regularExpression
+              ) != nil,
+              !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw FindoraError.database("Der Ontologietyp ist syntaktisch ungültig.")
+        }
+        let timestamp = now.timeIntervalSince1970
+        try transaction {
+            try execute(
+                """
+                INSERT INTO ontology_types (
+                    type_key, domain_key, display_name, description,
+                    is_builtin, enabled, revision, schema_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 0, 1, 1, '{}', ?, ?)
+                ON CONFLICT(type_key) DO UPDATE SET
+                    domain_key = excluded.domain_key,
+                    display_name = excluded.display_name,
+                    description = excluded.description,
+                    enabled = 1,
+                    revision = ontology_types.revision + 1,
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(key.rawValue), .text(domain), .text(displayName),
+                    .text(description), .real(timestamp), .real(timestamp)
+                ]
+            )
+            try appendAuditEvent(
+                eventType: "ontology_upsert",
+                objectType: "ontology_type",
+                objectID: key.rawValue,
+                actor: "user",
+                metadata: ["domain": domain],
+                now: timestamp
+            )
+        }
+    }
+
+    /// Executes source-bound deterministic stages after the model extraction.
+    /// Every stage reads validated persisted state and writes transactionally.
+    @discardableResult
+    public func performKnowledgePostprocessing(
+        kind: KnowledgeJobKind,
+        documentID: Int64?,
+        inputHash: String,
+        now: Date = .now
+    ) throws -> Int {
+        try ensureOpen()
+        let timestamp = now.timeIntervalSince1970
+        return try transaction {
+            switch kind {
+            case .extractEntities:
+                return try validatedMaterializedCount(
+                    documentID: documentID,
+                    table: "knowledge_entity_evidence",
+                    evidenceColumn: "evidence_id"
+                )
+            case .extractFacts:
+                return try validatedClaimCount(
+                    documentID: documentID,
+                    objectTable: "knowledge_facts"
+                )
+            case .resolveEntities:
+                return try resolveKnowledgeEntitiesInTransaction(
+                    documentID: documentID,
+                    now: timestamp
+                )
+            case .buildRelations:
+                return try validatedClaimCount(
+                    documentID: documentID,
+                    objectTable: "knowledge_relations"
+                )
+            case .proposeProjects:
+                return try promoteStrongProjectCandidatesInTransaction(
+                    documentID: documentID,
+                    now: timestamp
+                )
+            case .validateKnowledge:
+                return try validateStoredClaimsInTransaction(documentID: documentID)
+            case .detectConflicts:
+                return try refreshKnowledgeConflictsInTransaction(
+                    documentID: documentID,
+                    now: timestamp
+                )
+            case .refreshSummaries:
+                return try refreshExtractiveKnowledgeSummaryInTransaction(
+                    documentID: documentID,
+                    now: timestamp
+                )
+            case .analyzeCommunication:
+                try refreshCommunicationGraphInTransaction()
+                return try refreshCommunicationEventsInTransaction(
+                    documentID: documentID,
+                    now: timestamp
+                )
+            case .refreshExperience:
+                return try refreshExperienceKnowledgeInTransaction(now: timestamp)
+            case .removeStaleKnowledge:
+                return try markUnsupportedKnowledgeInTransaction(now: timestamp)
+            case .rebuildAffectedSubgraph:
+                guard let documentID,
+                      let hash = try query(
+                        "SELECT content_hash FROM documents WHERE id = ?",
+                        bindings: [.integer(documentID)]
+                      ).first?.string("content_hash") else {
+                    return 0
+                }
+                try enqueueKnowledgePipelineInTransaction(
+                    documentID: documentID,
+                    inputHash: inputHash.isEmpty ? hash : inputHash,
+                    now: timestamp
+                )
+                return 1
+            case .classifyDocument:
+                throw KnowledgeAgentSystemError.incompleteValidatedExtraction(kind)
+            }
+        }
     }
 
     public func invalidateKnowledge(
@@ -6530,6 +6860,700 @@ public actor SQLiteDatabase {
         }
     }
 
+    private func validatedMaterializedCount(
+        documentID: Int64?,
+        table: String,
+        evidenceColumn: String
+    ) throws -> Int {
+        guard let documentID else { return 0 }
+        guard try hasCurrentKnowledgeAnalysis(documentID: documentID) else {
+            throw KnowledgeAgentSystemError.incompleteValidatedExtraction(.extractEntities)
+        }
+        return Int(
+            try scalarInt64(
+                """
+                SELECT COUNT(DISTINCT materialized.rowid)
+                FROM \(table) materialized
+                JOIN knowledge_evidence evidence
+                  ON evidence.id = materialized.\(evidenceColumn)
+                WHERE evidence.document_id = ?
+                  AND evidence.evidence_status = 'valid'
+                """,
+                bindings: [.integer(documentID)]
+            )
+        )
+    }
+
+    private func validatedClaimCount(
+        documentID: Int64?,
+        objectTable: String
+    ) throws -> Int {
+        guard let documentID else { return 0 }
+        guard try hasCurrentKnowledgeAnalysis(documentID: documentID) else {
+            throw KnowledgeAgentSystemError.incompleteValidatedExtraction(.extractFacts)
+        }
+        return Int(
+            try scalarInt64(
+                """
+                SELECT COUNT(DISTINCT object.claim_id)
+                FROM \(objectTable) object
+                JOIN knowledge_claims claim ON claim.id = object.claim_id
+                JOIN knowledge_claim_evidence link ON link.claim_id = claim.id
+                JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                WHERE evidence.document_id = ?
+                  AND evidence.evidence_status = 'valid'
+                  AND claim.validation_status IN ('verified', 'supported')
+                """,
+                bindings: [.integer(documentID)]
+            )
+        )
+    }
+
+    private func hasCurrentKnowledgeAnalysis(documentID: Int64) throws -> Bool {
+        try scalarInt64(
+            """
+            SELECT COUNT(*)
+            FROM knowledge_analysis_state state
+            JOIN documents document ON document.id = state.document_id
+            WHERE state.document_id = ?
+              AND state.document_hash = document.content_hash
+              AND state.validation_version IS NOT NULL
+            """,
+            bindings: [.integer(documentID)]
+        ) == 1
+    }
+
+    private func resolveKnowledgeEntitiesInTransaction(
+        documentID: Int64?,
+        now: Double
+    ) throws -> Int {
+        guard let documentID else { return 0 }
+        guard try hasCurrentKnowledgeAnalysis(documentID: documentID) else {
+            throw KnowledgeAgentSystemError.incompleteValidatedExtraction(.resolveEntities)
+        }
+        try execute(
+            """
+            UPDATE knowledge_entities
+            SET merge_status = 'automatic', updated_at = ?
+            WHERE id IN (
+                SELECT DISTINCT entity.id
+                FROM knowledge_entities entity
+                JOIN knowledge_entity_evidence link ON link.entity_id = entity.id
+                JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                WHERE evidence.document_id = ?
+                  AND evidence.evidence_status = 'valid'
+                  AND (
+                      entity.user_confirmed = 1
+                      OR EXISTS (
+                          SELECT 1 FROM knowledge_entity_identifiers identifier
+                          WHERE identifier.entity_id = entity.id
+                            AND identifier.confidence >= 0.90
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM knowledge_entity_negative_rules negative
+                      WHERE negative.left_entity_id = entity.id
+                         OR negative.right_entity_id = entity.id
+                  )
+            )
+            """,
+            bindings: [.real(now), .integer(documentID)]
+        )
+        return Int(
+            try scalarInt64(
+                """
+                SELECT COUNT(DISTINCT entity.id)
+                FROM knowledge_entities entity
+                JOIN knowledge_entity_evidence link ON link.entity_id = entity.id
+                JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                WHERE evidence.document_id = ?
+                  AND evidence.evidence_status = 'valid'
+                """,
+                bindings: [.integer(documentID)]
+            )
+        )
+    }
+
+    private func promoteStrongProjectCandidatesInTransaction(
+        documentID: Int64?,
+        now: Double
+    ) throws -> Int {
+        guard let documentID else { return 0 }
+        let rows = try query(
+            """
+            SELECT id, candidate_key, proposed_name, project_type, confidence,
+                   supporting_signals_json
+            FROM knowledge_project_candidates
+            WHERE document_id = ? AND status = 'proposed'
+            """,
+            bindings: [.integer(documentID)]
+        )
+        var promoted = 0
+        for row in rows {
+            guard let candidateID = row.string("id"),
+                  let candidateKey = row.string("candidate_key"),
+                  let proposedName = row.string("proposed_name"),
+                  let projectType = row.string("project_type"),
+                  let confidence = row.double("confidence"),
+                  let signalsJSON = row.string("supporting_signals_json"),
+                  let signalData = signalsJSON.data(using: .utf8),
+                  let signals = try? JSONDecoder().decode(
+                    [KnowledgeProjectSignal].self,
+                    from: signalData
+                  ) else { continue }
+            let meaningfulSignals = signals.filter { $0.weight >= 0.70 }
+            let strongSignals = meaningfulSignals.filter {
+                $0.weight >= 0.85 && Self.isStrongProjectSignal($0.kind)
+            }
+            guard confidence >= 0.90,
+                  meaningfulSignals.count >= 2,
+                  !strongSignals.isEmpty else {
+                continue
+            }
+            let projectID = "project-\(SHA256Hasher().hash(data: Data(candidateKey.utf8)))"
+            try execute(
+                """
+                INSERT INTO knowledge_projects (
+                    id, canonical_name, project_type, status, confidence,
+                    user_confirmed, analysis_version, created_at, updated_at
+                ) VALUES (?, ?, ?, 'active', ?, 0, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    canonical_name = excluded.canonical_name,
+                    project_type = excluded.project_type,
+                    confidence = MAX(knowledge_projects.confidence, excluded.confidence),
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(projectID), .text(proposedName), .text(projectType),
+                    .real(confidence), .text(FindoraAnalysisVersions.projectAnalysis),
+                    .real(now), .real(now)
+                ]
+            )
+            try execute(
+                """
+                INSERT INTO knowledge_project_members (
+                    project_id, member_type, member_id, status,
+                    confidence, reason, created_at
+                ) VALUES (?, 'document', ?, 'automatic', ?, ?, ?)
+                ON CONFLICT(project_id, member_type, member_id) DO UPDATE SET
+                    confidence = MAX(knowledge_project_members.confidence, excluded.confidence),
+                    reason = excluded.reason
+                """,
+                bindings: [
+                    .text(projectID), .text(String(documentID)), .real(confidence),
+                    .text("Mehrere starke, belegte Projektsignale"), .real(now)
+                ]
+            )
+            for signal in strongSignals {
+                for storedID in Set(signal.evidenceIDs) {
+                    let isValidForDocument = try scalarInt64(
+                        """
+                        SELECT COUNT(*) FROM knowledge_evidence
+                        WHERE id = ? AND document_id = ?
+                          AND evidence_status = 'valid'
+                        """,
+                        bindings: [.text(storedID), .integer(documentID)]
+                    ) == 1
+                    if isValidForDocument {
+                        try execute(
+                            """
+                            INSERT OR IGNORE INTO knowledge_project_evidence (
+                                project_id, evidence_id, signal_kind, weight
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            bindings: [
+                                .text(projectID), .text(storedID),
+                                .text(signal.kind), .real(signal.weight)
+                            ]
+                        )
+                    }
+                }
+            }
+            try execute(
+                """
+                UPDATE knowledge_project_candidates
+                SET status = 'accepted', updated_at = ?
+                WHERE id = ?
+                """,
+                bindings: [.real(now), .text(candidateID)]
+            )
+            try appendAuditEvent(
+                eventType: "project_formed",
+                objectType: "knowledge_project",
+                objectID: projectID,
+                actor: FindoraAgentRole.project.rawValue,
+                metadata: [
+                    "documentID": String(documentID),
+                    "signalCount": String(meaningfulSignals.count)
+                ],
+                now: now
+            )
+            promoted += 1
+        }
+        return promoted
+    }
+
+    private func validateStoredClaimsInTransaction(documentID: Int64?) throws -> Int {
+        guard let documentID else { return 0 }
+        guard try hasCurrentKnowledgeAnalysis(documentID: documentID) else {
+            throw KnowledgeAgentSystemError.incompleteValidatedExtraction(.validateKnowledge)
+        }
+        try execute(
+            """
+            UPDATE knowledge_claims
+            SET status = 'proposed', validation_status = 'unverifiable',
+                revision = revision + 1, updated_at = ?
+            WHERE status = 'active'
+              AND EXISTS (
+                  SELECT 1
+                  FROM knowledge_claim_evidence link
+                  JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                  WHERE link.claim_id = knowledge_claims.id
+                    AND evidence.document_id = ?
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM knowledge_claim_evidence link
+                  JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                  WHERE link.claim_id = knowledge_claims.id
+                    AND evidence.evidence_status = 'valid'
+              )
+            """,
+            bindings: [.real(Date().timeIntervalSince1970), .integer(documentID)]
+        )
+        return Int(
+            try scalarInt64(
+                """
+                SELECT COUNT(DISTINCT claim.id)
+                FROM knowledge_claims claim
+                JOIN knowledge_claim_evidence link ON link.claim_id = claim.id
+                JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                WHERE evidence.document_id = ?
+                  AND evidence.evidence_status = 'valid'
+                  AND claim.status = 'active'
+                  AND claim.validation_status IN ('verified', 'supported')
+                """,
+                bindings: [.integer(documentID)]
+            )
+        )
+    }
+
+    private func refreshKnowledgeConflictsInTransaction(
+        documentID: Int64?,
+        now: Double
+    ) throws -> Int {
+        guard let documentID else { return 0 }
+        try execute(
+            """
+            INSERT OR IGNORE INTO knowledge_conflicts (
+                id, claim_id, conflicting_claim_id, conflict_kind,
+                status, confidence, explanation, created_at, updated_at
+            )
+            SELECT
+                'conflict-' || lower(hex(randomblob(16))),
+                first.claim_id,
+                second.claim_id,
+                'different_literal_value',
+                'open',
+                MIN(first_claim.confidence, second_claim.confidence),
+                'Belegte Aussagen besitzen für dasselbe Subjekt und Prädikat unterschiedliche Werte.',
+                ?,
+                ?
+            FROM knowledge_facts first
+            JOIN knowledge_facts second
+              ON second.subject_entity_id = first.subject_entity_id
+             AND second.predicate = first.predicate
+             AND second.claim_id > first.claim_id
+             AND COALESCE(second.normalized_value, second.literal_value, '')
+                 <> COALESCE(first.normalized_value, first.literal_value, '')
+            JOIN knowledge_claims first_claim ON first_claim.id = first.claim_id
+            JOIN knowledge_claims second_claim ON second_claim.id = second.claim_id
+            WHERE first_claim.status = 'active'
+              AND second_claim.status = 'active'
+              AND first_claim.validation_status IN ('verified', 'supported')
+              AND second_claim.validation_status IN ('verified', 'supported')
+              AND EXISTS (
+                  SELECT 1 FROM knowledge_claim_evidence link
+                  JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                  WHERE link.claim_id IN (first.claim_id, second.claim_id)
+                    AND evidence.document_id = ?
+                    AND evidence.evidence_status = 'valid'
+              )
+            """,
+            bindings: [.real(now), .real(now), .integer(documentID)]
+        )
+        return Int(
+            try scalarInt64(
+                """
+                SELECT COUNT(DISTINCT conflict.id)
+                FROM knowledge_conflicts conflict
+                JOIN knowledge_claim_evidence link
+                  ON link.claim_id IN (conflict.claim_id, conflict.conflicting_claim_id)
+                JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                WHERE evidence.document_id = ? AND conflict.status <> 'resolved'
+                """,
+                bindings: [.integer(documentID)]
+            )
+        )
+    }
+
+    private func refreshExtractiveKnowledgeSummaryInTransaction(
+        documentID: Int64?,
+        now: Double
+    ) throws -> Int {
+        guard let documentID else { return 0 }
+        let rows = try query(
+            """
+            SELECT DISTINCT evidence.source_quote, claim.id AS claim_id,
+                   claim.revision
+            FROM knowledge_claims claim
+            JOIN knowledge_claim_evidence link ON link.claim_id = claim.id
+            JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+            WHERE evidence.document_id = ?
+              AND evidence.evidence_status = 'valid'
+              AND claim.status = 'active'
+              AND claim.validation_status IN ('verified', 'supported')
+            ORDER BY claim.confidence DESC, evidence.confidence DESC
+            LIMIT 8
+            """,
+            bindings: [.integer(documentID)]
+        )
+        let quotes = rows.compactMap { $0.string("source_quote") }
+        guard !quotes.isEmpty else { return 0 }
+        let summaryText = quotes.prefix(4)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .joined(separator: " · ")
+        let claimIDs = rows.compactMap { $0.string("claim_id") }.sorted()
+        let sourceHash = SHA256Hasher().hash(
+            data: Data(claimIDs.joined(separator: "\u{1f}").utf8)
+        )
+        let summaryID = "summary-document-\(documentID)"
+        let previous = try query(
+            """
+            SELECT source_set_hash, version
+            FROM knowledge_summary_versions
+            WHERE summary_id = ?
+            ORDER BY version DESC
+            LIMIT 1
+            """,
+            bindings: [.text(summaryID)]
+        ).first
+        if previous?.string("source_set_hash") == sourceHash {
+            return 1
+        }
+        let version = Int(previous?.int64("version") ?? 0) + 1
+        try execute(
+            """
+            INSERT INTO knowledge_summaries (
+                id, scope_type, scope_id, summary_text, confidence,
+                validation_status, validity_status, model_id, model_version,
+                prompt_version, created_at, updated_at
+            ) VALUES (?, 'document', ?, ?, 1, 'supported', 'current',
+                      'findora-extractive', '1', 'source-quotes-v1', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                summary_text = excluded.summary_text,
+                confidence = excluded.confidence,
+                validation_status = excluded.validation_status,
+                validity_status = excluded.validity_status,
+                model_id = excluded.model_id,
+                model_version = excluded.model_version,
+                prompt_version = excluded.prompt_version,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .text(summaryID), .text(String(documentID)), .text(summaryText),
+                .real(now), .real(now)
+            ]
+        )
+        try execute(
+            """
+            INSERT INTO knowledge_summary_versions (
+                id, summary_id, version, summary_text, source_set_hash,
+                model_id, model_version, prompt_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'findora-extractive', '1',
+                      'source-quotes-v1', ?)
+            """,
+            bindings: [
+                .text("\(summaryID)-v\(version)"), .text(summaryID),
+                .integer(Int64(version)), .text(summaryText), .text(sourceHash),
+                .real(now)
+            ]
+        )
+        try execute(
+            "DELETE FROM knowledge_summary_dependencies WHERE summary_id = ?",
+            bindings: [.text(summaryID)]
+        )
+        try execute(
+            """
+            INSERT INTO knowledge_summary_dependencies (
+                summary_id, dependency_type, dependency_id, dependency_revision
+            ) VALUES (?, 'document', ?, 1)
+            """,
+            bindings: [.text(summaryID), .text(String(documentID))]
+        )
+        return 1
+    }
+
+    private func refreshCommunicationEventsInTransaction(
+        documentID: Int64?,
+        now: Double
+    ) throws -> Int {
+        guard let documentID else { return 0 }
+        let messages = try query(
+            """
+            SELECT message.id, message.sent_at
+            FROM communication_messages message
+            JOIN emails email ON email.id = message.email_id
+            WHERE email.document_id = ?
+            """,
+            bindings: [.integer(documentID)]
+        )
+        guard !messages.isEmpty else { return 0 }
+        let claims = try query(
+            """
+            SELECT fact.claim_id, fact.subject_entity_id, fact.object_entity_id,
+                   fact.predicate, fact.literal_value, claim.confidence,
+                   claim.validation_status
+            FROM knowledge_facts fact
+            JOIN knowledge_claims claim ON claim.id = fact.claim_id
+            WHERE claim.status = 'active'
+              AND claim.validation_status IN ('verified', 'supported')
+              AND EXISTS (
+                  SELECT 1 FROM knowledge_claim_evidence link
+                  JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                  WHERE link.claim_id = claim.id
+                    AND evidence.document_id = ?
+                    AND evidence.evidence_status = 'valid'
+              )
+            """,
+            bindings: [.integer(documentID)]
+        )
+        var inserted = 0
+        for message in messages {
+            guard let messageID = message.string("id") else { continue }
+            for claim in claims {
+                guard let claimID = claim.string("claim_id"),
+                      let predicate = claim.string("predicate"),
+                      let eventType = Self.communicationEventType(for: predicate),
+                      let confidence = claim.double("confidence"),
+                      let validationStatus = claim.string("validation_status")
+                else { continue }
+                let signature = "\(messageID)\u{1f}\(claimID)\u{1f}\(eventType.rawValue)"
+                let eventID = "communication-event-\(SHA256Hasher().hash(data: Data(signature.utf8)))"
+                try execute(
+                    """
+                    INSERT OR IGNORE INTO communication_events (
+                        id, message_id, event_type, subject_entity_id,
+                        object_entity_id, literal_value, occurred_at, claim_id,
+                        confidence, validation_status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    bindings: [
+                        .text(eventID), .text(messageID), .text(eventType.rawValue),
+                        claim.string("subject_entity_id").map(SQLiteValue.text) ?? .null,
+                        claim.string("object_entity_id").map(SQLiteValue.text) ?? .null,
+                        claim.string("literal_value").map(SQLiteValue.text) ?? .null,
+                        message.double("sent_at").map(SQLiteValue.real) ?? .null,
+                        .text(claimID), .real(confidence),
+                        .text(validationStatus), .real(now)
+                    ]
+                )
+                inserted += 1
+            }
+        }
+        return inserted
+    }
+
+    private func refreshExperienceKnowledgeInTransaction(now: Double) throws -> Int {
+        let groups = try query(
+            """
+            SELECT fact.predicate, COUNT(DISTINCT claim.id) AS sample_count
+            FROM knowledge_facts fact
+            JOIN knowledge_claims claim ON claim.id = fact.claim_id
+            WHERE claim.status = 'active'
+              AND claim.validation_status IN ('verified', 'supported')
+              AND claim.claim_type IN ('explicit_fact', 'calculated_fact')
+            GROUP BY fact.predicate
+            HAVING COUNT(DISTINCT claim.id) >= 3
+            """
+        )
+        var refreshed = 0
+        for group in groups {
+            guard let predicate = group.string("predicate"),
+                  let count = group.int64("sample_count") else { continue }
+            let claimIDs = try query(
+                """
+                SELECT claim.id
+                FROM knowledge_facts fact
+                JOIN knowledge_claims claim ON claim.id = fact.claim_id
+                WHERE fact.predicate = ?
+                  AND claim.status = 'active'
+                  AND claim.validation_status IN ('verified', 'supported')
+                  AND claim.claim_type IN ('explicit_fact', 'calculated_fact')
+                ORDER BY claim.id
+                """,
+                bindings: [.text(predicate)]
+            ).compactMap { $0.string("id") }
+            let sourceHash = SHA256Hasher().hash(
+                data: Data(claimIDs.joined(separator: "\u{1f}").utf8)
+            )
+            let keyHash = SHA256Hasher().hash(data: Data(predicate.utf8))
+            let statisticID = "statistic-predicate-\(keyHash)"
+            try execute(
+                """
+                INSERT INTO knowledge_statistics (
+                    id, statistic_key, scope_type, scope_id, sample_count,
+                    numeric_value, text_value, calculation_version,
+                    source_set_hash, calculated_at
+                ) VALUES (?, ?, 'global', NULL, ?, ?, ?, 'experience-v1', ?, ?)
+                ON CONFLICT(statistic_key) DO UPDATE SET
+                    sample_count = excluded.sample_count,
+                    numeric_value = excluded.numeric_value,
+                    text_value = excluded.text_value,
+                    calculation_version = excluded.calculation_version,
+                    source_set_hash = excluded.source_set_hash,
+                    calculated_at = excluded.calculated_at
+                """,
+                bindings: [
+                    .text(statisticID), .text("predicate_frequency:\(predicate)"),
+                    .integer(count), .real(Double(count)), .text(predicate),
+                    .text(sourceHash), .real(now)
+                ]
+            )
+            let patternID = "pattern-predicate-\(keyHash)"
+            let confidence = min(0.90, 0.55 + Double(count - 3) * 0.05)
+            try execute(
+                """
+                INSERT INTO knowledge_patterns (
+                    id, pattern_type, title, description, status, confidence,
+                    minimum_support, supporting_project_count,
+                    supporting_claim_count, model_id, model_version,
+                    analysis_version, created_at, updated_at
+                ) VALUES (?, 'recurring_predicate', ?, ?, 'proposed', ?, 3,
+                          0, ?, NULL, NULL, 'experience-v1', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    description = excluded.description,
+                    confidence = excluded.confidence,
+                    supporting_claim_count = excluded.supporting_claim_count,
+                    analysis_version = excluded.analysis_version,
+                    status = CASE WHEN knowledge_patterns.status IN ('confirmed', 'rejected')
+                        THEN knowledge_patterns.status ELSE 'proposed' END,
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(patternID), .text("Wiederkehrend: \(predicate)"),
+                    .text("\(count) belegte Aussagen verwenden dieses Prädikat."),
+                    .real(confidence), .integer(count), .real(now), .real(now)
+                ]
+            )
+            for claimID in claimIDs {
+                try execute(
+                    """
+                    INSERT OR REPLACE INTO knowledge_pattern_evidence (
+                        pattern_id, claim_id, weight
+                    ) VALUES (?, ?, 1)
+                    """,
+                    bindings: [.text(patternID), .text(claimID)]
+                )
+            }
+            refreshed += 1
+        }
+        return refreshed
+    }
+
+    private func markUnsupportedKnowledgeInTransaction(now: Double) throws -> Int {
+        try execute(
+            """
+            UPDATE knowledge_claims
+            SET status = CASE WHEN claim_type = 'user_confirmed'
+                    THEN 'review_required' ELSE 'deprecated' END,
+                validation_status = 'unverifiable',
+                revision = revision + 1,
+                updated_at = ?
+            WHERE status = 'active'
+              AND NOT EXISTS (
+                  SELECT 1 FROM knowledge_claim_evidence link
+                  JOIN knowledge_evidence evidence ON evidence.id = link.evidence_id
+                  WHERE link.claim_id = knowledge_claims.id
+                    AND evidence.evidence_status = 'valid'
+              )
+            """,
+            bindings: [.real(now)]
+        )
+        return Int(
+            try scalarInt64(
+                "SELECT COUNT(*) FROM knowledge_claims WHERE status = 'deprecated'"
+            )
+        )
+    }
+
+    private func appendAuditEvent(
+        eventType: String,
+        objectType: String,
+        objectID: String,
+        actor: String,
+        metadata: [String: String],
+        now: Double
+    ) throws {
+        let revision = try scalarInt64(
+            """
+            SELECT COALESCE(MAX(revision), 0) + 1
+            FROM audit_log
+            WHERE object_type = ? AND object_id = ?
+            """,
+            bindings: [.text(objectType), .text(objectID)]
+        )
+        let data = try JSONSerialization.data(
+            withJSONObject: metadata,
+            options: [.sortedKeys]
+        )
+        try execute(
+            """
+            INSERT INTO audit_log (
+                id, event_type, object_type, object_id, revision,
+                actor, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            bindings: [
+                .text(UUID().uuidString.lowercased()), .text(eventType),
+                .text(objectType), .text(objectID), .integer(revision),
+                .text(actor), .text(String(decoding: data, as: UTF8.self)),
+                .real(now)
+            ]
+        )
+    }
+
+    private static func isStrongProjectSignal(_ kind: String) -> Bool {
+        let normalized = kind.lowercased()
+        return [
+            "project", "projekt", "order", "auftrag", "contract", "vertrag",
+            "invoice", "rechnung", "address", "adresse", "serial", "device"
+        ].contains { normalized.contains($0) }
+    }
+
+    private static func communicationEventType(
+        for predicate: String
+    ) -> CommunicationEventType? {
+        let normalized = predicate.lowercased()
+        let mappings: [(CommunicationEventType, [String])] = [
+            (.decision, ["decision", "entscheidung", "beschlossen"]),
+            (.commitment, ["commitment", "promise", "zusage", "zugesagt"]),
+            (.rejection, ["rejection", "ablehnung", "abgelehnt"]),
+            (.question, ["question", "frage", "offene_frage"]),
+            (.missingDocument, ["missing_document", "fehlendes_dokument"]),
+            (.appointmentChanged, ["appointment", "termin", "deadline", "frist"]),
+            (.approval, ["approval", "freigabe", "genehmigung"]),
+            (.requirement, ["requirement", "anforderung"]),
+            (.technicalChange, ["technical_change", "technische_aenderung"]),
+            (.task, ["task", "aufgabe", "todo"]),
+            (.responsibility, ["responsibility", "verantwortlich"])
+        ]
+        return mappings.first { _, tokens in
+            tokens.contains { normalized.contains($0) }
+        }?.0
+    }
+
     private func enqueueKnowledgePipelineInTransaction(
         documentID: Int64,
         inputHash: String,
@@ -6546,7 +7570,8 @@ public actor SQLiteDatabase {
             (.validateKnowledge, .knowledgeValidation, 54),
             (.detectConflicts, .contradictionDetection, 53),
             (.refreshSummaries, .summarization, 52),
-            (.analyzeCommunication, .structuredExtraction, 51)
+            (.analyzeCommunication, .structuredExtraction, 51),
+            (.refreshExperience, .structuredExtraction, 50)
         ]
         var previousID: String?
         for (kind, capability, priority) in stages {
@@ -7040,6 +8065,52 @@ public actor SQLiteDatabase {
                 )
             }
         }
+        if current < 16 {
+            if current >= 1 {
+                try createPreKnowledgeMigrationBackup(schemaVersion: Int(current))
+            }
+            try transaction {
+                let hasProjectCandidates = try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'knowledge_project_candidates'
+                    """
+                ) > 0
+                if hasProjectCandidates {
+                    let projectCandidateColumns = Set(
+                        try query("PRAGMA table_info(knowledge_project_candidates)")
+                            .compactMap { $0.string("name") }
+                    )
+                    if !projectCandidateColumns.contains("document_id") {
+                        try execute(
+                            """
+                            ALTER TABLE knowledge_project_candidates
+                            ADD COLUMN document_id INTEGER
+                            REFERENCES documents(id) ON DELETE SET NULL
+                            """
+                        )
+                    }
+                }
+                for statement in Self.migration16 {
+                    try execute(statement)
+                }
+                if hasProjectCandidates {
+                    try execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_project_candidates_document
+                        ON knowledge_project_candidates(
+                            document_id, status, confidence DESC
+                        )
+                        """
+                    )
+                }
+                try seedBuiltInOntology(now: Date().timeIntervalSince1970)
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (16, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
     }
 
     private func createPreKnowledgeMigrationBackup(schemaVersion: Int) throws {
@@ -7057,6 +8128,58 @@ public actor SQLiteDatabase {
         } catch {
             throw FindoraError.database(
                 "Die Sicherheitskopie vor der Wissensmigration konnte nicht erstellt werden: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func seedBuiltInOntology(now: Double) throws {
+        let types: [(KnowledgeEntityType, String, String, String)] = [
+            (.person, "general", "Person", "Natürliche Person"),
+            (.company, "general", "Unternehmen", "Wirtschaftliche Organisation"),
+            (.organization, "general", "Organisation", "Organisation oder Institution"),
+            (.project, "general", "Projekt", "Beleggebundener Vorgang oder Projekt"),
+            (.case, "general", "Vorgang", "Allgemeiner sachlicher Vorgang"),
+            (.property, "general", "Objekt", "Grundstück, Gebäude oder Anlage"),
+            (.address, "general", "Adresse", "Postanschrift oder Anlagenstandort"),
+            (.document, "general", "Dokument", "Lokales Dokument"),
+            (.invoice, "finance", "Rechnung", "Rechnung oder Abrechnung"),
+            (.contract, "law", "Vertrag", "Vertragliche Vereinbarung"),
+            (.offer, "finance", "Angebot", "Kaufmännisches Angebot"),
+            (.product, "general", "Produkt", "Produkt oder Bauteil"),
+            (.device, "electrical", "Gerät", "Elektrisches oder technisches Gerät"),
+            (.technicalSystem, "electrical", "Technisches System", "Technische Gesamtanlage"),
+            (.pvSystem, "pv", "PV-Anlage", "Photovoltaikanlage"),
+            (.battery, "storage", "Speicher", "Elektrischer Energiespeicher"),
+            (.wallbox, "wallbox", "Wallbox", "Ladeeinrichtung"),
+            (.inverter, "pv", "Wechselrichter", "PV- oder Speicherwechselrichter"),
+            (.authority, "authority", "Behörde", "Behörde oder öffentliche Stelle"),
+            (.gridOperator, "energy", "Netzbetreiber", "Elektrischer Netzbetreiber"),
+            (.standard, "law", "Norm", "Norm, Richtlinie oder Rechtsgrundlage"),
+            (.appointment, "general", "Termin", "Belegter Termin"),
+            (.task, "general", "Aufgabe", "Belegte Aufgabe oder Zusage"),
+            (.topic, "general", "Thema", "Fachliches Thema"),
+            (.location, "general", "Ort", "Geografischer Ort")
+        ]
+        for (type, domain, displayName, description) in types {
+            try execute(
+                """
+                INSERT INTO ontology_types (
+                    type_key, domain_key, display_name, description,
+                    is_builtin, enabled, revision, schema_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, 1, 1, '{}', ?, ?)
+                ON CONFLICT(type_key) DO UPDATE SET
+                    domain_key = CASE WHEN ontology_types.is_builtin = 1
+                        THEN excluded.domain_key ELSE ontology_types.domain_key END,
+                    display_name = CASE WHEN ontology_types.is_builtin = 1
+                        THEN excluded.display_name ELSE ontology_types.display_name END,
+                    description = CASE WHEN ontology_types.is_builtin = 1
+                        THEN excluded.description ELSE ontology_types.description END,
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(type.rawValue), .text(domain), .text(displayName),
+                    .text(description), .real(now), .real(now)
+                ]
             )
         }
     }
@@ -8721,6 +9844,52 @@ public actor SQLiteDatabase {
         "CREATE INDEX IF NOT EXISTS idx_communication_messages_thread ON communication_messages(thread_id, sent_at)",
         "CREATE INDEX IF NOT EXISTS idx_communication_events_type ON communication_events(event_type, occurred_at)",
         "CREATE INDEX IF NOT EXISTS idx_knowledge_patterns_status ON knowledge_patterns(status, confidence DESC)"
+    ]
+
+    private static let migration16 = [
+        """
+        CREATE TABLE IF NOT EXISTS ontology_types (
+            type_key TEXT PRIMARY KEY,
+            domain_key TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            is_builtin INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            revision INTEGER NOT NULL DEFAULT 1,
+            schema_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            CHECK(length(type_key) BETWEEN 2 AND 64)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS agent_runs (
+            id TEXT PRIMARY KEY,
+            agent_role TEXT NOT NULL,
+            job_id TEXT REFERENCES knowledge_jobs(id) ON DELETE SET NULL,
+            job_kind TEXT,
+            state TEXT NOT NULL,
+            processed_item_count INTEGER NOT NULL DEFAULT 0,
+            error_category TEXT,
+            started_at REAL NOT NULL,
+            completed_at REAL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            object_type TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            actor TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_ontology_domain ON ontology_types(domain_key, enabled, type_key)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_runs_state ON agent_runs(state, started_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_object ON audit_log(object_type, object_id, revision)"
     ]
 }
 
