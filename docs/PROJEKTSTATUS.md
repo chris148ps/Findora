@@ -29,6 +29,8 @@ Stand: 30. Juli 2026
 - deterministische Konflikt-, Kommunikationsereignis-, Projekt-,
   Zusammenfassungs- und Erfahrungsfolgestufen;
 - sichtbare Antwortklassen mit fail-closed `Unbekannt` ohne gültige Quellen.
+- unsichere Modellableitungen werden nie als Fakten/Relationen gespeichert;
+  offene Informationen werden als später auflösbare Wissenslücken geführt.
 
 ## Abnahmegrenzen
 

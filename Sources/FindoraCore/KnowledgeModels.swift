@@ -524,6 +524,7 @@ public struct KnowledgeStatistics: Equatable, Sendable {
     public let projects: Int
     public let conflicts: Int
     public let uncertainCandidates: Int
+    public let knowledgeGaps: Int
     public let pendingJobs: Int
     public let communicationThreads: Int
     public let communicationEvents: Int
@@ -536,6 +537,7 @@ public struct KnowledgeStatistics: Equatable, Sendable {
         projects: Int = 0,
         conflicts: Int = 0,
         uncertainCandidates: Int = 0,
+        knowledgeGaps: Int = 0,
         pendingJobs: Int = 0,
         communicationThreads: Int = 0,
         communicationEvents: Int = 0,
@@ -547,6 +549,7 @@ public struct KnowledgeStatistics: Equatable, Sendable {
         self.projects = projects
         self.conflicts = conflicts
         self.uncertainCandidates = uncertainCandidates
+        self.knowledgeGaps = knowledgeGaps
         self.pendingJobs = pendingJobs
         self.communicationThreads = communicationThreads
         self.communicationEvents = communicationEvents

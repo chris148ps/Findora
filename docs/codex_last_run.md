@@ -51,6 +51,8 @@ Stand: 30. Juli 2026
   Datenbankschemamigration. Nicht registrierte Modelltypen werden abgelehnt.
 - Projektbeziehungen übernehmen ausschließlich die von starken Signalen
   referenzierten validierten Belege.
+- `model_inference` wird vor der Persistenz aus Fakten und Relationen entfernt;
+  nur eine inhaltsarme, später auflösbare Wissenslücke bleibt bestehen.
 - Antworten zeigen die Klassen `Gesichert`, `Berechnet`, `Wahrscheinlichkeit`,
   `Erfahrung`, `Konflikt` oder `Unbekannt`; ohne reale Quelle und gültige
   Quellen-ID wird fail-closed `Unbekannt` verwendet.
@@ -60,13 +62,15 @@ Stand: 30. Juli 2026
 
 ## Tests
 
-Der Bestand wurde von 112 auf 117 Tests erweitert. Neue Abdeckung umfasst:
+Der Bestand wurde von 112 auf 118 Tests erweitert. Neue Abdeckung umfasst:
 
 - vollständige produktive Wissensjobkette und Agenten-Audit;
 - `waiting_for_model`, Wiederaufnahme und bestehende Service-Agenten;
 - exklusive große Laufzeiten einschließlich Cleanup;
 - erweiterbare lokale Ontologie ohne neue Migration;
 - lokale API und fail-closed Antwortklassen.
+- Verwerfen unsicherer Modellableitungen als Fakten sowie Erzeugen und
+  Schließen der zugehörigen Wissenslücke.
 
 ## Noch extern abzunehmen
 
@@ -99,7 +103,7 @@ bestätigte vor jeder UI-Aktion ausschließlich den isolierten Testpfad.
 
 ## Abschlussprüfungen
 
-- `swift test`: 117 Tests bestanden, 0 Fehler.
+- `swift test`: 118 Tests bestanden, 0 Fehler.
 - `swift build -Xswiftc -strict-concurrency=complete
   -Xswiftc -warnings-as-errors`: bestanden.
 - `./scripts/check-product-name.sh`: bestanden.
@@ -109,10 +113,10 @@ bestätigte vor jeder UI-Aktion ausschließlich den isolierten Testpfad.
   (Ad-hoc-Signatur, Bundle-ID `de.findora.app`, arm64).
 - `git diff --check`: bestanden.
 - Isolierter Smoke-Test mit `FINDORA_TEST_ROOT` unter dem echten
-  macOS-Temporärverzeichnis: bestanden. `lsof` zeigte für PID 44458 nur die
+  macOS-Temporärverzeichnis: bestanden. `lsof` zeigte für PID 46277 nur die
   isolierte Datenbank und keinen produktiven oder benutzerdefinierten Findora-
   Daten-, Dokument- oder Modellpfad.
-- Isolierter Leerlauf-RSS: 107.680 KB.
+- Isolierter Leerlauf-RSS: 106.368 KB.
 - SQLite im isolierten Testbestand:
   `quick_check = ok`, `integrity_check = ok`, 0
   Fremdschlüsselverletzungen, Schema 16 und 25 aktive Ontologietypen.

@@ -194,8 +194,8 @@ den klassischen Index nicht.
 Modellausgaben werden als versioniertes JSON gegen Schema, Dokument, Seite,
 Chunk, wörtliche Textstelle und Confidence geprüft und erst danach vollständig
 in einer Transaktion gespeichert. Freie Modelltexte besitzen keinen
-Datenbankzugriff. `model_inference` bleibt unsicher und darf weder als
-gesicherter Fakt noch als automatische Projektverknüpfung dienen.
+Datenbankzugriff. `model_inference` wird nie als Fakt oder Relation dauerhaft
+gespeichert; die offene Information erscheint stattdessen als Wissenslücke.
 
 Neue oder geänderte Dokumente erhalten idempotente Wissensjobs. Beim Entfernen
 werden Belege zunächst als fehlend markiert; ein Fakt bleibt aktiv, solange

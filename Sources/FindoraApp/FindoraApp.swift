@@ -9140,9 +9140,9 @@ struct SettingsView: View {
                             )
                         }
                         GridRow {
-                            Text("Konflikte / unsicher")
+                            Text("Konflikte / Wissenslücken")
                             Text(
-                                "\(state.knowledgeStatistics.conflicts) / \(state.knowledgeStatistics.uncertainCandidates)"
+                                "\(state.knowledgeStatistics.conflicts) / \(state.knowledgeStatistics.knowledgeGaps)"
                             )
                         }
                         GridRow {

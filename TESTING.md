@@ -89,6 +89,8 @@ Abgedeckt sind:
   Schema-Migration;
 - fail-closed Antwortklassen sowie Berechnet- und Konfliktklassifikation;
 - exklusive prozessweite Generativsperre zusätzlich zu Modellleases;
+- Verwerfen von `model_inference` als dauerhaftem Fakt, Erzeugen und späteres
+  Schließen der zugehörigen Wissenslücke;
 - Schema 16 mit Agenten-, Audit-, Ontologie- und Projektquellenfeldern.
 
 ## Reale MLX-Integration

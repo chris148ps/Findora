@@ -168,6 +168,20 @@ public struct KnowledgeExtractionValidator: Sendable {
                 evidenceByID: evidenceByID
             )
         }
+        for uncertainty in envelope.uncertainties {
+            guard !uncertainty.kind
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                !uncertainty.description
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                uncertainty.kind.count <= 128,
+                uncertainty.description.count <= 2_000,
+                uncertainty.relatedCandidateIDs.allSatisfy(allIDs.contains)
+            else {
+                throw KnowledgeValidationError.unsupportedValue(
+                    "knowledge_uncertainty"
+                )
+            }
+        }
 
         return ValidatedKnowledgeExtraction(envelope: envelope, context: context)
     }

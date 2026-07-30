@@ -29,9 +29,10 @@ Prompt darf die Ausgabe einmal vollständig neu erzeugen.
 ## Aussagentypen und Zweitprüfung
 
 `explicit_fact` und `calculated_fact` können nach Quellenprüfung aktiv werden.
-`model_inference` bleibt ausschließlich ein nicht faktischer
-`proposed/uncertain`-Prüfkandidat und wird weder im aktiven Wissensgraph noch
-für Antworten, Projekte, Kommunikation oder Erfahrungswissen verwendet. Ein Modell darf weder
+`model_inference` wird vor dem Datenbank-Schreibpfad aus Fakten und Relationen
+entfernt und niemals dauerhaft als Aussage gespeichert. Die fehlende
+Information wird nur als offene `knowledge_gap` ohne den behaupteten
+Faktinhalt geführt und bei einer später belegten Extraktion geschlossen. Ein Modell darf weder
 `user_confirmed` noch `externally_verified` behaupten. Abgelehnte Aussagen und
 Nutzerkorrekturen werden beim Upsert nicht überschrieben.
 

@@ -163,6 +163,52 @@ func validatedKnowledgePersistsEvidenceFactsRelationsAndGraph() async throws {
 }
 
 @Test
+func modelInferenceIsNeverPersistedAsAFactAndBecomesAResolvableKnowledgeGap() async throws {
+    let fixture = try await makeKnowledgeDatabaseFixture(name: "InferenceGap")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let context = try #require(
+        try await fixture.database.knowledgeExtractionContext(
+            documentID: fixture.documentID,
+            modelID: "qwen-inference-test",
+            modelVersion: "1"
+        )
+    )
+    let generator = TestStructuredKnowledgeGenerator(
+        modelID: "qwen-inference-test",
+        modelVersion: "1",
+        output: try JSONEncoder().encode(
+            testEnvelope(context: context, claimType: .modelInference)
+        )
+    )
+    let coordinator = KnowledgeExtractionCoordinator(
+        database: fixture.database,
+        primary: generator,
+        policy: .init(automaticSecondReview: false)
+    )
+    let result = try await coordinator.extractAndStore(context: context)
+
+    #expect(result.envelope.facts.isEmpty)
+    #expect(
+        result.envelope.uncertainties.contains {
+            $0.kind == "discarded_model_inference"
+        }
+    )
+    var statistics = try await fixture.database.knowledgeStatistics()
+    #expect(statistics.facts == 0)
+    #expect(statistics.uncertainCandidates == 0)
+    #expect(statistics.knowledgeGaps == 1)
+
+    let explicit = try KnowledgeExtractionValidator().validate(
+        testEnvelope(context: context),
+        context: context
+    )
+    try await fixture.database.storeValidatedKnowledge(explicit)
+    statistics = try await fixture.database.knowledgeStatistics()
+    #expect(statistics.facts == 1)
+    #expect(statistics.knowledgeGaps == 0)
+}
+
+@Test
 func knowledgeResetPreservesClassicDocumentIndex() async throws {
     let fixture = try await makeKnowledgeDatabaseFixture(name: "Reset")
     defer { try? FileManager.default.removeItem(at: fixture.root) }

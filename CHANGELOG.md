@@ -33,6 +33,8 @@ oder Tags.
 - Agentenmonitor und sichtbare Antwortklassen;
 - tatsächliches, ausdrücklich aktivierbares capability-basiertes
   Downloadrouting für empfohlene Wissensmodelle.
+- unsichere `model_inference`-Aussagen werden nicht als Fakten oder Relationen
+  gespeichert, sondern ausschließlich als auflösbare Wissenslücken geführt.
 
 ### Behoben
 

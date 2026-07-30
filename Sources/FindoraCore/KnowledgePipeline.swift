@@ -118,8 +118,9 @@ public struct KnowledgeExtractionCoordinator: Sendable {
                 result = primaryResult
             }
 
-            try await database.storeValidatedKnowledge(result)
-            return result
+            let durableResult = Self.removingUncertainClaims(from: result)
+            try await database.storeValidatedKnowledge(durableResult)
+            return durableResult
         } catch {
             await primary.unload()
             if let independentReviewer {
@@ -300,6 +301,59 @@ public struct KnowledgeExtractionCoordinator: Sendable {
         )
         .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
         .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func removingUncertainClaims(
+        from extraction: ValidatedKnowledgeExtraction
+    ) -> ValidatedKnowledgeExtraction {
+        let inferredFacts = extraction.envelope.facts.filter {
+            $0.claimType == .modelInference
+        }
+        let inferredRelations = extraction.envelope.relations.filter {
+            $0.claimType == .modelInference
+        }
+        guard !inferredFacts.isEmpty || !inferredRelations.isEmpty else {
+            return extraction
+        }
+        let discardedIDs = Set(
+            inferredFacts.map(\.candidateID)
+                + inferredRelations.map(\.candidateID)
+        )
+        let retainedUncertainties = extraction.envelope.uncertainties.map {
+            KnowledgeUncertainty(
+                kind: $0.kind,
+                description: $0.description,
+                relatedCandidateIDs: $0.relatedCandidateIDs.filter {
+                    !discardedIDs.contains($0)
+                }
+            )
+        }
+        let envelope = KnowledgeExtractionEnvelope(
+            schemaVersion: extraction.envelope.schemaVersion,
+            documentType: extraction.envelope.documentType,
+            documentTypeConfidence: extraction.envelope.documentTypeConfidence,
+            entities: extraction.envelope.entities,
+            facts: extraction.envelope.facts.filter {
+                $0.claimType != .modelInference
+            },
+            relations: extraction.envelope.relations.filter {
+                $0.claimType != .modelInference
+            },
+            evidence: extraction.envelope.evidence,
+            projectSignals: extraction.envelope.projectSignals,
+            uncertainties: retainedUncertainties + [
+                KnowledgeUncertainty(
+                    kind: "discarded_model_inference",
+                    description:
+                        "Nicht ausdrücklich belegte Modellableitungen wurden nicht als Fakten gespeichert.",
+                    relatedCandidateIDs: []
+                )
+            ]
+        )
+        return ValidatedKnowledgeExtraction(
+            envelope: envelope,
+            context: extraction.context
+        )
     }
 
     private static let instructions = """

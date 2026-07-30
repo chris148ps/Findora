@@ -5534,6 +5534,11 @@ public actor SQLiteDatabase {
                     """
                 )
             ),
+            knowledgeGaps: Int(
+                try scalarInt64(
+                    "SELECT COUNT(*) FROM knowledge_gaps WHERE status = 'open'"
+                )
+            ),
             pendingJobs: Int(
                 try scalarInt64(
                     """
@@ -5787,6 +5792,23 @@ public actor SQLiteDatabase {
         try ensureOpen()
         let envelope = extraction.envelope
         let context = extraction.context
+        let durableFacts = envelope.facts.filter {
+            $0.claimType != .modelInference
+        }
+        let durableRelations = envelope.relations.filter {
+            $0.claimType != .modelInference
+        }
+        var knowledgeGaps = envelope.uncertainties
+        if durableFacts.count != envelope.facts.count
+            || durableRelations.count != envelope.relations.count {
+            knowledgeGaps.append(
+                KnowledgeUncertainty(
+                    kind: "discarded_model_inference",
+                    description:
+                        "Nicht ausdrücklich belegte Modellableitungen wurden nicht als Fakten gespeichert."
+                )
+            )
+        }
         let timestamp = now.timeIntervalSince1970
         let enabledOntologyTypes = Set(
             try query(
@@ -5832,6 +5854,27 @@ public actor SQLiteDatabase {
                     .real(timestamp), .real(timestamp)
                 ]
             )
+
+            try execute(
+                """
+                UPDATE knowledge_gaps
+                SET status = 'resolved', last_checked_at = ?, updated_at = ?
+                WHERE context_type = 'document' AND context_id = ?
+                  AND status = 'open'
+                """,
+                bindings: [
+                    .real(timestamp), .real(timestamp),
+                    .text(String(context.documentID))
+                ]
+            )
+            for gap in knowledgeGaps {
+                try upsertKnowledgeGap(
+                    gap,
+                    documentID: context.documentID,
+                    documentHash: context.documentHash,
+                    now: timestamp
+                )
+            }
 
             var storedEntityIDs: [String: String] = [:]
             for entity in envelope.entities {
@@ -5909,7 +5952,7 @@ public actor SQLiteDatabase {
                 }
             }
 
-            for fact in envelope.facts {
+            for fact in durableFacts {
                 guard let subjectID = storedEntityIDs[fact.subjectEntityID] else {
                     throw FindoraError.database("Faktsubjekt konnte nicht aufgelöst werden.")
                 }
@@ -5966,7 +6009,7 @@ public actor SQLiteDatabase {
                 )
             }
 
-            for relation in envelope.relations {
+            for relation in durableRelations {
                 guard let subjectID = storedEntityIDs[relation.subjectEntityID],
                       let objectID = storedEntityIDs[relation.objectEntityID] else {
                     throw FindoraError.database("Relationsentität konnte nicht aufgelöst werden.")
@@ -6778,6 +6821,45 @@ public actor SQLiteDatabase {
             )
         }
         return entityID
+    }
+
+    private func upsertKnowledgeGap(
+        _ gap: KnowledgeUncertainty,
+        documentID: Int64,
+        documentHash: String,
+        now: Double
+    ) throws {
+        let kind = gap.kind.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reason = gap.description.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !kind.isEmpty, kind.count <= 128,
+              !reason.isEmpty, reason.count <= 2_000 else {
+            throw FindoraError.database(
+                "Eine Wissenslücke ist syntaktisch ungültig."
+            )
+        }
+        let signature = "\(documentHash)\u{1f}\(kind)\u{1f}\(reason)"
+        let identifier = "knowledge-gap-\(SHA256Hasher().hash(data: Data(signature.utf8)))"
+        try execute(
+            """
+            INSERT INTO knowledge_gaps (
+                id, expected_information_type, context_type, context_id,
+                reason, search_coverage, confidence, processing_complete,
+                status, last_checked_at, created_at, updated_at
+            ) VALUES (?, ?, 'document', ?, ?, 1, 0.5, 1, 'open', ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                search_coverage = excluded.search_coverage,
+                processing_complete = excluded.processing_complete,
+                status = 'open',
+                last_checked_at = excluded.last_checked_at,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .text(identifier), .text(kind), .text(String(documentID)),
+                .text(reason), .real(now), .real(now), .real(now)
+            ]
+        )
     }
 
     private func upsertKnowledgeClaim(
