@@ -472,9 +472,30 @@ func configuredParallelOCRProcessesMoreThanOneFileAtOnce() async throws {
 @Test
 func bundledModelCatalogIsPinnedAndFitsEightGigabyteProfile() throws {
     let catalog = try ModelCatalog.bundled()
-    #expect(catalog.models.count == 5)
+    #expect(catalog.schemaVersion == 2)
+    #expect(catalog.models.count == 8)
     #expect(catalog.models.allSatisfy { !$0.files.isEmpty })
     #expect(catalog.models.allSatisfy { $0.files.allSatisfy { $0.checksumSHA256.count == 64 } })
+    #expect(catalog.models.allSatisfy { !$0.capabilities.isEmpty })
+    #expect(
+        catalog.models.contains {
+            $0.id.contains("Qwen3.5-4B")
+                && $0.capabilities.contains(.structuredExtraction)
+        }
+    )
+    #expect(
+        catalog.models.contains {
+            $0.kind == .validator
+                && $0.id.contains("Phi-4-mini-instruct")
+        }
+    )
+    #expect(
+        catalog.models.contains {
+            $0.id.contains("gemma-4-e2b-it")
+                && $0.experimental
+                && $0.runtime == .mlxVision
+        }
+    )
 
     let profile = HardwareProfile(
         isAppleSilicon: true,

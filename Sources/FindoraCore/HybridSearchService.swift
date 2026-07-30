@@ -5,6 +5,7 @@ public actor HybridSearchService {
         var source: SearchSource
         var lexicalRank: Int?
         var semanticScore: Double?
+        var knowledgeRank: Int? = nil
         var combinedScore: Double
     }
 
@@ -61,8 +62,13 @@ public actor HybridSearchService {
             contentFilter: contentFilter,
             limit: 40
         )
-        let (lexicalResults, fileNameResults) =
-            try await (lexical, fileNames)
+        async let knowledge = database.knowledgeSearch(
+            terms: plan.hardTerms + plan.topics + plan.documentTypes + [trimmed],
+            contentFilter: contentFilter,
+            limit: 40
+        )
+        let (lexicalResults, fileNameResults, knowledgeResults) =
+            try await (lexical, fileNames, knowledge)
         var semantic: [(SearchSource, Double)] = []
         if semanticEnabled {
             let vector = try await embedder.embed(
@@ -124,11 +130,29 @@ public actor HybridSearchService {
                 )
             }
         }
+        for (rank, source) in knowledgeResults.enumerated() {
+            let contribution = 0.70 / Double(61 + rank)
+            if var existing = candidates[source.id] {
+                existing.source = source
+                existing.knowledgeRank = rank
+                existing.combinedScore += contribution
+                candidates[source.id] = existing
+            } else {
+                candidates[source.id] = Candidate(
+                    source: source,
+                    lexicalRank: nil,
+                    semanticScore: nil,
+                    knowledgeRank: rank,
+                    combinedScore: contribution
+                )
+            }
+        }
 
         let viable = candidates.values.filter {
             $0.combinedScore >= 0.0065
                 && (
                     $0.lexicalRank != nil
+                    || $0.knowledgeRank != nil
                     || ($0.semanticScore ?? -1) >= 0.10
                 )
         }
@@ -246,6 +270,7 @@ public actor HybridSearchService {
             contains($0, in: bestChunk.text) || contains($0, in: fileName)
         }
         let hasExactEvidence = candidate.lexicalRank != nil
+            || candidate.knowledgeRank != nil
             || phraseInText
             || phraseInFileName
         let semanticScore = candidate.semanticScore ?? -1
@@ -268,22 +293,28 @@ public actor HybridSearchService {
 
         var kinds: [SearchMatchKind] = []
         if hasExactEvidence { kinds.append(.exact) }
+        if candidate.knowledgeRank != nil { kinds.append(.relation) }
         if semanticScore >= 0.10 { kinds.append(.semantic) }
         if hardTerms.contains(where: { contains($0, in: fileName) }) {
             kinds.append(.fileName)
         }
         kinds.append(sameChunk ? .sameChunk : .sameDocument)
 
-        let reason = reason(
-            matchedEntities: matchedEntities,
-            matchedTopics: matchedTopics,
-            fileNameMatched: kinds.contains(.fileName),
-            sameChunk: sameChunk,
-            pageNumber: bestChunk.pageNumber
-        )
-        let excerpt = bestChunk.text.count > 560
-            ? String(bestChunk.text.prefix(557)) + "…"
-            : bestChunk.text
+        let reason = candidate.knowledgeRank == nil
+            ? reason(
+                matchedEntities: matchedEntities,
+                matchedTopics: matchedTopics,
+                fileNameMatched: kinds.contains(.fileName),
+                sameChunk: sameChunk,
+                pageNumber: bestChunk.pageNumber
+            )
+            : "Belegte Aussage aus Wissensgraph und Originalquelle auf Seite \(candidate.source.pageNumber)."
+        let selectedExcerpt = candidate.knowledgeRank == nil
+            ? bestChunk.text
+            : candidate.source.excerpt
+        let excerpt = selectedExcerpt.count > 560
+            ? String(selectedExcerpt.prefix(557)) + "…"
+            : selectedExcerpt
         var score = candidate.combinedScore
         if sameChunk { score += 0.02 }
         score += Double(matchedHardTerms.count + matchedTopics.count) * 0.005

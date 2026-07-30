@@ -229,6 +229,15 @@ final class AppState {
     var scanIntervalMinutes = 5
     var showExperimentalModels = false
     var llmIdleMinutes = 10
+    var knowledgeEnabled = true
+    var developerModeEnabled = false
+    var automaticModelSelection = true
+    var automaticSecondReview = true
+    var reviewOnlyWhenUncertain = true
+    var automaticallyDownloadRecommendedModels = false
+    var unloadModelsWhenIdle = true
+    var knowledgeStatistics = KnowledgeStatistics()
+    var knowledgeReviewSnapshot = KnowledgeReviewSnapshot()
     var launchAtLogin = false
     var memoryPressure = "Normal"
     var availableModels: [InstalledModel] = []
@@ -237,6 +246,7 @@ final class AppState {
     var modelDownloadProgress: ModelDownloadProgress?
     var activeEmbeddingModelID: String?
     var activeAnswerModelID: String?
+    var activeValidatorModelID: String?
     var activeDocumentVisionModelID: String?
     var modelMessage: String?
     var isInstallingOCRComponents = false
@@ -256,6 +266,7 @@ final class AppState {
     var interfaceLanguage: InterfaceLanguage = .german
     var interfaceAppearance: InterfaceAppearance = .system
     var isAnswerModelLoaded = false
+    var isValidatorModelLoaded = false
     var isEmbeddingModelLoaded = false
     var isDocumentVisionModelLoaded = false
     var mailSources: [MailImportSource] = []
@@ -357,6 +368,7 @@ final class AppState {
     private var mailImportTask: Task<Void, Never>?
     private var mailWatchLoop: Task<Void, Never>?
     private var answerGenerator: (any AnswerGenerating)?
+    private var validatorGenerator: (any AnswerGenerating)?
     private var documentVisionAnalyzer: (any OpticalDocumentAnalyzing)?
     private var resolvedFolder: ResolvedFolder?
     private var scanLoop: Task<Void, Never>?
@@ -1308,6 +1320,31 @@ final class AppState {
                 try await database.setSetting(key: "scanIntervalMinutes", value: String(scanIntervalMinutes))
                 try await database.setSetting(key: "llmIdleMinutes", value: String(llmIdleMinutes))
                 try await database.setSetting(key: "showExperimentalModels", value: showExperimentalModels ? "1" : "0")
+                try await database.setKnowledgeProcessingEnabled(knowledgeEnabled)
+                try await database.setSetting(
+                    key: "developerModeEnabled",
+                    value: developerModeEnabled ? "1" : "0"
+                )
+                try await database.setSetting(
+                    key: "automaticModelSelection",
+                    value: automaticModelSelection ? "1" : "0"
+                )
+                try await database.setSetting(
+                    key: "automaticSecondReview",
+                    value: automaticSecondReview ? "1" : "0"
+                )
+                try await database.setSetting(
+                    key: "reviewOnlyWhenUncertain",
+                    value: reviewOnlyWhenUncertain ? "1" : "0"
+                )
+                try await database.setSetting(
+                    key: "automaticallyDownloadRecommendedModels",
+                    value: automaticallyDownloadRecommendedModels ? "1" : "0"
+                )
+                try await database.setSetting(
+                    key: "unloadModelsWhenIdle",
+                    value: unloadModelsWhenIdle ? "1" : "0"
+                )
                 try await database.setSetting(key: "interfaceLanguage", value: interfaceLanguage.rawValue)
                 try await database.setSetting(key: "interfaceAppearance", value: interfaceAppearance.rawValue)
                 try await database.setSetting(
@@ -2418,9 +2455,39 @@ final class AppState {
     func refreshDatabaseState() async {
         do {
             await refreshDocumentStatus()
+            knowledgeStatistics = try await database.knowledgeStatistics()
+            if developerModeEnabled {
+                knowledgeReviewSnapshot = try await database.knowledgeReviewSnapshot()
+            }
             logEntries = try await database.recentErrors()
         } catch {
             report(error)
+        }
+    }
+
+    func reanalyzeKnowledge() {
+        Task {
+            do {
+                try await database.enqueueAllKnowledgeReanalysis()
+                knowledgeStatistics = try await database.knowledgeStatistics()
+                knowledgeReviewSnapshot = try await database.knowledgeReviewSnapshot()
+                modelMessage = "Die betroffenen Wissensanalysen wurden idempotent neu eingereiht."
+            } catch {
+                report(error, taskType: "Wissensanalyse")
+            }
+        }
+    }
+
+    func resetKnowledgeDatabase(confirmation: String) {
+        Task {
+            do {
+                try await database.resetKnowledgeDatabase(confirmation: confirmation)
+                knowledgeStatistics = try await database.knowledgeStatistics()
+                knowledgeReviewSnapshot = KnowledgeReviewSnapshot()
+                modelMessage = "Die Wissens- und Kommunikationsschicht wurde zurückgesetzt. Dokumente, OCR und Suchindex blieben erhalten."
+            } catch {
+                report(error, taskType: "Wissensdatenbank zurücksetzen")
+            }
         }
     }
 
@@ -2467,6 +2534,10 @@ final class AppState {
         do {
             let snapshot = try await database.statistics()
             statistics = snapshot
+            knowledgeStatistics = try await database.knowledgeStatistics()
+            if developerModeEnabled {
+                knowledgeReviewSnapshot = try await database.knowledgeReviewSnapshot()
+            }
             isPaused = snapshot.isPaused
             if selectedSection == .maintenance {
                 await refreshMaintenance()
@@ -2552,8 +2623,10 @@ final class AppState {
                             )
                             try await provider.test()
                             await provider.unload()
-                        case .answer:
+                        case .answer, .validator:
                             let generator = MLXAnswerGenerator(
+                                modelID: descriptor.id,
+                                modelVersion: descriptor.modelVersion,
                                 directory: directory,
                                 contextLength: descriptor.defaultContextLength
                             )
@@ -2668,6 +2741,8 @@ final class AppState {
                     }
                 case .answer:
                     let generator = MLXAnswerGenerator(
+                        modelID: model.id,
+                        modelVersion: model.descriptor.modelVersion,
                         directory: directory,
                         contextLength: model.descriptor.defaultContextLength,
                         idleTimeout: .seconds(llmIdleMinutes * 60)
@@ -2685,6 +2760,32 @@ final class AppState {
                     )
                     try await database.setSetting(key: "activeAnswerModelID", value: model.id)
                     modelMessage = "Antwortmodell wurde getestet und aktiviert."
+                case .validator:
+                    let generator = MLXAnswerGenerator(
+                        modelID: model.id,
+                        modelVersion: model.descriptor.modelVersion,
+                        directory: directory,
+                        contextLength: model.descriptor.defaultContextLength,
+                        idleTimeout: .seconds(llmIdleMinutes * 60)
+                    )
+                    try await generator.test()
+                    try await modelManager.activate(modelID: model.id)
+                    if let validatorGenerator {
+                        await validatorGenerator.unload()
+                    }
+                    validatorGenerator = generator
+                    activeValidatorModelID = model.id
+                    isValidatorModelLoaded = true
+                    try await database.setModelEnabled(
+                        modelID: model.id,
+                        modelVersion: model.descriptor.modelVersion,
+                        kind: .validator
+                    )
+                    try await database.setSetting(
+                        key: "activeValidatorModelID",
+                        value: model.id
+                    )
+                    modelMessage = "Prüfmodell wurde getestet und aktiviert."
                 case .documentVision:
                     let analyzer = MLXDocumentVisionAnalyzer(
                         modelID: model.id,
@@ -2740,6 +2841,23 @@ final class AppState {
                     )
                     modelMessage =
                         "Antwortmodell deaktiviert. Suche und regelbasierte Suchplanung bleiben verfügbar."
+                case .validator:
+                    guard activeValidatorModelID == model.id else { return }
+                    await validatorGenerator?.unload()
+                    validatorGenerator = nil
+                    activeValidatorModelID = nil
+                    isValidatorModelLoaded = false
+                    await modelManager.deactivate(kind: .validator)
+                    try await database.setModelEnabled(
+                        modelID: nil,
+                        modelVersion: nil,
+                        kind: .validator
+                    )
+                    try await database.setSetting(
+                        key: "activeValidatorModelID",
+                        value: ""
+                    )
+                    modelMessage = "Prüfmodell deaktiviert."
                 case .embedding:
                     guard activeEmbeddingModelID == model.id else { return }
                     let fallback = TokenHashEmbedding()
@@ -2803,8 +2921,11 @@ final class AppState {
                     )
                     try await provider.test()
                     await provider.unload()
-                } else if model.descriptor.kind == .answer {
+                } else if model.descriptor.kind == .answer
+                            || model.descriptor.kind == .validator {
                     let generator = MLXAnswerGenerator(
+                        modelID: model.id,
+                        modelVersion: model.descriptor.modelVersion,
                         directory: directory,
                         contextLength: model.descriptor.defaultContextLength
                     )
@@ -2840,6 +2961,22 @@ final class AppState {
                         kind: .answer
                     )
                     try await database.setSetting(key: "activeAnswerModelID", value: "")
+                }
+                if model.descriptor.kind == .validator,
+                   activeValidatorModelID == model.id {
+                    await validatorGenerator?.unload()
+                    validatorGenerator = nil
+                    activeValidatorModelID = nil
+                    isValidatorModelLoaded = false
+                    try await database.setModelEnabled(
+                        modelID: nil,
+                        modelVersion: nil,
+                        kind: .validator
+                    )
+                    try await database.setSetting(
+                        key: "activeValidatorModelID",
+                        value: ""
+                    )
                 }
                 if model.descriptor.kind == .embedding, activeEmbeddingModelID == model.id {
                     let fallback = TokenHashEmbedding()
@@ -3009,6 +3146,9 @@ final class AppState {
             let storedAnswerID = storedStates.first {
                 $0.kind == .answer && $0.enabled
             }?.modelID
+            let storedValidatorID = storedStates.first {
+                $0.kind == .validator && $0.enabled
+            }?.modelID
             let storedDocumentVisionID = storedStates.first {
                 $0.kind == .documentVision && $0.enabled
             }?.modelID
@@ -3047,6 +3187,8 @@ final class AppState {
                let descriptor = await modelManager.descriptor(id: answerID),
                let directory = await modelManager.installedDirectory(modelID: answerID) {
                 answerGenerator = MLXAnswerGenerator(
+                    modelID: answerID,
+                    modelVersion: descriptor.modelVersion,
                     directory: directory,
                     contextLength: descriptor.defaultContextLength,
                     idleTimeout: .seconds(llmIdleMinutes * 60)
@@ -3058,6 +3200,31 @@ final class AppState {
                     modelID: answerID,
                     modelVersion: descriptor.modelVersion,
                     kind: .answer
+                )
+            }
+            let legacyValidatorID = try await database.setting(
+                key: "activeValidatorModelID"
+            )
+            let validatorID = storedValidatorID ?? legacyValidatorID
+            if let validatorID, !validatorID.isEmpty,
+               let descriptor = await modelManager.descriptor(id: validatorID),
+               let directory = await modelManager.installedDirectory(
+                    modelID: validatorID
+               ) {
+                validatorGenerator = MLXAnswerGenerator(
+                    modelID: validatorID,
+                    modelVersion: descriptor.modelVersion,
+                    directory: directory,
+                    contextLength: descriptor.defaultContextLength,
+                    idleTimeout: .seconds(llmIdleMinutes * 60)
+                )
+                try await modelManager.activate(modelID: validatorID)
+                activeValidatorModelID = validatorID
+                isValidatorModelLoaded = false
+                try await database.setModelEnabled(
+                    modelID: validatorID,
+                    modelVersion: descriptor.modelVersion,
+                    kind: .validator
                 )
             }
             let legacyDocumentVisionID = try await database.setting(
@@ -3106,6 +3273,21 @@ final class AppState {
                 llmIdleMinutes = min(max(decoded, 1), 120)
             }
             showExperimentalModels = try await database.setting(key: "showExperimentalModels") == "1"
+            knowledgeEnabled = try await database.setting(key: "knowledgeEnabled") != "0"
+            developerModeEnabled =
+                try await database.setting(key: "developerModeEnabled") == "1"
+            automaticModelSelection =
+                try await database.setting(key: "automaticModelSelection") != "0"
+            automaticSecondReview =
+                try await database.setting(key: "automaticSecondReview") != "0"
+            reviewOnlyWhenUncertain =
+                try await database.setting(key: "reviewOnlyWhenUncertain") != "0"
+            automaticallyDownloadRecommendedModels =
+                try await database.setting(
+                    key: "automaticallyDownloadRecommendedModels"
+                ) == "1"
+            unloadModelsWhenIdle =
+                try await database.setting(key: "unloadModelsWhenIdle") != "0"
             if let value = try await database.setting(key: "interfaceLanguage"),
                let language = InterfaceLanguage(rawValue: value) {
                 interfaceLanguage = language
@@ -3275,6 +3457,10 @@ final class AppState {
 
         if level == .critical {
             await unloadAnswerModel(reason: "kritischer Speicherdruck")
+            if let validatorGenerator {
+                await validatorGenerator.unload()
+                isValidatorModelLoaded = false
+            }
             if let documentVisionAnalyzer {
                 await documentVisionAnalyzer.unload()
                 isDocumentVisionModelLoaded = false
@@ -4161,10 +4347,216 @@ struct StorageMigrationConfirmationView: View {
     }
 }
 
+@MainActor
+private final class ResettableSearchSplitView: NSSplitView {
+    var resetAction: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let ordered = subviews.sorted { $0.frame.minY < $1.frame.minY }
+        let divider = ordered.count > 1
+            ? NSRect(
+                x: 0,
+                y: ordered[0].frame.maxY,
+                width: bounds.width,
+                height: max(
+                    dividerThickness,
+                    ordered[1].frame.minY - ordered[0].frame.maxY
+                )
+            )
+            : .zero
+        if event.clickCount == 2,
+           subviews.count > 1,
+           divider.insetBy(dx: -5, dy: -5).contains(point) {
+            resetAction?()
+            return
+        }
+        super.mouseDown(with: event)
+    }
+}
+
+@MainActor
+private final class SearchSplitHostController: NSViewController {
+    let splitView = ResettableSearchSplitView()
+    let leadingHost = NSHostingController(rootView: AnyView(EmptyView()))
+    let trailingHost = NSHostingController(rootView: AnyView(EmptyView()))
+
+    override func loadView() {
+        view = NSView()
+        splitView.isVertical = false
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        splitView.setAccessibilityLabel(
+            NSLocalizedString(
+                "Trenner zwischen Antwort und Quellen",
+                comment: "Search answer/source split view"
+            )
+        )
+        addChild(leadingHost)
+        addChild(trailingHost)
+        splitView.addSubview(leadingHost.view)
+        splitView.addSubview(trailingHost.view)
+        view.addSubview(splitView)
+        NSLayoutConstraint.activate([
+            splitView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            splitView.topAnchor.constraint(equalTo: view.topAnchor),
+            splitView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+    }
+}
+
+@MainActor
+private struct PersistentSearchSplitView<Leading: View, Trailing: View>:
+    NSViewControllerRepresentable
+{
+    let persistenceKey: String
+    let defaultFraction: Double
+    let minimumLeading: CGFloat
+    let minimumTrailing: CGFloat
+    @ViewBuilder let leading: () -> Leading
+    @ViewBuilder let trailing: () -> Trailing
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(
+            persistenceKey: persistenceKey,
+            defaultFraction: defaultFraction,
+            minimumLeading: minimumLeading,
+            minimumTrailing: minimumTrailing
+        )
+    }
+
+    func makeNSViewController(
+        context: Context
+    ) -> SearchSplitHostController {
+        let controller = SearchSplitHostController()
+        controller.loadViewIfNeeded()
+        controller.leadingHost.rootView = AnyView(leading())
+        controller.trailingHost.rootView = AnyView(trailing())
+        controller.splitView.delegate = context.coordinator
+        context.coordinator.controller = controller
+        controller.splitView.resetAction = { [weak coordinator = context.coordinator] in
+            coordinator?.reset()
+        }
+        DispatchQueue.main.async { [weak coordinator = context.coordinator] in
+            coordinator?.restore()
+        }
+        return controller
+    }
+
+    func updateNSViewController(
+        _ controller: SearchSplitHostController,
+        context: Context
+    ) {
+        controller.leadingHost.rootView = AnyView(leading())
+        controller.trailingHost.rootView = AnyView(trailing())
+        context.coordinator.controller = controller
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSSplitViewDelegate {
+        weak var controller: SearchSplitHostController?
+        private let persistenceKey: String
+        private let defaultFraction: Double
+        private let minimumLeading: CGFloat
+        private let minimumTrailing: CGFloat
+        private var restoring = false
+
+        init(
+            persistenceKey: String,
+            defaultFraction: Double,
+            minimumLeading: CGFloat,
+            minimumTrailing: CGFloat
+        ) {
+            self.persistenceKey = persistenceKey
+            self.defaultFraction = min(max(defaultFraction, 0.2), 0.8)
+            self.minimumLeading = minimumLeading
+            self.minimumTrailing = minimumTrailing
+        }
+
+        func restore() {
+            guard let splitView = controller?.splitView,
+                  splitView.bounds.height > 0 else { return }
+            let stored = UserDefaults.standard.object(forKey: persistenceKey) as? Double
+            setFraction(stored ?? defaultFraction, in: splitView)
+        }
+
+        func reset() {
+            guard let splitView = controller?.splitView else { return }
+            setFraction(defaultFraction, in: splitView)
+            UserDefaults.standard.set(defaultFraction, forKey: persistenceKey)
+        }
+
+        func splitView(
+            _ splitView: NSSplitView,
+            constrainSplitPosition proposedPosition: CGFloat,
+            ofSubviewAt dividerIndex: Int
+        ) -> CGFloat {
+            guard dividerIndex == 0 else { return proposedPosition }
+            let available = splitView.bounds.height - splitView.dividerThickness
+            guard available > 0 else { return proposedPosition }
+            return CGFloat(
+                layout.dividerPosition(
+                    fraction: Double(proposedPosition / available),
+                    availableLength: Double(splitView.bounds.height),
+                    dividerThickness: Double(splitView.dividerThickness)
+                )
+            )
+        }
+
+        func splitViewDidResizeSubviews(_ notification: Notification) {
+            guard !restoring,
+                  let splitView = notification.object as? NSSplitView,
+                  splitView.subviews.count > 1 else { return }
+            let available = splitView.bounds.height - splitView.dividerThickness
+            guard available > 0 else { return }
+            let fraction = Double(splitView.subviews[0].frame.height / available)
+            UserDefaults.standard.set(
+                min(max(fraction, 0.05), 0.95),
+                forKey: persistenceKey
+            )
+        }
+
+        private func setFraction(_ fraction: Double, in splitView: NSSplitView) {
+            guard splitView.bounds.height > 0 else { return }
+            restoring = true
+            splitView.setPosition(
+                CGFloat(
+                    layout.dividerPosition(
+                        fraction: fraction,
+                        availableLength: Double(splitView.bounds.height),
+                        dividerThickness: Double(splitView.dividerThickness)
+                    )
+                ),
+                ofDividerAt: 0
+            )
+            splitView.adjustSubviews()
+            restoring = false
+        }
+
+        private var layout: SearchSplitLayout {
+            SearchSplitLayout(
+                defaultFraction: defaultFraction,
+                minimumLeading: minimumLeading,
+                minimumTrailing: minimumTrailing
+            )
+        }
+    }
+}
+
 struct SearchView: View {
+    private enum CompactPane: String, CaseIterable, Identifiable {
+        case answer
+        case sources
+
+        var id: String { rawValue }
+    }
+
     @Environment(AppState.self) private var state
     @State private var showPossibleMatches = false
     @State private var showSessionHistory = false
+    @State private var compactPane: CompactPane = .answer
+    private let splitLayout = SearchSplitLayout()
 
     var body: some View {
         @Bindable var state = state
@@ -4233,130 +4625,36 @@ struct SearchView: View {
                     )
                 )
             } else {
-                VStack(spacing: 0) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(alignment: .top) {
-                            Text("Sie")
-                                .font(.caption.bold())
-                                .foregroundStyle(.secondary)
-                            Text(state.submittedQuestion)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .textSelection(.enabled)
-                        }
-                        .padding(12)
-                        .background(.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 14))
-
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Label("Findora", systemImage: "sparkles")
-                                    .font(.headline)
-                                Spacer()
-                                if !state.answer.isEmpty {
-                                    Button("Antwort kopieren", systemImage: "doc.on.doc") {
-                                        state.copyAnswer()
-                                    }
-                                    .buttonStyle(.borderless)
-                                }
+                GeometryReader { geometry in
+                    if splitLayout.usesCompactPresentation(
+                        width: geometry.size.width,
+                        height: geometry.size.height
+                    ) {
+                        VStack(spacing: 0) {
+                            Picker("Bereich", selection: $compactPane) {
+                                Text("Antwort").tag(CompactPane.answer)
+                                Text("Quellen").tag(CompactPane.sources)
                             }
-                            if state.isSearching && state.answer.isEmpty {
-                                HStack(spacing: 10) {
-                                    ProgressView()
-                                    Text("Antwort wird erstellt …")
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    Button("Abbrechen", role: .destructive) {
-                                        state.cancelSearch()
-                                    }
-                                }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .padding([.horizontal, .top])
+                            if compactPane == .answer {
+                                answerPane
                             } else {
-                                ScrollView {
-                                    Text(markdown(state.answer))
-                                        .font(.body)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .textSelection(.enabled)
-                                }
-                                .frame(minHeight: 80, maxHeight: 240)
-                                .environment(
-                                    \.openURL,
-                                    OpenURLAction { url in
-                                        guard url.scheme == "findora",
-                                              url.host == "source",
-                                              let number = Int(url.lastPathComponent),
-                                              state.searchResults.indices.contains(number - 1) else {
-                                            return .systemAction
-                                        }
-                                        state.showPage(state.searchResults[number - 1])
-                                        return .handled
-                                    }
-                                )
-                            }
-                            if let notice = state.searchPlanningNotice {
-                                Label(notice, systemImage: "shield.checkered")
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
-                            }
-                            if !state.searchResults.isEmpty {
-                                HStack(spacing: 8) {
-                                    ForEach(Array(state.searchResults.prefix(5).enumerated()), id: \.element.id) {
-                                        index, source in
-                                        Button("[\(index + 1)] \(source.fileName)") {
-                                            state.showPage(source)
-                                        }
-                                        .buttonStyle(.borderless)
-                                        .lineLimit(1)
-                                    }
-                                }
-                                .font(.caption)
+                                resultsPane
                             }
                         }
-                        .padding(16)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 16)
-                                .stroke(.blue.opacity(0.25), lineWidth: 1)
+                    } else {
+                        PersistentSearchSplitView(
+                            persistenceKey: "findora.search.answerSourcesSplit",
+                            defaultFraction: 0.43,
+                            minimumLeading: 180,
+                            minimumTrailing: 220
+                        ) {
+                            answerPane
+                        } trailing: {
+                            resultsPane
                         }
-                    }
-                    .padding()
-
-                    Divider()
-
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 14) {
-                            if !state.searchResults.isEmpty {
-                                HStack {
-                                    Text("Direkt passende Dokumente")
-                                        .font(.title2.bold())
-                                    Text(state.searchResults.count.formatted())
-                                        .foregroundStyle(.secondary)
-                                }
-                                ForEach(
-                                    Array(state.searchResults.enumerated()),
-                                    id: \.element.id
-                                ) { index, source in
-                                    SourceCard(number: index + 1, source: source)
-                                }
-                            } else if !state.isSearching {
-                                ContentUnavailableView(
-                                    "Keine ausreichend passenden Dokumente gefunden",
-                                    systemImage: "doc.text.magnifyingglass"
-                                )
-                            }
-
-                            if !state.possibleSearchResults.isEmpty {
-                                DisclosureGroup(
-                                    "Möglicherweise passende Dokumente (\(state.possibleSearchResults.count))",
-                                    isExpanded: $showPossibleMatches
-                                ) {
-                                    LazyVStack(spacing: 12) {
-                                        ForEach(state.possibleSearchResults) { source in
-                                            SourceCard(number: nil, source: source)
-                                        }
-                                    }
-                                    .padding(.top, 10)
-                                }
-                            }
-                        }
-                        .padding()
                     }
                 }
             }
@@ -4408,6 +4706,137 @@ struct SearchView: View {
             .padding()
         }
         .navigationTitle(state.localizedSectionTitle(.search))
+    }
+
+    private var answerPane: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                Text("Sie")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Text(state.submittedQuestion)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .padding(12)
+            .background(.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 14))
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label("Findora", systemImage: "sparkles")
+                        .font(.headline)
+                    Spacer()
+                    if !state.answer.isEmpty {
+                        Button("Antwort kopieren", systemImage: "doc.on.doc") {
+                            state.copyAnswer()
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+                if state.isSearching && state.answer.isEmpty {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Antwort wird erstellt …")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Abbrechen", role: .destructive) {
+                            state.cancelSearch()
+                        }
+                    }
+                } else {
+                    ScrollView {
+                        Text(markdown(state.answer))
+                            .font(.body)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(minHeight: 80)
+                    .environment(
+                        \.openURL,
+                        OpenURLAction { url in
+                            guard url.scheme == "findora",
+                                  url.host == "source",
+                                  let number = Int(url.lastPathComponent),
+                                  state.searchResults.indices.contains(number - 1) else {
+                                return .systemAction
+                            }
+                            state.showPage(state.searchResults[number - 1])
+                            return .handled
+                        }
+                    )
+                }
+                if let notice = state.searchPlanningNotice {
+                    Label(notice, systemImage: "shield.checkered")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                if !state.searchResults.isEmpty {
+                    HStack(spacing: 8) {
+                        ForEach(
+                            Array(state.searchResults.prefix(5).enumerated()),
+                            id: \.element.id
+                        ) { index, source in
+                            Button("[\(index + 1)] \(source.fileName)") {
+                                state.showPage(source)
+                            }
+                            .buttonStyle(.borderless)
+                            .lineLimit(1)
+                        }
+                    }
+                    .font(.caption)
+                }
+            }
+            .padding(16)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(.blue.opacity(0.25), lineWidth: 1)
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private var resultsPane: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14) {
+                if !state.searchResults.isEmpty {
+                    HStack {
+                        Text("Direkt passende Dokumente")
+                            .font(.title2.bold())
+                        Text(state.searchResults.count.formatted())
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(
+                        Array(state.searchResults.enumerated()),
+                        id: \.element.id
+                    ) { index, source in
+                        SourceCard(number: index + 1, source: source)
+                    }
+                } else if !state.isSearching {
+                    ContentUnavailableView(
+                        "Keine ausreichend passenden Dokumente gefunden",
+                        systemImage: "doc.text.magnifyingglass"
+                    )
+                }
+
+                if !state.possibleSearchResults.isEmpty {
+                    DisclosureGroup(
+                        "Möglicherweise passende Dokumente (\(state.possibleSearchResults.count))",
+                        isExpanded: $showPossibleMatches
+                    ) {
+                        LazyVStack(spacing: 12) {
+                            ForEach(state.possibleSearchResults) { source in
+                                SourceCard(number: nil, source: source)
+                            }
+                        }
+                        .padding(.top, 10)
+                    }
+                }
+            }
+            .padding()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func markdown(_ value: String) -> AttributedString {
@@ -7808,6 +8237,17 @@ struct ModelsView: View {
                 }
             }
 
+            Section("Prüfmodelle") {
+                ForEach(visibleModels(kind: .validator)) { model in
+                    modelCard(model)
+                }
+                Text(
+                    "Prüfmodelle werden nur für unsichere strukturierte Extraktionen, Quellenprüfung und Widersprüche geladen."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
             Section {
                 Text(
                     "Nur für Seiten, die PDFKit und die mehrstufige Apple‑Vision‑OCR nicht zuverlässig lösen. Download und Aktivierung erfolgen ausschließlich auf Ihre Aktion; die Verarbeitung bleibt lokal."
@@ -7890,6 +8330,8 @@ struct ModelsView: View {
             "Nur die Modelldateien werden verschoben. Gespeicherte Dokumenttexte und Embeddings bleiben erhalten; die Volltextsuche funktioniert weiter."
         case .answer:
             "Nur die Modelldateien werden verschoben. Dokumentindex und Suche bleiben erhalten; KI-Antworten sind danach deaktiviert."
+        case .validator:
+            "Nur die Modelldateien des optionalen Prüfmodells werden verschoben. Belegtes Wissen, Dokumentindex und Suche bleiben erhalten."
         case .documentVision:
             "Nur das lokale Dokumentmodell wird verschoben. Keine Seite wird gelöscht oder verändert; ungelöste Fälle bleiben unter OCR prüfen."
         }
@@ -8063,6 +8505,10 @@ struct ModelsView: View {
             return state.isAnswerModelLoaded
                 ? "Aktiv · geladen"
                 : "Aktiv · bei Bedarf laden"
+        case .validator:
+            return state.isValidatorModelLoaded
+                ? "Aktiv · geladen"
+                : "Aktiv · bei Unsicherheit laden"
         case .documentVision:
             return state.isDocumentVisionModelLoaded
                 ? "Aktiv · geladen"
@@ -8095,6 +8541,7 @@ struct SettingsView: View {
     @State private var confirmsIndexDeletionFinally = false
     @State private var confirmsOldStorageRemoval = false
     @State private var confirmsTemporaryCleanup = false
+    @State private var knowledgeResetConfirmation = ""
 
     var body: some View {
         @Bindable var state = state
@@ -8289,6 +8736,136 @@ struct SettingsView: View {
                     Text("Nach \(state.llmIdleMinutes) Minuten entladen")
                 }
                 Toggle("Experimentelle Modelle anzeigen", isOn: $state.showExperimentalModels)
+                Toggle("Automatische Modellauswahl", isOn: $state.automaticModelSelection)
+                Toggle(
+                    "Automatische Zweitprüfung",
+                    isOn: $state.automaticSecondReview
+                )
+                Toggle(
+                    "Nur bei Unsicherheit zweitprüfen",
+                    isOn: $state.reviewOnlyWhenUncertain
+                )
+                Toggle(
+                    "Modelle bei Inaktivität entladen",
+                    isOn: $state.unloadModelsWhenIdle
+                )
+                Toggle(
+                    "Benötigte empfohlene Modelle automatisch herunterladen",
+                    isOn: $state.automaticallyDownloadRecommendedModels
+                )
+                Text(
+                    "Automatische Modelldownloads sind standardmäßig aus. Vor manuellen Downloads zeigt Findora Zweck, Größe, RAM-Bedarf und Lizenz."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                if state.hardwareProfile.physicalMemoryBytes <= 8_589_934_592 {
+                    Label(
+                        "8-GB-Profil: Es wird höchstens ein großes generatives Modell gleichzeitig geladen; Kontext und Bildanalyse werden begrenzt.",
+                        systemImage: "memorychip"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+            }
+            Section("Entwicklung / Diagnose") {
+                Toggle("Entwicklermodus", isOn: $state.developerModeEnabled)
+                Toggle("Wissensdatenbank aktivieren", isOn: $state.knowledgeEnabled)
+                Text(
+                    "Bei deaktivierter Wissensdatenbank werden neue Wissensjobs pausiert. Klassische Suche, OCR und Dokumentindex bleiben verfügbar."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            if state.developerModeEnabled {
+                Section("Wissensdatenbank – Übersicht") {
+                    Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 5) {
+                        GridRow {
+                            Text("Entitäten")
+                            Text(state.knowledgeStatistics.entities.formatted())
+                        }
+                        GridRow {
+                            Text("Fakten")
+                            Text(state.knowledgeStatistics.facts.formatted())
+                        }
+                        GridRow {
+                            Text("Beziehungen")
+                            Text(state.knowledgeStatistics.relations.formatted())
+                        }
+                        GridRow {
+                            Text("Projekte / Kandidaten")
+                            Text(
+                                "\(state.knowledgeStatistics.projects) / \(state.knowledgeReviewSnapshot.projects.count)"
+                            )
+                        }
+                        GridRow {
+                            Text("Konflikte / unsicher")
+                            Text(
+                                "\(state.knowledgeStatistics.conflicts) / \(state.knowledgeStatistics.uncertainCandidates)"
+                            )
+                        }
+                        GridRow {
+                            Text("Ausstehende Jobs")
+                            Text(state.knowledgeStatistics.pendingJobs.formatted())
+                        }
+                        GridRow {
+                            Text("Kommunikationsthreads / Ereignisse")
+                            Text(
+                                "\(state.knowledgeStatistics.communicationThreads) / \(state.knowledgeStatistics.communicationEvents)"
+                            )
+                        }
+                        GridRow {
+                            Text("Erfahrungsmuster")
+                            Text(state.knowledgeStatistics.patterns.formatted())
+                        }
+                        GridRow {
+                            Text("Installierte / geladene Modelle")
+                            Text(
+                                "\(state.availableModels.filter(\.isInstalled).count) / \(loadedModelCount)"
+                            )
+                        }
+                    }
+                    Button("Diagnosedaten aktualisieren") {
+                        Task { await state.refreshDatabaseState() }
+                    }
+                }
+                Section("Wissensdatenbank – Prüfung") {
+                    DisclosureGroup("Projekte / Vorgänge prüfen") {
+                        reviewRecords(state.knowledgeReviewSnapshot.projects)
+                    }
+                    DisclosureGroup("Entitäten prüfen") {
+                        reviewRecords(state.knowledgeReviewSnapshot.entities)
+                    }
+                    DisclosureGroup("Wissenseinträge prüfen") {
+                        reviewRecords(state.knowledgeReviewSnapshot.claims)
+                    }
+                    DisclosureGroup("Kommunikationsgraph") {
+                        reviewRecords(state.knowledgeReviewSnapshot.communicationThreads)
+                    }
+                    DisclosureGroup("Erfahrungswissen") {
+                        reviewRecords(state.knowledgeReviewSnapshot.patterns)
+                    }
+                }
+                Section("Wissensdatenbank – Wartung") {
+                    Button("Betroffenen Wissensgraph neu analysieren") {
+                        state.reanalyzeKnowledge()
+                    }
+                    TextField(
+                        "Zur Bestätigung RESET KNOWLEDGE eingeben",
+                        text: $knowledgeResetConfirmation
+                    )
+                    Button("Wissensdatenbank vollständig zurücksetzen", role: .destructive) {
+                        state.resetKnowledgeDatabase(
+                            confirmation: knowledgeResetConfirmation
+                        )
+                        knowledgeResetConfirmation = ""
+                    }
+                    .disabled(knowledgeResetConfirmation != "RESET KNOWLEDGE")
+                    Text(
+                        "Der Reset betrifft nur Wissen, Kommunikation und Erfahrungswissen. Originaldokumente, OCR, Seiten, Embeddings und klassischer Suchindex bleiben erhalten."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
             }
             Section("Start und Hintergrund") {
                 Toggle(
@@ -8429,6 +9006,44 @@ struct SettingsView: View {
             Text(title).foregroundStyle(.secondary)
             Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))
                 .monospacedDigit()
+        }
+    }
+
+    private var loadedModelCount: Int {
+        [
+            state.isEmbeddingModelLoaded,
+            state.isAnswerModelLoaded,
+            state.isValidatorModelLoaded,
+            state.isDocumentVisionModelLoaded
+        ].filter { $0 }.count
+    }
+
+    @ViewBuilder
+    private func reviewRecords(_ records: [KnowledgeReviewRecord]) -> some View {
+        if records.isEmpty {
+            Text("Keine Einträge")
+                .foregroundStyle(.secondary)
+        } else {
+            ForEach(records) { record in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(record.title).font(.headline)
+                        Spacer()
+                        Text(record.confidence, format: .percent.precision(.fractionLength(0)))
+                            .monospacedDigit()
+                    }
+                    Text("\(record.detail) · \(record.status)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let source = record.sourceSummary, !source.isEmpty {
+                        Text(source)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                    }
+                }
+                .padding(.vertical, 3)
+            }
         }
     }
 }

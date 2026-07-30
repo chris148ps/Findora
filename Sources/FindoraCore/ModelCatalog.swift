@@ -3,7 +3,47 @@ import Foundation
 public enum ModelKind: String, Codable, Sendable {
     case embedding
     case answer
+    case validator
     case documentVision
+}
+
+public enum ModelCapability: String, Codable, CaseIterable, Hashable, Sendable {
+    case embeddingGeneration
+    case textGeneration
+    case structuredExtraction
+    case knowledgeValidation
+    case entityResolution
+    case summarization
+    case questionAnswering
+    case visionDocumentAnalysis
+    case ocrValidation
+    case relationExtraction
+    case contradictionDetection
+}
+
+public enum ModelRuntime: String, Codable, CaseIterable, Sendable {
+    case mlxText = "mlx_text"
+    case mlxVision = "mlx_vision"
+}
+
+public enum ModelAvailability: String, Codable, CaseIterable, Sendable {
+    case available
+    case experimental
+    case unavailable
+}
+
+public enum ModelOperationalState: String, Codable, CaseIterable, Sendable {
+    case available
+    case notInstalled
+    case downloading
+    case installed
+    case enabled
+    case loading
+    case loaded
+    case unloading
+    case disabled
+    case damaged
+    case incompatible
 }
 
 public enum ModelCompatibility: String, Codable, Comparable, Sendable {
@@ -42,6 +82,8 @@ public struct LocalModelDescriptor: Codable, Identifiable, Hashable, Sendable {
     public let kind: ModelKind
     public let displayName: String
     public let family: String
+    public let capabilities: Set<ModelCapability>
+    public let runtime: ModelRuntime
     public let parameters: String
     public let quantization: String
     public let backend: String
@@ -57,6 +99,8 @@ public struct LocalModelDescriptor: Codable, Identifiable, Hashable, Sendable {
     public let licenseURL: URL
     public let modelVersion: String
     public let repositoryID: String
+    public let experimental: Bool
+    public let availability: ModelAvailability
     public let files: [ModelFile]
 
     public init(
@@ -64,6 +108,8 @@ public struct LocalModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         kind: ModelKind,
         displayName: String,
         family: String,
+        capabilities: Set<ModelCapability> = [],
+        runtime: ModelRuntime = .mlxText,
         parameters: String,
         quantization: String,
         backend: String,
@@ -79,12 +125,16 @@ public struct LocalModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         licenseURL: URL,
         modelVersion: String,
         repositoryID: String,
+        experimental: Bool = false,
+        availability: ModelAvailability = .available,
         files: [ModelFile]
     ) {
         self.id = id
         self.kind = kind
         self.displayName = displayName
         self.family = family
+        self.capabilities = capabilities
+        self.runtime = runtime
         self.parameters = parameters
         self.quantization = quantization
         self.backend = backend
@@ -100,6 +150,8 @@ public struct LocalModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         self.licenseURL = licenseURL
         self.modelVersion = modelVersion
         self.repositoryID = repositoryID
+        self.experimental = experimental
+        self.availability = availability
         self.files = files
     }
 }
@@ -116,7 +168,7 @@ public struct ModelCatalog: Codable, Sendable {
     public static func load(from url: URL) throws -> ModelCatalog {
         let data = try Data(contentsOf: url)
         let catalog = try JSONDecoder().decode(ModelCatalog.self, from: data)
-        guard catalog.schemaVersion == 1 else {
+        guard catalog.schemaVersion == 2 else {
             throw FindoraError.processFailed("Nicht unterstützte Modellkatalog-Version.")
         }
         let allowedHosts = Set(["huggingface.co"])
@@ -127,6 +179,9 @@ public struct ModelCatalog: Codable, Sendable {
                 .joined()
             let manifestHash = SHA256Hasher().hash(data: Data(manifest.utf8))
             guard ["mlx", "mlx-vlm"].contains(model.backend),
+                  !model.capabilities.isEmpty,
+                  (model.runtime == .mlxVision) == (model.backend == "mlx-vlm"),
+                  model.availability != .unavailable || model.experimental,
                   !model.files.isEmpty,
                   model.downloadURL.scheme == "https",
                   model.checksumSHA256.lowercased() == manifestHash,

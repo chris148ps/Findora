@@ -1,7 +1,8 @@
 # Findora
 
-Findora ist eine native macOS-App für lokale OCR, Indexierung und
-semantische Suche in privaten PDF- und E-Mail-Beständen. Dokumente,
+Findora ist eine native macOS-App für lokale OCR, Indexierung, semantische
+Suche und eine quellengebundene Wissensschicht in privaten PDF- und
+E-Mail-Beständen. Dokumente,
 E-Mail-Inhalte, Suchanfragen,
 Embeddings und Antworten bleiben auf dem Mac. Es werden weder Ollama noch ein
 externer KI-Server oder eine Cloud-KI benötigt.
@@ -160,8 +161,10 @@ eingebauten Katalog. Vor der Installation zeigt die App Lizenz,
 Downloadgröße und RAM-Einstufung. Jede Datei wird per SHA-256 validiert.
 
 - Embeddings: multilingual E5 Small, 384 Dimensionen
-- Antworten: Qwen3 1.7B 4 Bit für 8-GB-Macs empfohlen
-- Qwen3 4B 4 Bit bei ausreichendem Speicher
+- primäre Wissensextraktion und Antworten: Qwen 3.5 4B 4 Bit
+- strukturierte Zweitprüfung: Phi-4 Mini Instruct 4 Bit
+- experimentelle visuelle Prüfung: Gemma 4 E2B Instruct 4 Bit
+- bestehende Qwen-3-Modelle bleiben als kompatible Altmodelle erhalten
 - Qwen3 8B 4 Bit auf 8-GB-Macs nur experimentell
 - Optische Dokumenteskalation: GLM-OCR 4 Bit, Revision
   `97f587506984cc92fa69b2694b4128e53db6b081`, MIT, rund 1,25 GB Download
@@ -174,6 +177,42 @@ GLM-OCR wird nur nach ausdrücklichem Download und nur für ungelöste Seiten
 verwendet. Unsichere Ergebnisse bleiben in **OCR prüfen**; das Modell darf
 weder PDFs ändern noch Seiten löschen oder manuelle Bewertungen überschreiben.
 
+Capability-Routing, Speicherbudget und exklusive Modell-Leases verhindern auf
+8-GB-Geräten unkontrolliertes paralleles Laden großer generativer Modelle.
+Automatische empfohlene Downloads sind standardmäßig aus. Details:
+[`MODEL_ROUTING.md`](docs/MODEL_ROUTING.md) und
+[`MODEL_LICENSES.md`](docs/MODEL_LICENSES.md).
+
+## Lokale Wissensdatenbank
+
+Über Dokument-, Seiten-, OCR-, FTS- und Embeddingdaten liegt eine getrennte
+SQLite-Wissensschicht für Entitäten, belegte Fakten, Beziehungen,
+Projektkandidaten, Konflikte, Kommunikation und Erfahrungswissen. Sie ersetzt
+den klassischen Index nicht.
+
+Modellausgaben werden als versioniertes JSON gegen Schema, Dokument, Seite,
+Chunk, wörtliche Textstelle und Confidence geprüft und erst danach vollständig
+in einer Transaktion gespeichert. Freie Modelltexte besitzen keinen
+Datenbankzugriff. `model_inference` bleibt unsicher und darf weder als
+gesicherter Fakt noch als automatische Projektverknüpfung dienen.
+
+Neue oder geänderte Dokumente erhalten idempotente Wissensjobs. Beim Entfernen
+werden Belege zunächst als fehlend markiert; ein Fakt bleibt aktiv, solange
+ein anderer gültiger Beleg existiert. Die Wissensfunktion ist deaktivierbar;
+die klassische Suche funktioniert ohne Wissensmodelle.
+
+Unter **Einstellungen → Entwicklung / Diagnose** sind nach Aktivierung des
+Entwicklermodus Entitäten, Aussagen, Projektkandidaten,
+Kommunikations-Threads, Erfahrungswissen und Wartung sichtbar. Der
+Wissensreset verlangt `RESET KNOWLEDGE` und lässt Originaldateien, OCR und
+klassischen Suchindex unangetastet. Details:
+[`KNOWLEDGE_ARCHITECTURE.md`](docs/KNOWLEDGE_ARCHITECTURE.md) und
+[`KNOWLEDGE_VALIDATION.md`](docs/KNOWLEDGE_VALIDATION.md).
+
+Antwort und Quellenliste besitzen einen persistenten nativen macOS-Trenner.
+Ein Doppelklick stellt die Standardaufteilung wieder her; kleine Fenster
+verwenden eine robuste Antwort-/Quellenwahl.
+
 ## Suche und Quellen
 
 Natürliche Anfragen werden zuerst in einen strikt validierten lokalen Suchplan
@@ -182,8 +221,8 @@ Pflichtbedingungen; bei komplexen Anfragen ergänzt das lokale Antwortmodell
 Themen und Synonyme. Ungültiger Modelloutput fällt auf den sicheren
 regelbasierten Plan zurück und wird nie als SQL ausgeführt.
 
-Die Suche kombiniert SQLite FTS5 mit lokaler Vektorsuche über PDFs, E-Mails
-und indexierbare Anhänge, prüft
+Die Suche kombiniert aktive belegte Wissensclaims, SQLite FTS5 und lokale
+Vektorsuche über PDFs, E-Mails und indexierbare Anhänge, prüft
 Pflichtbedingungen und bewertet Person-/Themennähe erneut. Nur „Sehr passend“
 und „Passend“ erscheinen regulär. Unsichere Treffer bleiben getrennt und
 eingeklappt. Trefferkarten zeigen Dateiname, Pfad, Seite, hervorgehobenen

@@ -67,3 +67,19 @@ public protocol AnswerGenerating: Sendable {
     func answer(question: String, sources: [SearchSource]) async throws -> String
     func unload() async
 }
+
+/// Local model boundary for versioned, schema-constrained knowledge tasks.
+/// Implementations return bytes only. They never receive database access and
+/// therefore cannot persist unchecked model output.
+public protocol StructuredKnowledgeGenerating: Sendable {
+    var modelID: String { get }
+    var modelVersion: String { get }
+
+    func generateStructuredJSON(
+        instructions: String,
+        prompt: String,
+        maximumTokens: Int
+    ) async throws -> Data
+
+    func unload() async
+}

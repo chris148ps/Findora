@@ -1758,6 +1758,29 @@ public actor SQLiteDatabase {
                 embeddingModelVersion: embeddingModelVersion,
                 now: now
             )
+            let knowledgeEnabled = try query(
+                "SELECT value FROM settings WHERE key = 'knowledgeEnabled'"
+            ).first?.string("value") != "0"
+            if knowledgeEnabled {
+                let knowledgeInput = chunks
+                    .sorted { lhs, rhs in
+                        lhs.pageNumber == rhs.pageNumber
+                            ? lhs.ordinal < rhs.ordinal
+                            : lhs.pageNumber < rhs.pageNumber
+                    }
+                    .map { "\($0.id):\($0.text)" }
+                    .joined(separator: "\n")
+                let knowledgeInputHash = SHA256Hasher().hash(
+                    data: Data(
+                        "\(hash):\(FindoraAnalysisVersions.knowledge):\(knowledgeInput)".utf8
+                    )
+                )
+                try enqueueKnowledgePipelineInTransaction(
+                    documentID: documentID,
+                    inputHash: knowledgeInputHash,
+                    now: now
+                )
+            }
             return documentID
         }
         publishStatusChange(.documentIndexed)
@@ -2768,6 +2791,107 @@ public actor SQLiteDatabase {
         )
         return rows.enumerated().compactMap { index, row in
             Self.source(row: row, score: 1.0 / Double(index + 1))
+        }
+    }
+
+    public func knowledgeSearch(
+        terms: [String],
+        contentFilter: SearchContentFilter = .all,
+        limit: Int = 40
+    ) throws -> [SearchSource] {
+        let normalized = terms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.count >= 2 }
+            .prefix(12)
+        guard !normalized.isEmpty else { return [] }
+        let searchable = """
+        lower(
+            COALESCE(subject.canonical_name, '') || ' ' ||
+            COALESCE(object.canonical_name, '') || ' ' ||
+            COALESCE(f.predicate, '') || ' ' ||
+            COALESCE(f.literal_value, '') || ' ' ||
+            COALESCE(r.predicate, '') || ' ' ||
+            e.source_quote
+        )
+        """
+        let conditions = Array(
+            repeating: "\(searchable) LIKE lower(?) ESCAPE '\\'",
+            count: normalized.count
+        ).joined(separator: " OR ")
+        let filterSQL = Self.contentFilterSQL(contentFilter, alias: "m")
+        let bindings = normalized.map { term -> SQLiteValue in
+            let escaped = term
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "%", with: "\\%")
+                .replacingOccurrences(of: "_", with: "\\_")
+            return .text("%\(escaped)%")
+        } + [.integer(Int64(limit))]
+        let rows = try query(
+            """
+            SELECT c.document_id, c.id AS chunk_id, e.page_number,
+                   e.source_quote AS chunk_text,
+                   m.file_name, m.absolute_path, m.relative_path, m.content_type,
+                   m.mail_subject, m.mail_sender, m.mail_date, m.mailbox,
+                   m.parent_email_subject, m.parent_email_sender,
+                   m.parent_email_date, kc.confidence
+            FROM knowledge_claims kc
+            LEFT JOIN knowledge_facts f ON f.claim_id = kc.id
+            LEFT JOIN knowledge_relations r ON r.claim_id = kc.id
+            LEFT JOIN knowledge_entities subject
+              ON subject.id = COALESCE(f.subject_entity_id, r.subject_entity_id)
+            LEFT JOIN knowledge_entities object
+              ON object.id = COALESCE(f.object_entity_id, r.object_entity_id)
+            JOIN knowledge_claim_evidence ce ON ce.claim_id = kc.id
+            JOIN knowledge_evidence e
+              ON e.id = ce.evidence_id AND e.evidence_status = 'valid'
+            JOIN search_source_metadata m ON m.document_id = e.document_id
+            JOIN chunks c ON c.id = COALESCE(
+                e.chunk_id,
+                (
+                    SELECT page_chunk.id FROM chunks page_chunk
+                    WHERE page_chunk.document_id = e.document_id
+                      AND page_chunk.page_number = e.page_number
+                    ORDER BY page_chunk.ordinal
+                    LIMIT 1
+                )
+            )
+            WHERE kc.status = 'active'
+              AND kc.validation_status IN ('verified', 'supported')
+              AND \(filterSQL)
+              AND (\(conditions))
+            ORDER BY kc.confidence DESC, e.confidence DESC, kc.updated_at DESC
+            LIMIT ?
+            """,
+            bindings: bindings
+        )
+        return rows.enumerated().compactMap { index, row in
+            guard let base = Self.source(
+                row: row,
+                score: row.double("confidence") ?? 1.0 / Double(index + 1)
+            ) else { return nil }
+            return SearchSource(
+                id: base.id,
+                documentID: base.documentID,
+                chunkID: base.chunkID,
+                fileName: base.fileName,
+                absolutePath: base.absolutePath,
+                relativePath: base.relativePath,
+                pageNumber: base.pageNumber,
+                excerpt: base.excerpt,
+                score: base.score,
+                relevance: .relevant,
+                reason: "Belegte Aussage aus dem lokalen Wissensgraphen.",
+                textSource: base.textSource,
+                matchKinds: [.relation, .exact],
+                contentType: base.contentType,
+                mailSubject: base.mailSubject,
+                mailSender: base.mailSender,
+                mailDate: base.mailDate,
+                mailbox: base.mailbox,
+                parentEmailSubject: base.parentEmailSubject,
+                parentEmailSender: base.parentEmailSender,
+                parentEmailDate: base.parentEmailDate
+            )
         }
     }
 
@@ -4666,6 +4790,230 @@ public actor SQLiteDatabase {
 
         try insertFileNameSuggestions(now: now)
         try rebuildDocumentRelations(now: now)
+        let hasKnowledgeCommunicationSchema = try scalarInt64(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table' AND name = 'communication_threads'
+            """
+        ) > 0
+        if hasKnowledgeCommunicationSchema {
+            try refreshKnowledgeCommunicationGraphInTransaction(now: now)
+        }
+    }
+
+    private func refreshKnowledgeCommunicationGraphInTransaction(
+        now: Double
+    ) throws {
+        let emailRows = try query(
+            """
+            SELECT id, message_id, conversation_id, subject, sender_name,
+                   sender_address, sent_at, received_at, in_reply_to,
+                   message_references, normalized_text
+            FROM emails
+            ORDER BY COALESCE(sent_at, received_at, imported_at), id
+            """
+        )
+        for row in emailRows {
+            guard let emailID = row.int64("id"),
+                  let subject = row.string("subject"),
+                  let body = row.string("normalized_text") else { continue }
+            let messageID = "communication-message-\(emailID)"
+            let recipients = try query(
+                """
+                SELECT role, display_name, address
+                FROM email_recipients
+                WHERE email_id = ?
+                ORDER BY lower(address), role
+                """,
+                bindings: [.integer(emailID)]
+            )
+            var participantAddresses = recipients.compactMap { $0.string("address") }
+            if let sender = row.string("sender_address"), !sender.isEmpty {
+                participantAddresses.append(sender)
+            }
+            let normalizedParticipants = participantAddresses
+                .map { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .sorted()
+                .joined(separator: "|")
+            let normalizedSubject = Self.normalizedThreadSubject(subject)
+
+            let threadKey: String
+            var confidence = 0.82
+            if let conversation = row.string("conversation_id")?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !conversation.isEmpty {
+                threadKey = "conversation:\(conversation)"
+                confidence = 0.99
+            } else if let inReplyTo = row.string("in_reply_to"),
+                      let parent = try query(
+                        """
+                        SELECT t.thread_key
+                        FROM communication_messages m
+                        JOIN communication_threads t ON t.id = m.thread_id
+                        WHERE m.message_identifier = ?
+                        ORDER BY m.sent_at DESC
+                        LIMIT 1
+                        """,
+                        bindings: [.text(inReplyTo)]
+                      ).first?.string("thread_key") {
+                threadKey = parent
+                confidence = 0.98
+            } else {
+                let signature = "\(normalizedSubject)\u{1f}\(normalizedParticipants)"
+                threadKey = "derived:\(SHA256Hasher().hash(data: Data(signature.utf8)))"
+                confidence = normalizedSubject.isEmpty || normalizedParticipants.isEmpty
+                    ? 0.55
+                    : 0.82
+            }
+            let threadID = "communication-thread-\(SHA256Hasher().hash(data: Data(threadKey.utf8)))"
+            let activity = row.double("sent_at") ?? row.double("received_at")
+            try execute(
+                """
+                INSERT INTO communication_threads (
+                    id, thread_key, subject_normalized, status, confidence,
+                    started_at, last_activity_at, created_at, updated_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_key) DO UPDATE SET
+                    subject_normalized = COALESCE(
+                        communication_threads.subject_normalized,
+                        excluded.subject_normalized
+                    ),
+                    confidence = MAX(communication_threads.confidence, excluded.confidence),
+                    started_at = MIN(
+                        COALESCE(communication_threads.started_at, excluded.started_at),
+                        COALESCE(excluded.started_at, communication_threads.started_at)
+                    ),
+                    last_activity_at = MAX(
+                        COALESCE(communication_threads.last_activity_at, excluded.last_activity_at),
+                        COALESCE(excluded.last_activity_at, communication_threads.last_activity_at)
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(threadID), .text(threadKey),
+                    normalizedSubject.isEmpty ? .null : .text(normalizedSubject),
+                    .real(confidence),
+                    activity.map(SQLiteValue.real) ?? .null,
+                    activity.map(SQLiteValue.real) ?? .null,
+                    .real(now), .real(now)
+                ]
+            )
+            let referencesJSON = Self.referenceJSON(
+                row.string("message_references") ?? ""
+            )
+            let bodyHash = SHA256Hasher().hash(data: Data(body.utf8))
+            try execute(
+                """
+                INSERT INTO communication_messages (
+                    id, thread_id, email_id, message_identifier, in_reply_to,
+                    references_json, sent_at, subject, body_hash, confidence,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(email_id) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    message_identifier = excluded.message_identifier,
+                    in_reply_to = excluded.in_reply_to,
+                    references_json = excluded.references_json,
+                    sent_at = excluded.sent_at,
+                    subject = excluded.subject,
+                    body_hash = excluded.body_hash,
+                    confidence = excluded.confidence,
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(messageID), .text(threadID), .integer(emailID),
+                    row.string("message_id").map(SQLiteValue.text) ?? .null,
+                    row.string("in_reply_to").map(SQLiteValue.text) ?? .null,
+                    .text(referencesJSON),
+                    activity.map(SQLiteValue.real) ?? .null,
+                    .text(subject), .text(bodyHash), .real(confidence),
+                    .real(now), .real(now)
+                ]
+            )
+            try execute(
+                "DELETE FROM communication_participants WHERE message_id = ?",
+                bindings: [.text(messageID)]
+            )
+            if let sender = row.string("sender_address"), !sender.isEmpty {
+                try execute(
+                    """
+                    INSERT OR IGNORE INTO communication_participants (
+                        message_id, address, display_name, role
+                    ) VALUES (?, ?, ?, 'sender')
+                    """,
+                    bindings: [
+                        .text(messageID), .text(sender.lowercased()),
+                        row.string("sender_name").map(SQLiteValue.text) ?? .null
+                    ]
+                )
+            }
+            for recipient in recipients {
+                guard let address = recipient.string("address"),
+                      let role = recipient.string("role") else { continue }
+                try execute(
+                    """
+                    INSERT OR IGNORE INTO communication_participants (
+                        message_id, address, display_name, role
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    bindings: [
+                        .text(messageID), .text(address.lowercased()),
+                        recipient.string("display_name").map(SQLiteValue.text) ?? .null,
+                        .text(role)
+                    ]
+                )
+            }
+            try execute(
+                "DELETE FROM communication_attachments WHERE message_id = ?",
+                bindings: [.text(messageID)]
+            )
+            try execute(
+                """
+                INSERT INTO communication_attachments (
+                    message_id, attachment_id, document_id, content_hash, file_name
+                )
+                SELECT ?, a.id, a.document_id, a.sha256, l.file_name
+                FROM email_attachment_links l
+                JOIN email_attachments a ON a.id = l.attachment_id
+                WHERE l.email_id = ?
+                """,
+                bindings: [.text(messageID), .integer(emailID)]
+            )
+        }
+        try execute(
+            """
+            DELETE FROM communication_threads
+            WHERE NOT EXISTS (
+                SELECT 1 FROM communication_messages m
+                WHERE m.thread_id = communication_threads.id
+            )
+            """
+        )
+    }
+
+    private static func normalizedThreadSubject(_ subject: String) -> String {
+        subject
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "de_DE")
+            )
+            .replacingOccurrences(
+                of: #"^(\s*(re|aw|wg|fw|fwd)\s*:\s*)+"#,
+                with: "",
+                options: .regularExpression
+            )
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func referenceJSON(_ value: String) -> String {
+        let references = value
+            .split(whereSeparator: { $0.isWhitespace || $0 == "," })
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        guard let data = try? JSONEncoder().encode(references) else { return "[]" }
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func organizationID(for address: String, now: Double) throws -> Int64? {
@@ -5149,6 +5497,1142 @@ public actor SQLiteDatabase {
         }
     }
 
+    public func knowledgeStatistics() throws -> KnowledgeStatistics {
+        try ensureOpen()
+        return KnowledgeStatistics(
+            entities: Int(try scalarInt64("SELECT COUNT(*) FROM knowledge_entities")),
+            facts: Int(
+                try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM knowledge_facts f
+                    JOIN knowledge_claims c ON c.id = f.claim_id
+                    WHERE c.status = 'active'
+                    """
+                )
+            ),
+            relations: Int(
+                try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM knowledge_relations r
+                    JOIN knowledge_claims c ON c.id = r.claim_id
+                    WHERE c.status = 'active'
+                    """
+                )
+            ),
+            projects: Int(try scalarInt64("SELECT COUNT(*) FROM knowledge_projects")),
+            conflicts: Int(
+                try scalarInt64(
+                    "SELECT COUNT(*) FROM knowledge_conflicts WHERE status <> 'resolved'"
+                )
+            ),
+            uncertainCandidates: Int(
+                try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM knowledge_claims
+                    WHERE validation_status IN ('uncertain', 'unverifiable')
+                       OR status = 'proposed'
+                    """
+                )
+            ),
+            pendingJobs: Int(
+                try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM knowledge_jobs
+                    WHERE state IN ('pending', 'running', 'paused', 'waiting_for_model')
+                    """
+                )
+            ),
+            communicationThreads: Int(
+                try scalarInt64("SELECT COUNT(*) FROM communication_threads")
+            ),
+            communicationEvents: Int(
+                try scalarInt64("SELECT COUNT(*) FROM communication_events")
+            ),
+            patterns: Int(try scalarInt64("SELECT COUNT(*) FROM knowledge_patterns"))
+        )
+    }
+
+    public func knowledgeExtractionContext(
+        documentID: Int64,
+        modelID: String,
+        modelVersion: String,
+        promptVersion: String = "knowledge-extraction-v1"
+    ) throws -> KnowledgeExtractionContext? {
+        try ensureOpen()
+        guard let document = try query(
+            "SELECT content_hash FROM documents WHERE id = ?",
+            bindings: [.integer(documentID)]
+        ).first,
+        let documentHash = document.string("content_hash") else {
+            return nil
+        }
+        let pageRows = try query(
+            """
+            SELECT id, page_number, text
+            FROM pages
+            WHERE document_id = ?
+            ORDER BY page_number
+            """,
+            bindings: [.integer(documentID)]
+        )
+        let pages = try pageRows.compactMap { row -> KnowledgeSourcePage? in
+            guard let pageID = row.int64("id"),
+                  let pageNumber = row.int64("page_number"),
+                  let text = row.string("text"),
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            let chunkIDs = Set(
+                try query(
+                    """
+                    SELECT id FROM chunks
+                    WHERE document_id = ? AND page_number = ?
+                    ORDER BY ordinal
+                    """,
+                    bindings: [.integer(documentID), .integer(pageNumber)]
+                ).compactMap { $0.string("id") }
+            )
+            return KnowledgeSourcePage(
+                pageID: pageID,
+                pageNumber: Int(pageNumber),
+                text: text,
+                validChunkIDs: chunkIDs
+            )
+        }
+        return KnowledgeExtractionContext(
+            documentID: documentID,
+            documentHash: documentHash,
+            pages: pages,
+            extractionModelID: modelID,
+            extractionModelVersion: modelVersion,
+            promptVersion: promptVersion
+        )
+    }
+
+    public func knowledgeEntityID(
+        type: KnowledgeEntityType,
+        canonicalName: String
+    ) throws -> String? {
+        try query(
+            """
+            SELECT id FROM knowledge_entities
+            WHERE type = ? AND normalized_name = ?
+            """,
+            bindings: [
+                .text(type.rawValue),
+                .text(Self.normalizedKnowledgeName(canonicalName))
+            ]
+        ).first?.string("id")
+    }
+
+    public func knowledgeReviewSnapshot(
+        limitPerSection: Int = 50
+    ) throws -> KnowledgeReviewSnapshot {
+        let limit = max(1, min(limitPerSection, 200))
+        let projects = try query(
+            """
+            SELECT id, proposed_name AS title, project_type AS detail,
+                   status, confidence, supporting_signals_json AS source
+            FROM knowledge_project_candidates
+            ORDER BY confidence DESC, updated_at DESC
+            LIMIT ?
+            """,
+            bindings: [.integer(Int64(limit))]
+        ).compactMap(Self.knowledgeReviewRecord)
+        let entities = try query(
+            """
+            SELECT id, canonical_name AS title, type AS detail,
+                   status, confidence, short_description AS source
+            FROM knowledge_entities
+            ORDER BY user_confirmed DESC, confidence DESC, updated_at DESC
+            LIMIT ?
+            """,
+            bindings: [.integer(Int64(limit))]
+        ).compactMap(Self.knowledgeReviewRecord)
+        let claims = try query(
+            """
+            SELECT c.id,
+                   COALESCE(f.predicate, r.predicate, c.claim_type) AS title,
+                   c.claim_type || ' · ' || c.validation_status AS detail,
+                   c.status, c.confidence,
+                   (
+                       SELECT e.document_hash || ' · Seite ' || e.page_number
+                       FROM knowledge_claim_evidence ce
+                       JOIN knowledge_evidence e ON e.id = ce.evidence_id
+                       WHERE ce.claim_id = c.id
+                       ORDER BY e.confidence DESC
+                       LIMIT 1
+                   ) AS source
+            FROM knowledge_claims c
+            LEFT JOIN knowledge_facts f ON f.claim_id = c.id
+            LEFT JOIN knowledge_relations r ON r.claim_id = c.id
+            ORDER BY c.updated_at DESC
+            LIMIT ?
+            """,
+            bindings: [.integer(Int64(limit))]
+        ).compactMap(Self.knowledgeReviewRecord)
+        let threads = try query(
+            """
+            SELECT t.id, COALESCE(t.subject_normalized, '(ohne Betreff)') AS title,
+                   CAST(COUNT(m.id) AS TEXT) || ' Nachricht(en)' AS detail,
+                   t.status, t.confidence,
+                   CAST(t.last_activity_at AS TEXT) AS source
+            FROM communication_threads t
+            LEFT JOIN communication_messages m ON m.thread_id = t.id
+            GROUP BY t.id
+            ORDER BY t.last_activity_at DESC
+            LIMIT ?
+            """,
+            bindings: [.integer(Int64(limit))]
+        ).compactMap(Self.knowledgeReviewRecord)
+        let patterns = try query(
+            """
+            SELECT id, title, description AS detail, status, confidence,
+                   CAST(supporting_project_count AS TEXT) || ' Projekt(e), '
+                       || CAST(supporting_claim_count AS TEXT) || ' Aussage(n)' AS source
+            FROM knowledge_patterns
+            ORDER BY confidence DESC, updated_at DESC
+            LIMIT ?
+            """,
+            bindings: [.integer(Int64(limit))]
+        ).compactMap(Self.knowledgeReviewRecord)
+        return KnowledgeReviewSnapshot(
+            projects: projects,
+            entities: entities,
+            claims: claims,
+            communicationThreads: threads,
+            patterns: patterns
+        )
+    }
+
+    public func setKnowledgeProcessingEnabled(_ enabled: Bool) throws {
+        try transaction {
+            try execute(
+                """
+                INSERT INTO settings (key, value, updated_at)
+                VALUES ('knowledgeEnabled', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(enabled ? "1" : "0"),
+                    .real(Date().timeIntervalSince1970)
+                ]
+            )
+            try execute(
+                enabled
+                    ? """
+                      UPDATE knowledge_jobs SET state = 'pending', updated_at = ?
+                      WHERE state = 'paused' AND last_error_category = 'user_disabled'
+                      """
+                    : """
+                      UPDATE knowledge_jobs
+                      SET state = 'paused', last_error_category = 'user_disabled',
+                          updated_at = ?
+                      WHERE state IN ('pending', 'waiting_for_model')
+                      """,
+                bindings: [.real(Date().timeIntervalSince1970)]
+            )
+        }
+    }
+
+    public func enqueueAllKnowledgeReanalysis(now: Date = Date()) throws {
+        try ensureOpen()
+        let timestamp = now.timeIntervalSince1970
+        try transaction {
+            let documents = try query(
+                """
+                SELECT d.id, d.content_hash
+                FROM documents d
+                WHERE EXISTS (
+                    SELECT 1 FROM pages p
+                    WHERE p.document_id = d.id AND trim(p.text) <> ''
+                )
+                """
+            )
+            for document in documents {
+                guard let documentID = document.int64("id"),
+                      let hash = document.string("content_hash") else { continue }
+                let pageFingerprint = try query(
+                    """
+                    SELECT page_number, text FROM pages
+                    WHERE document_id = ?
+                    ORDER BY page_number
+                    """,
+                    bindings: [.integer(documentID)]
+                ).compactMap { row -> String? in
+                    guard let page = row.int64("page_number"),
+                          let text = row.string("text") else { return nil }
+                    return "\(page):\(text)"
+                }.joined(separator: "\n")
+                let inputHash = SHA256Hasher().hash(
+                    data: Data(
+                        "\(hash):\(FindoraAnalysisVersions.knowledge):\(pageFingerprint)".utf8
+                    )
+                )
+                try enqueueKnowledgePipelineInTransaction(
+                    documentID: documentID,
+                    inputHash: inputHash,
+                    now: timestamp
+                )
+            }
+        }
+    }
+
+    public func storeValidatedKnowledge(
+        _ extraction: ValidatedKnowledgeExtraction,
+        now: Date = Date()
+    ) throws {
+        try ensureOpen()
+        let envelope = extraction.envelope
+        let context = extraction.context
+        let timestamp = now.timeIntervalSince1970
+        let encodedEnvelope = try JSONEncoder().encode(envelope)
+        let outputHash = SHA256Hasher().hash(data: encodedEnvelope)
+        let inputHash = SHA256Hasher().hash(
+            data: Data(
+                context.pages
+                    .sorted { $0.pageNumber < $1.pageNumber }
+                    .map { "\($0.pageID):\($0.text)" }
+                    .joined(separator: "\n")
+                    .utf8
+            )
+        )
+        let runID = UUID().uuidString.lowercased()
+
+        try transaction {
+            try execute(
+                """
+                INSERT INTO knowledge_model_runs (
+                    id, document_id, task_kind, model_id, model_version,
+                    prompt_version, schema_version, input_hash, output_hash,
+                    validation_status, started_at, completed_at
+                ) VALUES (?, ?, 'structuredExtraction', ?, ?, ?, ?, ?, ?, 'supported', ?, ?)
+                """,
+                bindings: [
+                    .text(runID), .integer(context.documentID),
+                    .text(context.extractionModelID),
+                    .text(context.extractionModelVersion),
+                    .text(context.promptVersion),
+                    .integer(Int64(context.schemaVersion)),
+                    .text(inputHash), .text(outputHash),
+                    .real(timestamp), .real(timestamp)
+                ]
+            )
+
+            var storedEntityIDs: [String: String] = [:]
+            for entity in envelope.entities {
+                let storedID = try upsertKnowledgeEntity(
+                    entity,
+                    analysisVersion: "\(context.extractionModelVersion):\(context.promptVersion)",
+                    now: timestamp
+                )
+                storedEntityIDs[entity.candidateID] = storedID
+            }
+
+            var storedEvidenceIDs: [String: String] = [:]
+            for evidence in envelope.evidence {
+                let signature = [
+                    context.documentHash,
+                    String(evidence.pageID),
+                    String(evidence.pageNumber),
+                    String(evidence.characterStart ?? -1),
+                    String(evidence.characterEnd ?? -1),
+                    evidence.source.rawValue,
+                    evidence.quote
+                ].joined(separator: "\u{1f}")
+                let storedID = "evidence-\(SHA256Hasher().hash(data: Data(signature.utf8)))"
+                storedEvidenceIDs[evidence.id] = storedID
+                try execute(
+                    """
+                    INSERT INTO knowledge_evidence (
+                        id, document_id, document_hash, page_id, page_number,
+                        chunk_id, source_quote, character_start, character_end,
+                        bbox_x, bbox_y, bbox_width, bbox_height, source_kind,
+                        confidence, evidence_status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        document_id = excluded.document_id,
+                        page_id = excluded.page_id,
+                        chunk_id = excluded.chunk_id,
+                        confidence = MAX(knowledge_evidence.confidence, excluded.confidence),
+                        evidence_status = 'valid',
+                        updated_at = excluded.updated_at
+                    """,
+                    bindings: [
+                        .text(storedID), .integer(context.documentID),
+                        .text(context.documentHash), .integer(evidence.pageID),
+                        .integer(Int64(evidence.pageNumber)),
+                        evidence.chunkID.map(SQLiteValue.text) ?? .null,
+                        .text(evidence.quote),
+                        evidence.characterStart.map { .integer(Int64($0)) } ?? .null,
+                        evidence.characterEnd.map { .integer(Int64($0)) } ?? .null,
+                        evidence.boundingBox.map { .real($0.x) } ?? .null,
+                        evidence.boundingBox.map { .real($0.y) } ?? .null,
+                        evidence.boundingBox.map { .real($0.width) } ?? .null,
+                        evidence.boundingBox.map { .real($0.height) } ?? .null,
+                        .text(evidence.source.rawValue), .real(evidence.confidence),
+                        .real(timestamp), .real(timestamp)
+                    ]
+                )
+            }
+
+            for entity in envelope.entities {
+                guard let entityID = storedEntityIDs[entity.candidateID] else {
+                    throw FindoraError.database("Entität konnte nicht aufgelöst werden.")
+                }
+                for evidenceID in Set(entity.evidenceIDs) {
+                    guard let storedEvidenceID = storedEvidenceIDs[evidenceID] else {
+                        throw FindoraError.database("Entitätsbeleg fehlt.")
+                    }
+                    try execute(
+                        """
+                        INSERT OR IGNORE INTO knowledge_entity_evidence (
+                            entity_id, evidence_id
+                        ) VALUES (?, ?)
+                        """,
+                        bindings: [.text(entityID), .text(storedEvidenceID)]
+                    )
+                }
+            }
+
+            for fact in envelope.facts {
+                guard let subjectID = storedEntityIDs[fact.subjectEntityID] else {
+                    throw FindoraError.database("Faktsubjekt konnte nicht aufgelöst werden.")
+                }
+                let objectID = fact.objectEntityID.flatMap { storedEntityIDs[$0] }
+                let semantic = [
+                    "fact", subjectID, fact.predicate, objectID ?? "",
+                    fact.literalValue ?? "", fact.valueType.rawValue, fact.unit ?? "",
+                    fact.validFrom ?? "", fact.validUntil ?? ""
+                ].joined(separator: "\u{1f}")
+                let fingerprint = SHA256Hasher().hash(data: Data(semantic.utf8))
+                let claimID = try upsertKnowledgeClaim(
+                    fingerprint: fingerprint,
+                    claimType: fact.claimType,
+                    confidence: fact.confidence,
+                    context: context,
+                    now: timestamp
+                )
+                let normalizedValue = fact.literalValue.flatMap {
+                    KnowledgeValueNormalizer().normalize($0, type: fact.valueType)
+                }
+                try execute(
+                    """
+                    INSERT INTO knowledge_facts (
+                        id, claim_id, subject_entity_id, predicate,
+                        object_entity_id, literal_value, normalized_value,
+                        value_type, unit, valid_from, valid_until
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(claim_id) DO UPDATE SET
+                        subject_entity_id = excluded.subject_entity_id,
+                        predicate = excluded.predicate,
+                        object_entity_id = excluded.object_entity_id,
+                        literal_value = excluded.literal_value,
+                        normalized_value = excluded.normalized_value,
+                        value_type = excluded.value_type,
+                        unit = excluded.unit,
+                        valid_from = excluded.valid_from,
+                        valid_until = excluded.valid_until
+                    """,
+                    bindings: [
+                        .text("fact-\(fingerprint)"), .text(claimID), .text(subjectID),
+                        .text(fact.predicate), objectID.map(SQLiteValue.text) ?? .null,
+                        fact.literalValue.map(SQLiteValue.text) ?? .null,
+                        normalizedValue.map(SQLiteValue.text) ?? .null,
+                        .text(fact.valueType.rawValue),
+                        fact.unit.map(SQLiteValue.text) ?? .null,
+                        fact.validFrom.map(SQLiteValue.text) ?? .null,
+                        fact.validUntil.map(SQLiteValue.text) ?? .null
+                    ]
+                )
+                try linkKnowledgeEvidence(
+                    fact.evidenceIDs,
+                    storedEvidenceIDs: storedEvidenceIDs,
+                    claimID: claimID
+                )
+            }
+
+            for relation in envelope.relations {
+                guard let subjectID = storedEntityIDs[relation.subjectEntityID],
+                      let objectID = storedEntityIDs[relation.objectEntityID] else {
+                    throw FindoraError.database("Relationsentität konnte nicht aufgelöst werden.")
+                }
+                let semantic = [
+                    "relation", subjectID, relation.predicate, objectID,
+                    relation.validFrom ?? "", relation.validUntil ?? ""
+                ].joined(separator: "\u{1f}")
+                let fingerprint = SHA256Hasher().hash(data: Data(semantic.utf8))
+                let claimID = try upsertKnowledgeClaim(
+                    fingerprint: fingerprint,
+                    claimType: relation.claimType,
+                    confidence: relation.confidence,
+                    context: context,
+                    now: timestamp
+                )
+                try execute(
+                    """
+                    INSERT INTO knowledge_relations (
+                        id, claim_id, subject_entity_id, predicate,
+                        object_entity_id, valid_from, valid_until
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(claim_id) DO UPDATE SET
+                        subject_entity_id = excluded.subject_entity_id,
+                        predicate = excluded.predicate,
+                        object_entity_id = excluded.object_entity_id,
+                        valid_from = excluded.valid_from,
+                        valid_until = excluded.valid_until
+                    """,
+                    bindings: [
+                        .text("relation-\(fingerprint)"), .text(claimID),
+                        .text(subjectID), .text(relation.predicate), .text(objectID),
+                        relation.validFrom.map(SQLiteValue.text) ?? .null,
+                        relation.validUntil.map(SQLiteValue.text) ?? .null
+                    ]
+                )
+                try linkKnowledgeEvidence(
+                    relation.evidenceIDs,
+                    storedEvidenceIDs: storedEvidenceIDs,
+                    claimID: claimID
+                )
+            }
+
+            if !envelope.projectSignals.isEmpty {
+                let signalData = try JSONEncoder().encode(envelope.projectSignals)
+                let candidateKey = SHA256Hasher().hash(
+                    data: Data("\(context.documentHash):\(String(decoding: signalData, as: UTF8.self))".utf8)
+                )
+                let confidence = envelope.projectSignals.map(\.weight).reduce(0, +)
+                    / Double(envelope.projectSignals.count)
+                try execute(
+                    """
+                    INSERT INTO knowledge_project_candidates (
+                        id, candidate_key, proposed_name, project_type, status,
+                        confidence, supporting_signals_json, counter_signals_json,
+                        extraction_model, model_version, prompt_version,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'proposed', ?, ?, '[]', ?, ?, ?, ?, ?)
+                    ON CONFLICT(candidate_key) DO UPDATE SET
+                        confidence = excluded.confidence,
+                        supporting_signals_json = excluded.supporting_signals_json,
+                        model_version = excluded.model_version,
+                        prompt_version = excluded.prompt_version,
+                        updated_at = excluded.updated_at
+                    """,
+                    bindings: [
+                        .text("project-candidate-\(candidateKey)"), .text(candidateKey),
+                        .text("Vorgang \(context.documentHash.prefix(10))"),
+                        .text(envelope.documentType ?? "case"), .real(confidence),
+                        .text(String(decoding: signalData, as: UTF8.self)),
+                        .text(context.extractionModelID),
+                        .text(context.extractionModelVersion),
+                        .text(context.promptVersion),
+                        .real(timestamp), .real(timestamp)
+                    ]
+                )
+            }
+
+            try execute(
+                """
+                INSERT INTO knowledge_analysis_state (
+                    document_id, document_hash, schema_version,
+                    extraction_version, validation_version, graph_version,
+                    updated_at, last_completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    document_hash = excluded.document_hash,
+                    schema_version = excluded.schema_version,
+                    extraction_version = excluded.extraction_version,
+                    validation_version = excluded.validation_version,
+                    graph_version = excluded.graph_version,
+                    updated_at = excluded.updated_at,
+                    last_completed_at = excluded.last_completed_at
+                """,
+                bindings: [
+                    .integer(context.documentID), .text(context.documentHash),
+                    .integer(Int64(context.schemaVersion)),
+                    .text(context.promptVersion), .text("source-validation-v1"),
+                    .text("sqlite-graph-v1"), .real(timestamp), .real(timestamp)
+                ]
+            )
+        }
+        publishStatusChange(.documentIndexed)
+    }
+
+    @discardableResult
+    public func enqueueKnowledgeJob(
+        kind: KnowledgeJobKind,
+        documentID: Int64?,
+        targetKey: String,
+        inputHash: String,
+        priority: Int,
+        requiredCapability: ModelCapability? = nil,
+        requiredModelID: String? = nil,
+        now: Date = Date()
+    ) throws -> String {
+        try ensureOpen()
+        let identifier = UUID().uuidString.lowercased()
+        let timestamp = now.timeIntervalSince1970
+        try execute(
+            """
+            INSERT INTO knowledge_jobs (
+                id, job_kind, document_id, target_key, input_hash, priority,
+                state, required_capability, required_model_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+            ON CONFLICT(job_kind, target_key, input_hash) DO UPDATE SET
+                priority = MAX(knowledge_jobs.priority, excluded.priority),
+                state = CASE
+                    WHEN knowledge_jobs.state = 'completed' THEN 'completed'
+                    ELSE 'pending' END,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .text(identifier), .text(kind.rawValue),
+                documentID.map(SQLiteValue.integer) ?? .null,
+                .text(targetKey), .text(inputHash), .integer(Int64(priority)),
+                requiredCapability.map { .text($0.rawValue) } ?? .null,
+                requiredModelID.map(SQLiteValue.text) ?? .null,
+                .real(timestamp), .real(timestamp)
+            ]
+        )
+        return try query(
+            """
+            SELECT id FROM knowledge_jobs
+            WHERE job_kind = ? AND target_key = ? AND input_hash = ?
+            """,
+            bindings: [.text(kind.rawValue), .text(targetKey), .text(inputHash)]
+        ).first?.string("id") ?? identifier
+    }
+
+    public func nextKnowledgeJob(now: Date = Date()) throws -> KnowledgeJob? {
+        try ensureOpen()
+        let row = try query(
+            """
+            SELECT j.*
+            FROM knowledge_jobs j
+            WHERE j.state = 'pending'
+              AND (j.not_before IS NULL OR j.not_before <= ?)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM knowledge_job_dependencies d
+                  JOIN knowledge_jobs parent ON parent.id = d.depends_on_job_id
+                  WHERE d.job_id = j.id AND parent.state <> 'completed'
+              )
+            ORDER BY j.priority DESC, j.updated_at ASC
+            LIMIT 1
+            """,
+            bindings: [.real(now.timeIntervalSince1970)]
+        ).first
+        guard let row,
+              let id = row.string("id"),
+              let kindRaw = row.string("job_kind"),
+              let kind = KnowledgeJobKind(rawValue: kindRaw),
+              let targetKey = row.string("target_key"),
+              let inputHash = row.string("input_hash"),
+              let priority = row.int64("priority"),
+              let attempts = row.int64("attempt_count"),
+              let createdAt = row.double("created_at"),
+              let updatedAt = row.double("updated_at") else { return nil }
+        try execute(
+            """
+            UPDATE knowledge_jobs
+            SET state = 'running', attempt_count = attempt_count + 1, updated_at = ?
+            WHERE id = ? AND state = 'pending'
+            """,
+            bindings: [.real(now.timeIntervalSince1970), .text(id)]
+        )
+        return KnowledgeJob(
+            id: id,
+            kind: kind,
+            documentID: row.int64("document_id"),
+            targetKey: targetKey,
+            inputHash: inputHash,
+            priority: Int(priority),
+            state: .running,
+            attemptCount: Int(attempts) + 1,
+            lastErrorCategory: row.string("last_error_category"),
+            createdAt: Date(timeIntervalSince1970: createdAt),
+            updatedAt: Date(timeIntervalSince1970: updatedAt)
+        )
+    }
+
+    public func completeKnowledgeJob(
+        id: String,
+        succeeded: Bool,
+        errorCategory: String? = nil,
+        retryAfter: Date? = nil,
+        now: Date = Date()
+    ) throws {
+        let state = succeeded ? "completed" : (retryAfter == nil ? "failed" : "pending")
+        try execute(
+            """
+            UPDATE knowledge_jobs
+            SET state = ?, last_error_category = ?, not_before = ?,
+                completed_at = CASE WHEN ? = 'completed' THEN ? ELSE NULL END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            bindings: [
+                .text(state), errorCategory.map(SQLiteValue.text) ?? .null,
+                retryAfter.map { .real($0.timeIntervalSince1970) } ?? .null,
+                .text(state), .real(now.timeIntervalSince1970),
+                .real(now.timeIntervalSince1970), .text(id)
+            ]
+        )
+    }
+
+    public func invalidateKnowledge(
+        documentID: Int64,
+        currentDocumentHash: String?,
+        reason: String,
+        now: Date = Date()
+    ) throws {
+        let timestamp = now.timeIntervalSince1970
+        let revisionJSON = String(
+            decoding: try JSONSerialization.data(
+                withJSONObject: ["reason": reason],
+                options: [.sortedKeys]
+            ),
+            as: UTF8.self
+        )
+        try transaction {
+            let hashCondition = currentDocumentHash == nil
+                ? ""
+                : " AND document_hash <> ?"
+            var bindings: [SQLiteValue] = [
+                .text(currentDocumentHash == nil ? "missing" : "stale"),
+                .real(timestamp), .integer(documentID)
+            ]
+            if let currentDocumentHash {
+                bindings.append(.text(currentDocumentHash))
+            }
+            try execute(
+                """
+                UPDATE knowledge_evidence
+                SET evidence_status = ?, updated_at = ?
+                WHERE document_id = ?\(hashCondition)
+                """,
+                bindings: bindings
+            )
+            try execute(
+                """
+                UPDATE knowledge_claims
+                SET status = CASE
+                        WHEN claim_type = 'user_confirmed' THEN 'review_required'
+                        ELSE 'deprecated' END,
+                    validation_status = CASE
+                        WHEN claim_type = 'user_confirmed' THEN 'uncertain'
+                        ELSE 'unverifiable' END,
+                    revision = revision + 1,
+                    updated_at = ?
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM knowledge_claim_evidence ce
+                    JOIN knowledge_evidence e ON e.id = ce.evidence_id
+                    WHERE ce.claim_id = knowledge_claims.id
+                      AND e.document_id = ?
+                )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM knowledge_claim_evidence ce
+                    JOIN knowledge_evidence e ON e.id = ce.evidence_id
+                    WHERE ce.claim_id = knowledge_claims.id
+                      AND e.evidence_status = 'valid'
+                )
+                """,
+                bindings: [.real(timestamp), .integer(documentID)]
+            )
+            try execute(
+                """
+                UPDATE knowledge_summaries
+                SET validity_status = 'stale', updated_at = ?
+                WHERE EXISTS (
+                    SELECT 1 FROM knowledge_summary_dependencies d
+                    WHERE d.summary_id = knowledge_summaries.id
+                      AND d.dependency_type = 'document'
+                      AND d.dependency_id = ?
+                )
+                """,
+                bindings: [.real(timestamp), .text(String(documentID))]
+            )
+            let targetHash = currentDocumentHash ?? "missing"
+            _ = try enqueueKnowledgeJob(
+                kind: .rebuildAffectedSubgraph,
+                documentID: documentID,
+                targetKey: "document:\(documentID)",
+                inputHash: targetHash,
+                priority: 80,
+                now: now
+            )
+            try execute(
+                """
+                INSERT INTO knowledge_revisions (
+                    id, object_type, object_id, revision, action,
+                    current_json, actor, created_at
+                ) VALUES (?, 'document_knowledge', ?, 1, 'invalidate', ?, 'system', ?)
+                """,
+                bindings: [
+                    .text(UUID().uuidString.lowercased()), .text(String(documentID)),
+                    .text(revisionJSON),
+                    .real(timestamp)
+                ]
+            )
+        }
+    }
+
+    public func knowledgeGraph(
+        startingAt entityID: String,
+        maximumDepth: Int = 3,
+        maximumEdges: Int = 200
+    ) throws -> [KnowledgeGraphEdge] {
+        let depth = max(1, min(maximumDepth, 5))
+        let limit = max(1, min(maximumEdges, 500))
+        let rows = try query(
+            """
+            WITH RECURSIVE graph(id, subject_id, predicate, object_id, depth, path) AS (
+                SELECT r.id, r.subject_entity_id, r.predicate, r.object_entity_id,
+                       1, '|' || r.subject_entity_id || '|' || r.object_entity_id || '|'
+                FROM knowledge_relations r
+                JOIN knowledge_claims c ON c.id = r.claim_id
+                WHERE r.subject_entity_id = ?
+                  AND c.status = 'active'
+                  AND c.validation_status IN ('verified', 'supported')
+                UNION ALL
+                SELECT r.id, r.subject_entity_id, r.predicate, r.object_entity_id,
+                       graph.depth + 1,
+                       graph.path || r.object_entity_id || '|'
+                FROM graph
+                JOIN knowledge_relations r ON r.subject_entity_id = graph.object_id
+                JOIN knowledge_claims c ON c.id = r.claim_id
+                WHERE graph.depth < ?
+                  AND c.status = 'active'
+                  AND c.validation_status IN ('verified', 'supported')
+                  AND instr(graph.path, '|' || r.object_entity_id || '|') = 0
+            )
+            SELECT graph.id, graph.subject_id, graph.predicate, graph.object_id,
+                   graph.depth, c.claim_type, c.validation_status, c.confidence
+            FROM graph
+            JOIN knowledge_relations r ON r.id = graph.id
+            JOIN knowledge_claims c ON c.id = r.claim_id
+            ORDER BY graph.depth, c.confidence DESC
+            LIMIT ?
+            """,
+            bindings: [
+                .text(entityID), .integer(Int64(depth)), .integer(Int64(limit))
+            ]
+        )
+        return rows.compactMap {
+            guard let id = $0.string("id"),
+                  let subject = $0.string("subject_id"),
+                  let predicate = $0.string("predicate"),
+                  let object = $0.string("object_id"),
+                  let depth = $0.int64("depth"),
+                  let typeRaw = $0.string("claim_type"),
+                  let type = KnowledgeClaimType(rawValue: typeRaw),
+                  let statusRaw = $0.string("validation_status"),
+                  let status = KnowledgeValidationStatus(rawValue: statusRaw),
+                  let confidence = $0.double("confidence") else { return nil }
+            return KnowledgeGraphEdge(
+                id: id,
+                subjectEntityID: subject,
+                predicate: predicate,
+                objectEntityID: object,
+                claimType: type,
+                validationStatus: status,
+                confidence: confidence,
+                depth: Int(depth)
+            )
+        }
+    }
+
+    public func resetKnowledgeDatabase(confirmation: String) throws {
+        guard confirmation == "RESET KNOWLEDGE" else {
+            throw FindoraError.processFailed(
+                "Die Bestätigung für das Zurücksetzen der Wissensdatenbank fehlt."
+            )
+        }
+        try transaction {
+            for table in Self.knowledgeResetTables {
+                try execute("DELETE FROM \(table)")
+            }
+        }
+    }
+
+    private func upsertKnowledgeEntity(
+        _ candidate: KnowledgeEntityCandidate,
+        analysisVersion: String,
+        now: Double
+    ) throws -> String {
+        let normalized = Self.normalizedKnowledgeName(candidate.canonicalName)
+        let identifier = UUID().uuidString.lowercased()
+        try execute(
+            """
+            INSERT INTO knowledge_entities (
+                id, type, canonical_name, normalized_name, short_description,
+                confidence, first_source_at, last_source_at, analysis_version,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(type, normalized_name) DO UPDATE SET
+                canonical_name = CASE
+                    WHEN knowledge_entities.user_confirmed = 1
+                    THEN knowledge_entities.canonical_name
+                    ELSE excluded.canonical_name END,
+                short_description = COALESCE(
+                    knowledge_entities.short_description,
+                    excluded.short_description
+                ),
+                confidence = MAX(knowledge_entities.confidence, excluded.confidence),
+                last_source_at = excluded.last_source_at,
+                analysis_version = excluded.analysis_version,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .text(identifier), .text(candidate.type.rawValue),
+                .text(candidate.canonicalName), .text(normalized),
+                candidate.shortDescription.map(SQLiteValue.text) ?? .null,
+                .real(candidate.confidence), .real(now), .real(now),
+                .text(analysisVersion), .real(now), .real(now)
+            ]
+        )
+        guard let entityID = try query(
+            """
+            SELECT id FROM knowledge_entities
+            WHERE type = ? AND normalized_name = ?
+            """,
+            bindings: [.text(candidate.type.rawValue), .text(normalized)]
+        ).first?.string("id") else {
+            throw FindoraError.database("Wissensentität konnte nicht gespeichert werden.")
+        }
+        for alias in Set(candidate.aliases + [candidate.canonicalName]) {
+            let normalizedAlias = Self.normalizedKnowledgeName(alias)
+            guard !normalizedAlias.isEmpty else { continue }
+            try execute(
+                """
+                INSERT INTO knowledge_entity_aliases (
+                    id, entity_id, alias, normalized_alias, confidence,
+                    source_kind, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'extraction', ?)
+                ON CONFLICT(entity_id, normalized_alias) DO UPDATE SET
+                    confidence = MAX(
+                        knowledge_entity_aliases.confidence,
+                        excluded.confidence
+                    )
+                """,
+                bindings: [
+                    .text(UUID().uuidString.lowercased()), .text(entityID),
+                    .text(alias), .text(normalizedAlias),
+                    .real(candidate.confidence), .real(now)
+                ]
+            )
+        }
+        for (type, value) in candidate.identifiers {
+            let normalizedValue = Self.normalizedKnowledgeName(value)
+            try execute(
+                """
+                INSERT INTO knowledge_entity_identifiers (
+                    id, entity_id, identifier_type, identifier_value,
+                    normalized_value, confidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(identifier_type, normalized_value) DO UPDATE SET
+                    confidence = MAX(
+                        knowledge_entity_identifiers.confidence,
+                        excluded.confidence
+                    )
+                """,
+                bindings: [
+                    .text(UUID().uuidString.lowercased()), .text(entityID),
+                    .text(type), .text(value), .text(normalizedValue),
+                    .real(candidate.confidence), .real(now)
+                ]
+            )
+        }
+        return entityID
+    }
+
+    private func upsertKnowledgeClaim(
+        fingerprint: String,
+        claimType: KnowledgeClaimType,
+        confidence: Double,
+        context: KnowledgeExtractionContext,
+        now: Double
+    ) throws -> String {
+        let identifier = UUID().uuidString.lowercased()
+        let validation: KnowledgeValidationStatus = claimType == .modelInference
+            ? .uncertain
+            : .supported
+        let status = claimType.mayBecomeActiveAutomatically
+            && validation.maySupportActiveKnowledge ? "active" : "proposed"
+        try execute(
+            """
+            INSERT INTO knowledge_claims (
+                id, source_fingerprint, claim_type, validation_status,
+                confidence, status, extraction_model, model_version,
+                prompt_version, schema_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_fingerprint) DO UPDATE SET
+                claim_type = CASE
+                    WHEN knowledge_claims.claim_type = 'user_confirmed'
+                    THEN knowledge_claims.claim_type
+                    ELSE excluded.claim_type END,
+                validation_status = CASE
+                    WHEN knowledge_claims.claim_type = 'user_confirmed'
+                    THEN knowledge_claims.validation_status
+                    ELSE excluded.validation_status END,
+                confidence = MAX(knowledge_claims.confidence, excluded.confidence),
+                status = CASE
+                    WHEN knowledge_claims.claim_type IN ('user_confirmed', 'rejected')
+                    THEN knowledge_claims.status
+                    ELSE excluded.status END,
+                extraction_model = excluded.extraction_model,
+                model_version = excluded.model_version,
+                prompt_version = excluded.prompt_version,
+                schema_version = excluded.schema_version,
+                revision = knowledge_claims.revision + 1,
+                updated_at = excluded.updated_at
+            """,
+            bindings: [
+                .text(identifier), .text(fingerprint), .text(claimType.rawValue),
+                .text(validation.rawValue), .real(confidence), .text(status),
+                .text(context.extractionModelID),
+                .text(context.extractionModelVersion),
+                .text(context.promptVersion),
+                .integer(Int64(context.schemaVersion)),
+                .real(now), .real(now)
+            ]
+        )
+        return try query(
+            "SELECT id FROM knowledge_claims WHERE source_fingerprint = ?",
+            bindings: [.text(fingerprint)]
+        ).first?.string("id") ?? identifier
+    }
+
+    private func linkKnowledgeEvidence(
+        _ evidenceIDs: [String],
+        storedEvidenceIDs: [String: String],
+        claimID: String
+    ) throws {
+        guard !evidenceIDs.isEmpty else {
+            throw FindoraError.database("Ein Wissenseintrag darf nicht ohne Beleg gespeichert werden.")
+        }
+        for evidenceID in Set(evidenceIDs) {
+            guard let storedID = storedEvidenceIDs[evidenceID] else {
+                throw FindoraError.database("Ein referenzierter Wissensbeleg fehlt.")
+            }
+            try execute(
+                """
+                INSERT OR IGNORE INTO knowledge_claim_evidence (
+                    claim_id, evidence_id, support_kind
+                ) VALUES (?, ?, 'supports')
+                """,
+                bindings: [.text(claimID), .text(storedID)]
+            )
+        }
+    }
+
+    private func enqueueKnowledgePipelineInTransaction(
+        documentID: Int64,
+        inputHash: String,
+        now: Double
+    ) throws {
+        let targetKey = "document:\(documentID)"
+        let stages: [(KnowledgeJobKind, ModelCapability, Int)] = [
+            (.classifyDocument, .structuredExtraction, 60),
+            (.extractEntities, .structuredExtraction, 59),
+            (.extractFacts, .structuredExtraction, 58),
+            (.resolveEntities, .entityResolution, 57),
+            (.buildRelations, .relationExtraction, 56),
+            (.proposeProjects, .structuredExtraction, 55),
+            (.validateKnowledge, .knowledgeValidation, 54),
+            (.detectConflicts, .contradictionDetection, 53),
+            (.refreshSummaries, .summarization, 52),
+            (.analyzeCommunication, .structuredExtraction, 51)
+        ]
+        var previousID: String?
+        for (kind, capability, priority) in stages {
+            let jobSignature = "\(kind.rawValue):\(targetKey):\(inputHash)"
+            let jobID = "knowledge-job-\(SHA256Hasher().hash(data: Data(jobSignature.utf8)))"
+            try execute(
+                """
+                INSERT INTO knowledge_jobs (
+                    id, job_kind, document_id, target_key, input_hash, priority,
+                    state, required_capability, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(job_kind, target_key, input_hash) DO UPDATE SET
+                    priority = MAX(knowledge_jobs.priority, excluded.priority),
+                    updated_at = excluded.updated_at
+                """,
+                bindings: [
+                    .text(jobID), .text(kind.rawValue), .integer(documentID),
+                    .text(targetKey), .text(inputHash), .integer(Int64(priority)),
+                    .text(capability.rawValue), .real(now), .real(now)
+                ]
+            )
+            if let previousID {
+                try execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge_job_dependencies (
+                        job_id, depends_on_job_id
+                    ) VALUES (?, ?)
+                    """,
+                    bindings: [.text(jobID), .text(previousID)]
+                )
+            }
+            previousID = jobID
+        }
+    }
+
+    private static func normalizedKnowledgeName(_ value: String) -> String {
+        value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "de_DE")
+        )
+        .replacingOccurrences(
+            of: #"[^a-z0-9@+]+"#,
+            with: " ",
+            options: .regularExpression
+        )
+        .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func knowledgeReviewRecord(
+        _ row: SQLiteRow
+    ) -> KnowledgeReviewRecord? {
+        guard let id = row.string("id"),
+              let title = row.string("title"),
+              let detail = row.string("detail"),
+              let status = row.string("status"),
+              let confidence = row.double("confidence") else { return nil }
+        return KnowledgeReviewRecord(
+            id: id,
+            title: title,
+            detail: detail,
+            status: status,
+            confidence: confidence,
+            sourceSummary: row.string("source")
+        )
+    }
+
+    private static let knowledgeResetTables = [
+        "knowledge_recommendations", "knowledge_trends", "knowledge_statistics",
+        "knowledge_pattern_evidence", "knowledge_patterns",
+        "communication_relations", "communication_attachments",
+        "communication_events", "communication_participants",
+        "communication_messages", "communication_threads", "knowledge_gaps",
+        "knowledge_model_runs", "knowledge_job_dependencies", "knowledge_jobs",
+        "knowledge_analysis_state", "knowledge_summary_versions",
+        "knowledge_summary_dependencies", "knowledge_summaries",
+        "knowledge_project_evidence", "knowledge_project_members",
+        "knowledge_project_candidates", "knowledge_projects",
+        "knowledge_entity_negative_rules", "knowledge_entity_merge_rules",
+        "knowledge_revisions", "knowledge_inferences", "knowledge_conflicts",
+        "knowledge_claim_evidence", "knowledge_facts", "knowledge_relations",
+        "knowledge_claims", "knowledge_entity_evidence", "knowledge_evidence",
+        "knowledge_entity_embeddings", "knowledge_entity_identifiers",
+        "knowledge_entity_aliases", "knowledge_entities"
+    ]
+
     private static let freeMailDomains: Set<String> = [
         "gmail.com", "googlemail.com", "icloud.com", "me.com", "mac.com",
         "outlook.com", "hotmail.com", "live.com", "yahoo.com", "gmx.de",
@@ -5531,6 +7015,50 @@ public actor SQLiteDatabase {
                 )
             }
         }
+        if current < 15 {
+            if current >= 1 {
+                try createPreKnowledgeMigrationBackup(schemaVersion: Int(current))
+            }
+            try transaction {
+                let hasDocumentSchema = try scalarInt64(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'documents'
+                    """
+                ) > 0
+                if hasDocumentSchema {
+                    for statement in Self.migration15 {
+                        try execute(statement)
+                    }
+                    try refreshKnowledgeCommunicationGraphInTransaction(
+                        now: Date().timeIntervalSince1970
+                    )
+                }
+                try execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (15, ?)",
+                    bindings: [.real(Date().timeIntervalSince1970)]
+                )
+            }
+        }
+    }
+
+    private func createPreKnowledgeMigrationBackup(schemaVersion: Int) throws {
+        try execute("PRAGMA wal_checkpoint(FULL)")
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = formatter.string(from: Date())
+        let backup = url.deletingLastPathComponent().appending(
+            path: "\(url.deletingPathExtension().lastPathComponent)-pre-knowledge-v\(schemaVersion)-\(stamp).sqlite3"
+        )
+        guard !FileManager.default.fileExists(atPath: backup.path) else { return }
+        do {
+            try FileManager.default.copyItem(at: url, to: backup)
+        } catch {
+            throw FindoraError.database(
+                "Die Sicherheitskopie vor der Wissensmigration konnte nicht erstellt werden: \(error.localizedDescription)"
+            )
+        }
     }
 
     private func ensureOpen() throws {
@@ -5540,6 +7068,56 @@ public actor SQLiteDatabase {
     }
 
     private func removeOrphanedDocumentsInTransaction() throws {
+        try execute(
+            """
+            UPDATE knowledge_evidence
+            SET evidence_status = 'missing', updated_at = ?
+            WHERE document_id IN (
+                SELECT d.id
+                FROM documents d
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_locations l
+                    WHERE l.document_id = d.id AND l.deleted_at IS NULL
+                )
+                  AND d.content_type = 'pdf'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM emails e WHERE e.document_id = d.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM email_attachments a WHERE a.document_id = d.id
+                  )
+            )
+            """,
+            bindings: [.real(Date().timeIntervalSince1970)]
+        )
+        try execute(
+            """
+            UPDATE knowledge_claims
+            SET status = CASE
+                    WHEN claim_type = 'user_confirmed' THEN 'review_required'
+                    ELSE 'deprecated' END,
+                validation_status = CASE
+                    WHEN claim_type = 'user_confirmed' THEN 'uncertain'
+                    ELSE 'unverifiable' END,
+                revision = revision + 1,
+                updated_at = ?
+            WHERE EXISTS (
+                SELECT 1
+                FROM knowledge_claim_evidence ce
+                JOIN knowledge_evidence e ON e.id = ce.evidence_id
+                WHERE ce.claim_id = knowledge_claims.id
+                  AND e.evidence_status = 'missing'
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM knowledge_claim_evidence ce
+                JOIN knowledge_evidence e ON e.id = ce.evidence_id
+                WHERE ce.claim_id = knowledge_claims.id
+                  AND e.evidence_status = 'valid'
+            )
+            """,
+            bindings: [.real(Date().timeIntervalSince1970)]
+        )
         try execute(
             """
             DELETE FROM chunks_fts
@@ -5831,7 +7409,7 @@ public actor SQLiteDatabase {
 
     private static let migration1 = [
         """
-        CREATE TABLE documents (
+        CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content_hash TEXT NOT NULL UNIQUE,
             page_count INTEGER NOT NULL DEFAULT 0,
@@ -5843,7 +7421,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE document_locations (
+        CREATE TABLE IF NOT EXISTS document_locations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             absolute_path TEXT NOT NULL UNIQUE,
@@ -5856,7 +7434,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE pages (
+        CREATE TABLE IF NOT EXISTS pages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             page_number INTEGER NOT NULL,
@@ -5865,7 +7443,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE chunks (
+        CREATE TABLE IF NOT EXISTS chunks (
             id TEXT PRIMARY KEY,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             document_hash TEXT NOT NULL,
@@ -5880,7 +7458,7 @@ public actor SQLiteDatabase {
         """,
         "CREATE VIRTUAL TABLE chunks_fts USING fts5(chunk_id UNINDEXED, chunk_text, tokenize='unicode61 remove_diacritics 2')",
         """
-        CREATE TABLE chunk_embeddings (
+        CREATE TABLE IF NOT EXISTS chunk_embeddings (
             chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
             model_id TEXT NOT NULL,
             model_version TEXT NOT NULL,
@@ -5890,7 +7468,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE processing_jobs (
+        CREATE TABLE IF NOT EXISTS processing_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_key TEXT NOT NULL UNIQUE,
             absolute_path TEXT NOT NULL,
@@ -5908,7 +7486,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE ocr_results (
+        CREATE TABLE IF NOT EXISTS ocr_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
             input_hash TEXT NOT NULL,
@@ -5921,7 +7499,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE index_state (
+        CREATE TABLE IF NOT EXISTS index_state (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             embedding_model_id TEXT NOT NULL,
             embedding_model_version TEXT NOT NULL,
@@ -5933,7 +7511,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE embedding_models (
+        CREATE TABLE IF NOT EXISTS embedding_models (
             id TEXT NOT NULL,
             version TEXT NOT NULL,
             state TEXT NOT NULL,
@@ -5943,7 +7521,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE llm_models (
+        CREATE TABLE IF NOT EXISTS llm_models (
             id TEXT NOT NULL,
             version TEXT NOT NULL,
             state TEXT NOT NULL,
@@ -5954,7 +7532,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE model_downloads (
+        CREATE TABLE IF NOT EXISTS model_downloads (
             id TEXT PRIMARY KEY,
             model_id TEXT NOT NULL,
             model_version TEXT NOT NULL,
@@ -5967,14 +7545,14 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE settings (
+        CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at REAL NOT NULL
         )
         """,
         """
-        CREATE TABLE errors (
+        CREATE TABLE IF NOT EXISTS errors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL,
             message TEXT NOT NULL,
@@ -5984,7 +7562,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE search_history (
+        CREATE TABLE IF NOT EXISTS search_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             query TEXT NOT NULL,
             created_at REAL NOT NULL,
@@ -5993,7 +7571,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE source_bookmarks (
+        CREATE TABLE IF NOT EXISTS source_bookmarks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             purpose TEXT NOT NULL UNIQUE,
             bookmark_data BLOB NOT NULL,
@@ -6001,10 +7579,10 @@ public actor SQLiteDatabase {
             updated_at REAL NOT NULL
         )
         """,
-        "CREATE INDEX idx_locations_document ON document_locations(document_id)",
-        "CREATE INDEX idx_jobs_state ON processing_jobs(state, updated_at)",
-        "CREATE INDEX idx_chunks_document ON chunks(document_id)",
-        "CREATE INDEX idx_embeddings_model ON chunk_embeddings(model_id, model_version)"
+        "CREATE INDEX IF NOT EXISTS idx_locations_document ON document_locations(document_id)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_state ON processing_jobs(state, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id)",
+        "CREATE INDEX IF NOT EXISTS idx_embeddings_model ON chunk_embeddings(model_id, model_version)"
     ]
 
     private static let migration2 = [
@@ -6016,12 +7594,12 @@ public actor SQLiteDatabase {
         )
         WHERE current_file_hash IS NULL
         """,
-        "CREATE INDEX idx_locations_current_hash ON document_locations(current_file_hash)"
+        "CREATE INDEX IF NOT EXISTS idx_locations_current_hash ON document_locations(current_file_hash)"
     ]
 
     private static let migration3 = [
         """
-        CREATE TABLE ocr_page_quality (
+        CREATE TABLE IF NOT EXISTS ocr_page_quality (
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             page_number INTEGER NOT NULL,
             mean_confidence REAL,
@@ -6036,7 +7614,7 @@ public actor SQLiteDatabase {
             PRIMARY KEY(document_id, page_number)
         )
         """,
-        "CREATE INDEX idx_ocr_quality_status ON ocr_page_quality(status)"
+        "CREATE INDEX IF NOT EXISTS idx_ocr_quality_status ON ocr_page_quality(status)"
     ]
 
     private static let migration4 = [
@@ -6065,7 +7643,7 @@ public actor SQLiteDatabase {
 
     private static let migration7 = [
         """
-        CREATE TABLE page_content_analysis (
+        CREATE TABLE IF NOT EXISTS page_content_analysis (
             absolute_path TEXT NOT NULL,
             original_hash TEXT NOT NULL,
             page_number INTEGER NOT NULL,
@@ -6092,8 +7670,8 @@ public actor SQLiteDatabase {
             PRIMARY KEY(absolute_path, page_number)
         )
         """,
-        "CREATE INDEX idx_page_analysis_status ON page_content_analysis(status, user_decision)",
-        "CREATE INDEX idx_page_analysis_hash ON page_content_analysis(original_hash)"
+        "CREATE INDEX IF NOT EXISTS idx_page_analysis_status ON page_content_analysis(status, user_decision)",
+        "CREATE INDEX IF NOT EXISTS idx_page_analysis_hash ON page_content_analysis(original_hash)"
     ]
 
     private static let migration8 = [
@@ -6105,7 +7683,7 @@ public actor SQLiteDatabase {
         "ALTER TABLE processing_jobs ADD COLUMN ocr_attempt_total INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE processing_jobs ADD COLUMN ocr_strategy TEXT",
         """
-        CREATE TABLE ocr_page_attempts (
+        CREATE TABLE IF NOT EXISTS ocr_page_attempts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             absolute_path TEXT NOT NULL,
             original_hash TEXT NOT NULL,
@@ -6128,7 +7706,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE INDEX idx_ocr_attempt_review
+        CREATE INDEX IF NOT EXISTS idx_ocr_attempt_review
         ON ocr_page_attempts(absolute_path, original_hash, page_number, is_best)
         """,
         """
@@ -6146,7 +7724,7 @@ public actor SQLiteDatabase {
 
     private static let migration9 = [
         """
-        CREATE TABLE model_states (
+        CREATE TABLE IF NOT EXISTS model_states (
             model_id TEXT NOT NULL,
             model_version TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -6157,9 +7735,9 @@ public actor SQLiteDatabase {
             PRIMARY KEY(model_id, model_version)
         )
         """,
-        "CREATE UNIQUE INDEX idx_model_state_enabled_kind ON model_states(kind) WHERE enabled = 1",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_model_state_enabled_kind ON model_states(kind) WHERE enabled = 1",
         """
-        CREATE TABLE processing_sessions (
+        CREATE TABLE IF NOT EXISTS processing_sessions (
             id TEXT PRIMARY KEY,
             phase TEXT NOT NULL,
             started_at REAL NOT NULL,
@@ -6172,13 +7750,13 @@ public actor SQLiteDatabase {
             updated_at REAL NOT NULL
         )
         """,
-        "CREATE INDEX idx_processing_sessions_updated ON processing_sessions(updated_at DESC)"
+        "CREATE INDEX IF NOT EXISTS idx_processing_sessions_updated ON processing_sessions(updated_at DESC)"
     ]
 
     private static let migration10 = [
         "ALTER TABLE documents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'pdf'",
         """
-        CREATE TABLE mail_import_sources (
+        CREATE TABLE IF NOT EXISTS mail_import_sources (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_key TEXT NOT NULL UNIQUE,
             display_name TEXT NOT NULL,
@@ -6204,7 +7782,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE emails (
+        CREATE TABLE IF NOT EXISTS emails (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER NOT NULL UNIQUE REFERENCES documents(id) ON DELETE CASCADE,
             stable_identity TEXT NOT NULL UNIQUE,
@@ -6232,7 +7810,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE email_recipients (
+        CREATE TABLE IF NOT EXISTS email_recipients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
             role TEXT NOT NULL,
@@ -6241,7 +7819,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE email_source_links (
+        CREATE TABLE IF NOT EXISTS email_source_links (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
             source_id INTEGER NOT NULL REFERENCES mail_import_sources(id) ON DELETE CASCADE,
@@ -6254,7 +7832,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE email_attachments (
+        CREATE TABLE IF NOT EXISTS email_attachments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             sha256 TEXT NOT NULL UNIQUE,
@@ -6270,7 +7848,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE email_attachment_links (
+        CREATE TABLE IF NOT EXISTS email_attachment_links (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
             attachment_id INTEGER NOT NULL REFERENCES email_attachments(id) ON DELETE CASCADE,
@@ -6281,7 +7859,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE storage_migrations (
+        CREATE TABLE IF NOT EXISTS storage_migrations (
             id TEXT PRIMARY KEY,
             kind TEXT NOT NULL,
             source_path TEXT NOT NULL,
@@ -6297,12 +7875,12 @@ public actor SQLiteDatabase {
             completed_at REAL
         )
         """,
-        "CREATE INDEX idx_emails_message_id ON emails(message_id)",
-        "CREATE INDEX idx_emails_conversation ON emails(conversation_id)",
-        "CREATE INDEX idx_email_recipients_address ON email_recipients(address, role)",
-        "CREATE INDEX idx_email_source_links_source ON email_source_links(source_id, source_present)",
-        "CREATE INDEX idx_email_attachment_links_email ON email_attachment_links(email_id)",
-        "CREATE INDEX idx_documents_content_type ON documents(content_type)",
+        "CREATE INDEX IF NOT EXISTS idx_emails_message_id ON emails(message_id)",
+        "CREATE INDEX IF NOT EXISTS idx_emails_conversation ON emails(conversation_id)",
+        "CREATE INDEX IF NOT EXISTS idx_email_recipients_address ON email_recipients(address, role)",
+        "CREATE INDEX IF NOT EXISTS idx_email_source_links_source ON email_source_links(source_id, source_present)",
+        "CREATE INDEX IF NOT EXISTS idx_email_attachment_links_email ON email_attachment_links(email_id)",
+        "CREATE INDEX IF NOT EXISTS idx_documents_content_type ON documents(content_type)",
         """
         CREATE VIEW search_source_metadata AS
         SELECT d.id AS document_id,
@@ -6361,7 +7939,7 @@ public actor SQLiteDatabase {
 
     private static let migration11 = [
         """
-        CREATE TABLE organizations (
+        CREATE TABLE IF NOT EXISTS organizations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             canonical_name TEXT NOT NULL,
             email_domain TEXT UNIQUE,
@@ -6370,7 +7948,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE communication_partners (
+        CREATE TABLE IF NOT EXISTS communication_partners (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
             canonical_name TEXT NOT NULL,
@@ -6381,7 +7959,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE communication_partner_aliases (
+        CREATE TABLE IF NOT EXISTS communication_partner_aliases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             partner_id INTEGER NOT NULL REFERENCES communication_partners(id) ON DELETE CASCADE,
             display_name TEXT,
@@ -6391,7 +7969,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE communication_partner_email_links (
+        CREATE TABLE IF NOT EXISTS communication_partner_email_links (
             partner_id INTEGER NOT NULL REFERENCES communication_partners(id) ON DELETE CASCADE,
             email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
             role TEXT NOT NULL,
@@ -6399,7 +7977,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE projects (
+        CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             canonical_name TEXT NOT NULL,
             reference_key TEXT NOT NULL UNIQUE,
@@ -6411,7 +7989,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE project_document_links (
+        CREATE TABLE IF NOT EXISTS project_document_links (
             project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             relation_status TEXT NOT NULL,
@@ -6421,7 +7999,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE project_email_links (
+        CREATE TABLE IF NOT EXISTS project_email_links (
             project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
             relation_status TEXT NOT NULL,
@@ -6431,7 +8009,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE document_relations (
+        CREATE TABLE IF NOT EXISTS document_relations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             related_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -6446,7 +8024,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE mail_relations (
+        CREATE TABLE IF NOT EXISTS mail_relations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
             related_email_id INTEGER REFERENCES emails(id) ON DELETE CASCADE,
@@ -6461,20 +8039,20 @@ public actor SQLiteDatabase {
             UNIQUE(email_id, related_email_id, document_id, relation_kind)
         )
         """,
-        "CREATE INDEX idx_partners_organization ON communication_partners(organization_id)",
-        "CREATE INDEX idx_partner_email_links_email ON communication_partner_email_links(email_id)",
-        "CREATE INDEX idx_project_document_links_document ON project_document_links(document_id)",
-        "CREATE INDEX idx_project_email_links_email ON project_email_links(email_id)",
-        "CREATE INDEX idx_document_relations_related ON document_relations(related_document_id)",
-        "CREATE INDEX idx_mail_relations_document ON mail_relations(document_id)",
-        "CREATE INDEX idx_mail_relations_related_email ON mail_relations(related_email_id)",
+        "CREATE INDEX IF NOT EXISTS idx_partners_organization ON communication_partners(organization_id)",
+        "CREATE INDEX IF NOT EXISTS idx_partner_email_links_email ON communication_partner_email_links(email_id)",
+        "CREATE INDEX IF NOT EXISTS idx_project_document_links_document ON project_document_links(document_id)",
+        "CREATE INDEX IF NOT EXISTS idx_project_email_links_email ON project_email_links(email_id)",
+        "CREATE INDEX IF NOT EXISTS idx_document_relations_related ON document_relations(related_document_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mail_relations_document ON mail_relations(document_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mail_relations_related_email ON mail_relations(related_email_id)",
         """
-        CREATE UNIQUE INDEX idx_mail_relations_email_document_kind
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_relations_email_document_kind
         ON mail_relations(email_id, document_id, relation_kind)
         WHERE related_email_id IS NULL AND document_id IS NOT NULL
         """,
         """
-        CREATE UNIQUE INDEX idx_mail_relations_email_email_kind
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_relations_email_email_kind
         ON mail_relations(email_id, related_email_id, relation_kind)
         WHERE related_email_id IS NOT NULL AND document_id IS NULL
         """
@@ -6482,7 +8060,7 @@ public actor SQLiteDatabase {
 
     private static let migration12 = [
         """
-        CREATE TABLE document_analysis_versions (
+        CREATE TABLE IF NOT EXISTS document_analysis_versions (
             document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
             ocr_version TEXT,
             parser_version TEXT,
@@ -6496,7 +8074,7 @@ public actor SQLiteDatabase {
         )
         """,
         """
-        CREATE TABLE analysis_upgrade_jobs (
+        CREATE TABLE IF NOT EXISTS analysis_upgrade_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             analysis_kind TEXT NOT NULL,
@@ -6544,9 +8122,9 @@ public actor SQLiteDatabase {
                strftime('%s', 'now')
         FROM documents d
         """,
-        "CREATE INDEX idx_analysis_upgrade_jobs_state ON analysis_upgrade_jobs(state, updated_at)",
-        "CREATE INDEX idx_analysis_versions_people ON document_analysis_versions(people_analysis_version)",
-        "CREATE INDEX idx_analysis_versions_projects ON document_analysis_versions(project_analysis_version)"
+        "CREATE INDEX IF NOT EXISTS idx_analysis_upgrade_jobs_state ON analysis_upgrade_jobs(state, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_versions_people ON document_analysis_versions(people_analysis_version)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_versions_projects ON document_analysis_versions(project_analysis_version)"
     ]
 
     private static let migration13 = [
@@ -6615,6 +8193,534 @@ public actor SQLiteDatabase {
             )
         )
         """
+    ]
+
+    private static let migration15 = [
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_entities (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            canonical_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            short_description TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            first_source_at REAL,
+            last_source_at REAL,
+            user_confirmed INTEGER NOT NULL DEFAULT 0,
+            merge_status TEXT NOT NULL DEFAULT 'separate',
+            analysis_version TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(type, normalized_name)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_entity_aliases (
+            id TEXT PRIMARY KEY,
+            entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE CASCADE,
+            alias TEXT NOT NULL,
+            normalized_alias TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            source_kind TEXT NOT NULL,
+            rejected INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            UNIQUE(entity_id, normalized_alias)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_entity_identifiers (
+            id TEXT PRIMARY KEY,
+            entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE CASCADE,
+            identifier_type TEXT NOT NULL,
+            identifier_value TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            created_at REAL NOT NULL,
+            UNIQUE(identifier_type, normalized_value)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_entity_embeddings (
+            entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE CASCADE,
+            model_id TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(entity_id, model_id, model_version)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_claims (
+            id TEXT PRIMARY KEY,
+            source_fingerprint TEXT NOT NULL UNIQUE,
+            claim_type TEXT NOT NULL,
+            validation_status TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            status TEXT NOT NULL DEFAULT 'active',
+            extraction_model TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            last_confirmed_at REAL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_facts (
+            id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL UNIQUE REFERENCES knowledge_claims(id) ON DELETE CASCADE,
+            subject_entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE RESTRICT,
+            predicate TEXT NOT NULL,
+            object_entity_id TEXT REFERENCES knowledge_entities(id) ON DELETE RESTRICT,
+            literal_value TEXT,
+            normalized_value TEXT,
+            value_type TEXT NOT NULL,
+            unit TEXT,
+            valid_from TEXT,
+            valid_until TEXT,
+            CHECK(object_entity_id IS NOT NULL OR literal_value IS NOT NULL)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_relations (
+            id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL UNIQUE REFERENCES knowledge_claims(id) ON DELETE CASCADE,
+            subject_entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE RESTRICT,
+            predicate TEXT NOT NULL,
+            object_entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE RESTRICT,
+            valid_from TEXT,
+            valid_until TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_evidence (
+            id TEXT PRIMARY KEY,
+            document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+            document_hash TEXT NOT NULL,
+            page_id INTEGER REFERENCES pages(id) ON DELETE SET NULL,
+            page_number INTEGER NOT NULL,
+            chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+            source_quote TEXT NOT NULL,
+            character_start INTEGER,
+            character_end INTEGER,
+            bbox_x REAL,
+            bbox_y REAL,
+            bbox_width REAL,
+            bbox_height REAL,
+            source_kind TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            evidence_status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            CHECK(length(source_quote) > 0 AND length(source_quote) <= 1500)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_claim_evidence (
+            claim_id TEXT NOT NULL REFERENCES knowledge_claims(id) ON DELETE CASCADE,
+            evidence_id TEXT NOT NULL REFERENCES knowledge_evidence(id) ON DELETE CASCADE,
+            support_kind TEXT NOT NULL DEFAULT 'supports',
+            PRIMARY KEY(claim_id, evidence_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_entity_evidence (
+            entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE CASCADE,
+            evidence_id TEXT NOT NULL REFERENCES knowledge_evidence(id) ON DELETE CASCADE,
+            PRIMARY KEY(entity_id, evidence_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_conflicts (
+            id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL REFERENCES knowledge_claims(id) ON DELETE CASCADE,
+            conflicting_claim_id TEXT NOT NULL REFERENCES knowledge_claims(id) ON DELETE CASCADE,
+            conflict_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            explanation TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            CHECK(claim_id < conflicting_claim_id),
+            UNIQUE(claim_id, conflicting_claim_id, conflict_kind)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_inferences (
+            id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL UNIQUE REFERENCES knowledge_claims(id) ON DELETE CASCADE,
+            method TEXT NOT NULL,
+            premise_claim_ids_json TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_revisions (
+            id TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            previous_json TEXT,
+            current_json TEXT,
+            actor TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(object_type, object_id, revision)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_entity_merge_rules (
+            id TEXT PRIMARY KEY,
+            source_entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE CASCADE,
+            target_entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE CASCADE,
+            decision TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            reason TEXT NOT NULL,
+            reversible INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(source_entity_id, target_entity_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_entity_negative_rules (
+            id TEXT PRIMARY KEY,
+            left_entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE CASCADE,
+            right_entity_id TEXT NOT NULL REFERENCES knowledge_entities(id) ON DELETE CASCADE,
+            reason TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            CHECK(left_entity_id < right_entity_id),
+            UNIQUE(left_entity_id, right_entity_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_projects (
+            id TEXT PRIMARY KEY,
+            canonical_name TEXT NOT NULL,
+            project_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            user_confirmed INTEGER NOT NULL DEFAULT 0,
+            analysis_version TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_project_members (
+            project_id TEXT NOT NULL REFERENCES knowledge_projects(id) ON DELETE CASCADE,
+            member_type TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            reason TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(project_id, member_type, member_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_project_evidence (
+            project_id TEXT NOT NULL REFERENCES knowledge_projects(id) ON DELETE CASCADE,
+            evidence_id TEXT NOT NULL REFERENCES knowledge_evidence(id) ON DELETE CASCADE,
+            signal_kind TEXT NOT NULL,
+            weight REAL NOT NULL CHECK(weight >= 0 AND weight <= 1),
+            PRIMARY KEY(project_id, evidence_id, signal_kind)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_project_candidates (
+            id TEXT PRIMARY KEY,
+            candidate_key TEXT NOT NULL UNIQUE,
+            proposed_name TEXT NOT NULL,
+            project_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            supporting_signals_json TEXT NOT NULL,
+            counter_signals_json TEXT NOT NULL,
+            extraction_model TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_summaries (
+            id TEXT PRIMARY KEY,
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            validation_status TEXT NOT NULL,
+            validity_status TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_summary_dependencies (
+            summary_id TEXT NOT NULL REFERENCES knowledge_summaries(id) ON DELETE CASCADE,
+            dependency_type TEXT NOT NULL,
+            dependency_id TEXT NOT NULL,
+            dependency_revision INTEGER NOT NULL,
+            PRIMARY KEY(summary_id, dependency_type, dependency_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_summary_versions (
+            id TEXT PRIMARY KEY,
+            summary_id TEXT NOT NULL REFERENCES knowledge_summaries(id) ON DELETE CASCADE,
+            version INTEGER NOT NULL,
+            summary_text TEXT NOT NULL,
+            source_set_hash TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(summary_id, version)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_jobs (
+            id TEXT PRIMARY KEY,
+            job_kind TEXT NOT NULL,
+            document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+            target_key TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            priority INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            required_capability TEXT,
+            required_model_id TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            maximum_attempts INTEGER NOT NULL DEFAULT 3,
+            not_before REAL,
+            last_error_category TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            completed_at REAL,
+            UNIQUE(job_kind, target_key, input_hash)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_job_dependencies (
+            job_id TEXT NOT NULL REFERENCES knowledge_jobs(id) ON DELETE CASCADE,
+            depends_on_job_id TEXT NOT NULL REFERENCES knowledge_jobs(id) ON DELETE CASCADE,
+            PRIMARY KEY(job_id, depends_on_job_id),
+            CHECK(job_id <> depends_on_job_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_analysis_state (
+            document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+            document_hash TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            extraction_version TEXT,
+            validation_version TEXT,
+            graph_version TEXT,
+            summary_version TEXT,
+            last_completed_at REAL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_model_runs (
+            id TEXT PRIMARY KEY,
+            job_id TEXT REFERENCES knowledge_jobs(id) ON DELETE SET NULL,
+            document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+            task_kind TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            input_hash TEXT NOT NULL,
+            output_hash TEXT,
+            validation_status TEXT NOT NULL,
+            error_category TEXT,
+            started_at REAL NOT NULL,
+            completed_at REAL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_gaps (
+            id TEXT PRIMARY KEY,
+            expected_information_type TEXT NOT NULL,
+            context_type TEXT NOT NULL,
+            context_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            search_coverage REAL NOT NULL CHECK(search_coverage >= 0 AND search_coverage <= 1),
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            processing_complete INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            last_checked_at REAL NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS communication_threads (
+            id TEXT PRIMARY KEY,
+            thread_key TEXT NOT NULL UNIQUE,
+            subject_normalized TEXT,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            started_at REAL,
+            last_activity_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS communication_messages (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT REFERENCES communication_threads(id) ON DELETE SET NULL,
+            email_id INTEGER UNIQUE REFERENCES emails(id) ON DELETE CASCADE,
+            message_identifier TEXT,
+            in_reply_to TEXT,
+            references_json TEXT NOT NULL DEFAULT '[]',
+            sent_at REAL,
+            subject TEXT,
+            body_hash TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS communication_participants (
+            message_id TEXT NOT NULL REFERENCES communication_messages(id) ON DELETE CASCADE,
+            entity_id TEXT REFERENCES knowledge_entities(id) ON DELETE SET NULL,
+            address TEXT NOT NULL,
+            display_name TEXT,
+            role TEXT NOT NULL,
+            PRIMARY KEY(message_id, address, role)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS communication_events (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL REFERENCES communication_messages(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            subject_entity_id TEXT REFERENCES knowledge_entities(id) ON DELETE SET NULL,
+            object_entity_id TEXT REFERENCES knowledge_entities(id) ON DELETE SET NULL,
+            literal_value TEXT,
+            occurred_at REAL,
+            claim_id TEXT NOT NULL REFERENCES knowledge_claims(id) ON DELETE CASCADE,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            validation_status TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS communication_attachments (
+            message_id TEXT NOT NULL REFERENCES communication_messages(id) ON DELETE CASCADE,
+            attachment_id INTEGER REFERENCES email_attachments(id) ON DELETE SET NULL,
+            document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+            content_hash TEXT NOT NULL,
+            file_name TEXT,
+            PRIMARY KEY(message_id, content_hash)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS communication_relations (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL REFERENCES communication_messages(id) ON DELETE CASCADE,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            claim_id TEXT REFERENCES knowledge_claims(id) ON DELETE SET NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            validation_status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(message_id, target_type, target_id, relation_type)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_patterns (
+            id TEXT PRIMARY KEY,
+            pattern_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            minimum_support INTEGER NOT NULL,
+            supporting_project_count INTEGER NOT NULL,
+            supporting_claim_count INTEGER NOT NULL,
+            model_id TEXT,
+            model_version TEXT,
+            analysis_version TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_pattern_evidence (
+            pattern_id TEXT NOT NULL REFERENCES knowledge_patterns(id) ON DELETE CASCADE,
+            claim_id TEXT NOT NULL REFERENCES knowledge_claims(id) ON DELETE CASCADE,
+            weight REAL NOT NULL CHECK(weight >= 0 AND weight <= 1),
+            PRIMARY KEY(pattern_id, claim_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_statistics (
+            id TEXT PRIMARY KEY,
+            statistic_key TEXT NOT NULL UNIQUE,
+            scope_type TEXT NOT NULL,
+            scope_id TEXT,
+            sample_count INTEGER NOT NULL,
+            numeric_value REAL,
+            text_value TEXT,
+            calculation_version TEXT NOT NULL,
+            source_set_hash TEXT NOT NULL,
+            calculated_at REAL NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_trends (
+            id TEXT PRIMARY KEY,
+            statistic_id TEXT NOT NULL REFERENCES knowledge_statistics(id) ON DELETE CASCADE,
+            period_start REAL NOT NULL,
+            period_end REAL NOT NULL,
+            value REAL NOT NULL,
+            sample_count INTEGER NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            UNIQUE(statistic_id, period_start, period_end)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_recommendations (
+            id TEXT PRIMARY KEY,
+            pattern_id TEXT REFERENCES knowledge_patterns(id) ON DELETE SET NULL,
+            context_type TEXT NOT NULL,
+            context_id TEXT NOT NULL,
+            recommendation TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_entities_normalized ON knowledge_entities(type, normalized_name)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_aliases_normalized ON knowledge_entity_aliases(normalized_alias)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_claims_status ON knowledge_claims(status, validation_status, claim_type)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_facts_subject ON knowledge_facts(subject_entity_id, predicate)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_relations_subject ON knowledge_relations(subject_entity_id, predicate)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_relations_object ON knowledge_relations(object_entity_id, predicate)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_evidence_document ON knowledge_evidence(document_id, document_hash, evidence_status)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_jobs_queue ON knowledge_jobs(state, priority DESC, updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_project_candidates_status ON knowledge_project_candidates(status, confidence DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_summaries_scope ON knowledge_summaries(scope_type, scope_id, validity_status)",
+        "CREATE INDEX IF NOT EXISTS idx_communication_messages_thread ON communication_messages(thread_id, sent_at)",
+        "CREATE INDEX IF NOT EXISTS idx_communication_events_type ON communication_events(event_type, occurred_at)",
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_patterns_status ON knowledge_patterns(status, confidence DESC)"
     ]
 }
 
